@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# Local session notes
+WORK_LOG.md
+
 # Python
 __pycache__/
 *.pyc
