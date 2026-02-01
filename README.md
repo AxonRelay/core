@@ -12,7 +12,7 @@ AI Agent Orchestration with Human-in-the-Loop — コアシステム
 flowchart LR
     subgraph M1["M1: プロジェクト基盤"]
         I1["#1 .gitignore\n.env.example 🟢"]
-        I2["#2 README.md 🟡"]
+        I2["#2 README.md 🟢"]
         I3["#3 docker-compose.yml 🟢"]
         I4["#4 Caddyfile 🟢"]
     end
@@ -40,7 +40,7 @@ flowchart LR
     end
 
     subgraph M5["M5: AWSデプロイ"]
-        I18["#18 EC2構築 🔴"]
+        I18["#18 EC2構築 🟢"]
         I19["#19 DNS設定 🔴"]
         I20["#20 本番デプロイ 🔴"]
     end
@@ -85,15 +85,15 @@ flowchart LR
 
 | Milestone | 内容 | Issue | 状態 |
 |-----------|------|-------|------|
-| **M1: プロジェクト基盤** | Docker/リバプロ/環境変数の土台 | #1 #2 #3 #4 | 🟢 (#2 残り) |
+| **M1: プロジェクト基盤** | Docker/リバプロ/環境変数の土台 | #1 #2 #3 #4 | 🟢 |
 | **M2: Backend** | FastAPI + LangGraph + Redis | #5 #6 #7 #8 #9 #10 #11 #12 | 🟢 |
 | **M3: Frontend** | Next.js 人間介入ダッシュボード | #13 #14 #15 | 🟢 |
 | **M4: Docker統合** | フルスタック起動 + E2E検証 | #16 #17 | 🟢 |
-| **M5: AWSデプロイ** | EC2 + DNS + SSL + 本番稼働 | #18 #19 #20 | 🔴 |
+| **M5: AWSデプロイ** | EC2 + DNS + SSL + 本番稼働 | #18 #19 #20 | 🟡 (#18 完了) |
 
 ### 現在地
 
-> **次に着手すべき: M5 AWSデプロイ** (#18 EC2構築)
+> **#18 EC2構築完了。次は #20 本番デプロイ (IP直アクセスで動作確認) → #19 DNS設定**
 
 ---
 
