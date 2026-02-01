@@ -1,4 +1,4 @@
-{$DOMAIN_NAME} {
+{$CADDY_SITE_ADDRESS::80} {
     handle_path /api/* {
         reverse_proxy backend:8000
     }

@@ -2,7 +2,6 @@ import os
 
 from langgraph.graph import StateGraph
 from langgraph.checkpoint.redis import AsyncRedisSaver
-from redis.asyncio import Redis
 
 from app.schema import AgentState
 
@@ -27,8 +26,7 @@ builder.add_node("publisher", approval_node)
 builder.set_entry_point("writer")
 builder.add_edge("writer", "publisher")
 
-redis_client = Redis.from_url(REDIS_URL)
-checkpointer = AsyncRedisSaver(conn=redis_client)
+checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
 
 graph_app = builder.compile(
     checkpointer=checkpointer,

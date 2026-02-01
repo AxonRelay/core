@@ -1,10 +1,19 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.graph import graph_app
+from app.graph import graph_app, checkpointer
 from app.schema import TaskRequest, ApprovalRequest, StatusResponse
 
-app = FastAPI(title="AxonRelay API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await checkpointer.asetup()
+    yield
+
+
+app = FastAPI(title="AxonRelay API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
