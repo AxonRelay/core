@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+langchain-openai
+langgraph
+langgraph-checkpoint-redis
+redis
+pydantic
+python-dotenv

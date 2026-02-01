@@ -1,0 +1,49 @@
+services:
+  caddy:
+    image: caddy:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - DOMAIN_NAME=${DOMAIN_NAME:-localhost}
+    depends_on:
+      - frontend
+      - backend
+
+  redis:
+    image: redis:alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build: ./backend
+    restart: always
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    depends_on:
+      - redis
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build: ./frontend
+    restart: always
+    environment:
+      - NEXT_PUBLIC_API_URL=/api
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+volumes:
+  caddy_data:
+  caddy_config:
+  redis_data:
