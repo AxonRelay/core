@@ -8,9 +8,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.graph import graph_app, checkpointer
-from app.schema import TaskRequest, ApprovalRequest, StatusResponse, UserSyncRequest, UserResponse
+from app.schema import (
+    TaskRequest, ApprovalRequest, StatusResponse, UserSyncRequest, UserResponse,
+    ProjectCreateRequest, ProjectUpdateRequest, ProjectResponse, ProjectWithMembersResponse,
+    AddProjectMemberRequest, UpdateProjectMemberRoleRequest
+)
 from app.database import get_db
-from app import crud
+from app import crud, models
 from sqlalchemy.orm import Session
 
 limiter = Limiter(key_func=get_remote_address)
@@ -34,7 +38,7 @@ app.add_middleware(
         "http://localhost:3000",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -104,3 +108,163 @@ async def approve_task(request: Request, req: ApprovalRequest):
     async for _event in graph_app.astream(None, config):
         pass
     return {"message": "Task resumed and completed"}
+
+
+# ========== Project Endpoints ==========
+
+@app.get("/projects", response_model=list[ProjectResponse])
+@limiter.limit("60/minute")
+async def list_user_projects(request: Request, user_id: int, db: Session = Depends(get_db)):
+    """List all projects where the user is a member."""
+    projects = crud.get_user_projects(db, user_id)
+    return projects
+
+
+@app.post("/projects", response_model=ProjectResponse)
+@limiter.limit("30/minute")
+async def create_project(request: Request, project_data: ProjectCreateRequest, user_id: int, db: Session = Depends(get_db)):
+    """Create a new project with the user as owner."""
+    # Verify user exists
+    user = crud.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    project = crud.create_project(
+        db=db,
+        name=project_data.name,
+        description=project_data.description,
+        owner_id=user_id
+    )
+    return project
+
+
+@app.get("/projects/{project_id}", response_model=ProjectWithMembersResponse)
+@limiter.limit("60/minute")
+async def get_project(request: Request, project_id: int, user_id: int, db: Session = Depends(get_db)):
+    """Get project details with members list."""
+    # Check if user is a member
+    member = crud.get_project_member(db, project_id, user_id)
+    if not member:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    project = crud.get_project(db, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return project
+
+
+@app.put("/projects/{project_id}", response_model=ProjectResponse)
+@limiter.limit("30/minute")
+async def update_project(request: Request, project_id: int, project_data: ProjectUpdateRequest, user_id: int, db: Session = Depends(get_db)):
+    """Update project details (requires OWNER or ADMIN role)."""
+    # Check permission
+    if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    project = crud.update_project(
+        db=db,
+        project_id=project_id,
+        name=project_data.name,
+        description=project_data.description
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return project
+
+
+@app.delete("/projects/{project_id}")
+@limiter.limit("30/minute")
+async def delete_project(request: Request, project_id: int, user_id: int, db: Session = Depends(get_db)):
+    """Delete a project (requires OWNER role)."""
+    # Check permission
+    if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER]):
+        raise HTTPException(status_code=403, detail="Only project owner can delete project")
+
+    success = crud.delete_project(db, project_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {"message": "Project deleted successfully"}
+
+
+# ========== Project Member Endpoints ==========
+
+@app.post("/projects/{project_id}/members")
+@limiter.limit("30/minute")
+async def add_project_member(request: Request, project_id: int, member_data: AddProjectMemberRequest, user_id: int, db: Session = Depends(get_db)):
+    """Add a member to a project (requires OWNER or ADMIN role)."""
+    # Check permission
+    if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    # Verify target user exists
+    target_user = crud.get_user(db, member_data.user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Check if already a member
+    existing_member = crud.get_project_member(db, project_id, member_data.user_id)
+    if existing_member:
+        raise HTTPException(status_code=400, detail="User is already a member")
+
+    member = crud.add_project_member(
+        db=db,
+        project_id=project_id,
+        user_id=member_data.user_id,
+        role=models.RoleEnum(member_data.role)
+    )
+    return member
+
+
+@app.patch("/projects/{project_id}/members/{member_user_id}")
+@limiter.limit("30/minute")
+async def update_member_role(request: Request, project_id: int, member_user_id: int, role_data: UpdateProjectMemberRoleRequest, user_id: int, db: Session = Depends(get_db)):
+    """Update a project member's role (requires OWNER or ADMIN role)."""
+    # Check permission
+    if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    # Prevent removing the last owner
+    if role_data.role != "owner":
+        members = crud.get_project_members(db, project_id)
+        owner_count = sum(1 for m in members if m.role == models.RoleEnum.OWNER)
+        if owner_count == 1:
+            target_member = crud.get_project_member(db, project_id, member_user_id)
+            if target_member and target_member.role == models.RoleEnum.OWNER:
+                raise HTTPException(status_code=400, detail="Cannot remove the last owner")
+
+    member = crud.update_project_member_role(
+        db=db,
+        project_id=project_id,
+        user_id=member_user_id,
+        role=models.RoleEnum(role_data.role)
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    return member
+
+
+@app.delete("/projects/{project_id}/members/{member_user_id}")
+@limiter.limit("30/minute")
+async def remove_project_member(request: Request, project_id: int, member_user_id: int, user_id: int, db: Session = Depends(get_db)):
+    """Remove a member from a project (requires OWNER or ADMIN role)."""
+    # Check permission
+    if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    # Prevent removing the last owner
+    members = crud.get_project_members(db, project_id)
+    owner_count = sum(1 for m in members if m.role == models.RoleEnum.OWNER)
+    if owner_count == 1:
+        target_member = crud.get_project_member(db, project_id, member_user_id)
+        if target_member and target_member.role == models.RoleEnum.OWNER:
+            raise HTTPException(status_code=400, detail="Cannot remove the last owner")
+
+    success = crud.remove_project_member(db, project_id, member_user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    return {"message": "Member removed successfully"}

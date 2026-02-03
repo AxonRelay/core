@@ -49,3 +49,61 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ========== Project Schemas ==========
+
+class ProjectCreateRequest(BaseModel):
+    """Request to create a new project."""
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+
+
+class ProjectUpdateRequest(BaseModel):
+    """Request to update project details."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+
+
+class ProjectResponse(BaseModel):
+    """Project response model."""
+    id: int
+    name: str
+    description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectMemberResponse(BaseModel):
+    """Project member response model."""
+    id: int
+    user_id: int
+    project_id: int
+    role: str
+    joined_at: datetime
+    user: UserResponse
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectWithMembersResponse(ProjectResponse):
+    """Project response with members list."""
+    members: list[ProjectMemberResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+class AddProjectMemberRequest(BaseModel):
+    """Request to add a member to a project."""
+    user_id: int = Field(..., gt=0)
+    role: str = Field(..., pattern="^(owner|admin|member|reviewer|viewer)$")
+
+
+class UpdateProjectMemberRoleRequest(BaseModel):
+    """Request to update a project member's role."""
+    role: str = Field(..., pattern="^(owner|admin|member|reviewer|viewer)$")
