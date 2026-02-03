@@ -116,7 +116,7 @@ def upgrade() -> None:
         sa.Column('task_id', sa.Integer(), nullable=False),
         sa.Column('link_type', sa.String(length=50), nullable=False),
         sa.Column('url', sa.String(length=1000), nullable=False),
-        sa.Column('metadata', sa.JSON(), nullable=True),
+        sa.Column('link_metadata', sa.JSON(), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(['task_id'], ['tasks.id'], ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('id')

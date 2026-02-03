@@ -139,7 +139,7 @@ class ExternalLink(Base):
     task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
     link_type = Column(String(50), nullable=False)  # "github_issue", "notion_page", etc.
     url = Column(String(1000), nullable=False)
-    metadata = Column(JSON)  # Additional provider-specific data
+    link_metadata = Column(JSON)  # Additional provider-specific data
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships
