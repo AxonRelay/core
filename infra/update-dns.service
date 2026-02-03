@@ -1,0 +1,12 @@
+[Unit]
+Description=Update Cloudflare DNS with current EC2 public IP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/axonrelay/update-dns.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
