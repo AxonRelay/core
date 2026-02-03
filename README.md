@@ -41,8 +41,8 @@ flowchart LR
 
     subgraph M5["M5: AWSデプロイ"]
         I18["#18 EC2構築 🟢"]
-        I19["#19 DNS設定 🔴"]
-        I20["#20 本番デプロイ 🔴"]
+        I19["#19 DNS設定 🟢"]
+        I20["#20 本番デプロイ 🟢"]
     end
 
     %% 依存関係
@@ -89,11 +89,11 @@ flowchart LR
 | **M2: Backend** | FastAPI + LangGraph + Redis | #5 #6 #7 #8 #9 #10 #11 #12 | 🟢 |
 | **M3: Frontend** | Next.js 人間介入ダッシュボード | #13 #14 #15 | 🟢 |
 | **M4: Docker統合** | フルスタック起動 + E2E検証 | #16 #17 | 🟢 |
-| **M5: AWSデプロイ** | EC2 + DNS + SSL + 本番稼働 | #18 #19 #20 | 🟡 (#18 完了) |
+| **M5: AWSデプロイ** | EC2 + DNS + SSL + 本番稼働 | #18 #19 #20 | 🟢 |
 
 ### 現在地
 
-> **#18 EC2構築完了。次は #20 本番デプロイ (IP直アクセスで動作確認) → #19 DNS設定**
+> **Phase 1 完了。本番 https://axonrelay.com で稼働中。Phase 2 に移行。**
 
 ---
 
