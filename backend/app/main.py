@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Path, Request
+from fastapi import FastAPI, HTTPException, Path, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -8,7 +8,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.graph import graph_app, checkpointer
-from app.schema import TaskRequest, ApprovalRequest, StatusResponse
+from app.schema import TaskRequest, ApprovalRequest, StatusResponse, UserSyncRequest, UserResponse
+from app.database import get_db
+from app import crud
+from sqlalchemy.orm import Session
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -39,6 +42,20 @@ app.add_middleware(
 @app.get("/")
 def health():
     return {"status": "ok", "service": "AxonRelay"}
+
+
+@app.post("/auth/sync", response_model=UserResponse)
+@limiter.limit("30/minute")
+async def sync_user(request: Request, user_data: UserSyncRequest, db: Session = Depends(get_db)):
+    """Sync user from OAuth authentication to database."""
+    user = crud.get_or_create_user(
+        db=db,
+        email=user_data.email,
+        name=user_data.name,
+        oauth_provider=user_data.oauth_provider,
+        oauth_id=user_data.oauth_id
+    )
+    return user
 
 
 @app.post("/task/start")

@@ -10,3 +10,5 @@ slowapi
 sqlalchemy
 alembic
 psycopg2-binary
+pyjwt
+cryptography
