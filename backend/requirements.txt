@@ -7,3 +7,6 @@ redis
 pydantic
 python-dotenv
 slowapi
+sqlalchemy
+alembic
+psycopg2-binary

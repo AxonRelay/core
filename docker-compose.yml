@@ -21,14 +21,28 @@ services:
     volumes:
       - redis_data:/data
 
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-axonrelay}
+      - POSTGRES_USER=${POSTGRES_USER:-axonrelay}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-axonrelay_dev}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
   backend:
     build: ./backend
     restart: always
     environment:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay}
     depends_on:
       - redis
+      - postgres
     volumes:
       - ./backend:/app
 
@@ -47,3 +61,4 @@ volumes:
   caddy_data:
   caddy_config:
   redis_data:
+  postgres_data:
