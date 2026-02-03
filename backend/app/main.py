@@ -1,10 +1,16 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from app.graph import graph_app, checkpointer
 from app.schema import TaskRequest, ApprovalRequest, StatusResponse
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
@@ -14,13 +20,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AxonRelay API", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to frontend domain in production
+    allow_origins=[
+        "https://axonrelay.com",
+        "http://localhost",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -30,7 +42,8 @@ def health():
 
 
 @app.post("/task/start")
-async def start_task(req: TaskRequest):
+@limiter.limit("10/minute")
+async def start_task(request: Request, req: TaskRequest):
     config = {"configurable": {"thread_id": req.thread_id}}
     initial_state = {
         "task": req.task,
@@ -44,7 +57,8 @@ async def start_task(req: TaskRequest):
 
 
 @app.get("/task/{thread_id}", response_model=StatusResponse)
-async def get_status(thread_id: str):
+@limiter.limit("60/minute")
+async def get_status(request: Request, thread_id: str = Path(..., min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_\-]+$")):
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = await graph_app.aget_state(config)
     if not snapshot.values:
@@ -59,7 +73,8 @@ async def get_status(thread_id: str):
 
 
 @app.post("/task/approve")
-async def approve_task(req: ApprovalRequest):
+@limiter.limit("10/minute")
+async def approve_task(request: Request, req: ApprovalRequest):
     config = {"configurable": {"thread_id": req.thread_id}}
     snapshot = await graph_app.aget_state(config)
     if not snapshot.next:
