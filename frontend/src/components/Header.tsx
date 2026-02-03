@@ -14,7 +14,15 @@ export default async function Header() {
             </Link>
           </div>
 
-          <nav className="flex items-center gap-4">
+          <nav className="flex items-center gap-6">
+            {session?.user && (
+              <Link
+                href="/projects"
+                className="text-sm font-medium text-gray-700 hover:text-gray-900"
+              >
+                Projects
+              </Link>
+            )}
             {session?.user ? (
               <>
                 <div className="flex items-center gap-3">
