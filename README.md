@@ -1,6 +1,8 @@
 # AxonRelay / core
 
-AI Agent Orchestration with Human-in-the-Loop — コアシステム
+**[日本語](README.ja.md)** | English
+
+AI Agent Orchestration with Human-in-the-Loop — Core System
 
 ---
 
@@ -10,7 +12,7 @@ AI Agent Orchestration with Human-in-the-Loop — コアシステム
 
 ```mermaid
 flowchart LR
-    subgraph M1["M1: プロジェクト基盤"]
+    subgraph M1["M1: Project Foundation"]
         I1["#1 .gitignore\n.env.example 🟢"]
         I2["#2 README.md 🟢"]
         I3["#3 docker-compose.yml 🟢"]
@@ -19,33 +21,33 @@ flowchart LR
 
     subgraph M2["M2: Backend"]
         I5["#5 Dockerfile 🟢"]
-        I6["#6 Python依存関係 🟢"]
-        I7["#7 FastAPI骨格 🟢"]
-        I8["#8 Stateスキーマ 🟢"]
-        I9["#9 LangGraphグラフ 🟢"]
-        I10["#10 Redis統合 🟢"]
+        I6["#6 Python Dependencies 🟢"]
+        I7["#7 FastAPI Scaffold 🟢"]
+        I8["#8 State Schema 🟢"]
+        I9["#9 LangGraph Graph 🟢"]
+        I10["#10 Redis Integration 🟢"]
         I11["#11 API: start/status 🟢"]
         I12["#12 API: approve 🟢"]
     end
 
     subgraph M3["M3: Frontend"]
         I13["#13 Next.js Setup 🟢"]
-        I14["#14 タスク入力UI 🟢"]
-        I15["#15 承認UI 🟢"]
+        I14["#14 Task Input UI 🟢"]
+        I15["#15 Approval UI 🟢"]
     end
 
-    subgraph M4["M4: Docker統合"]
-        I16["#16 フルスタック起動 🟢"]
-        I17["#17 E2Eフロー検証 🟢"]
+    subgraph M4["M4: Docker Integration"]
+        I16["#16 Full Stack Launch 🟢"]
+        I17["#17 E2E Flow Validation 🟢"]
     end
 
-    subgraph M5["M5: AWSデプロイ"]
-        I18["#18 EC2構築 🟢"]
-        I19["#19 DNS設定 🟢"]
-        I20["#20 本番デプロイ 🟢"]
+    subgraph M5["M5: AWS Deployment"]
+        I18["#18 EC2 Setup 🟢"]
+        I19["#19 DNS Configuration 🟢"]
+        I20["#20 Production Deploy 🟢"]
     end
 
-    %% 依存関係
+    %% Dependencies
     I1 --> I3
     I1 --> I5
     I1 --> I13
@@ -71,7 +73,7 @@ flowchart LR
     I18 --> I19
     I19 --> I20
 
-    %% スタイル
+    %% Styles
     style M1 fill:#1e293b,stroke:#facc15,color:#fef9c3
     style M2 fill:#1e293b,stroke:#ef4444,color:#fecaca
     style M3 fill:#1e293b,stroke:#a855f7,color:#e9d5ff
@@ -79,21 +81,21 @@ flowchart LR
     style M5 fill:#1e293b,stroke:#22c55e,color:#bbf7d0
 ```
 
-### 進捗
+### Progress
 
-**M1 → M2/M3 (並行可) → M4 → M5** の順に進行します。
+**M1 → M2/M3 (parallel) → M4 → M5** in this order.
 
-| Milestone | 内容 | Issue | 状態 |
-|-----------|------|-------|------|
-| **M1: プロジェクト基盤** | Docker/リバプロ/環境変数の土台 | #1 #2 #3 #4 | 🟢 |
+| Milestone | Description | Issue | Status |
+|-----------|-------------|-------|--------|
+| **M1: Project Foundation** | Docker/Reverse Proxy/Environment Variables | #1 #2 #3 #4 | 🟢 |
 | **M2: Backend** | FastAPI + LangGraph + Redis | #5 #6 #7 #8 #9 #10 #11 #12 | 🟢 |
-| **M3: Frontend** | Next.js 人間介入ダッシュボード | #13 #14 #15 | 🟢 |
-| **M4: Docker統合** | フルスタック起動 + E2E検証 | #16 #17 | 🟢 |
-| **M5: AWSデプロイ** | EC2 + DNS + SSL + 本番稼働 | #18 #19 #20 | 🟢 |
+| **M3: Frontend** | Next.js Human-in-the-Loop Dashboard | #13 #14 #15 | 🟢 |
+| **M4: Docker Integration** | Full Stack Launch + E2E Validation | #16 #17 | 🟢 |
+| **M5: AWS Deployment** | EC2 + DNS + SSL + Production | #18 #19 #20 | 🟢 |
 
-### 現在地
+### Current Status
 
-> **Phase 1 完了。本番 https://axonrelay.com で稼働中。Phase 2 に移行。**
+> **Phase 1 Complete. Running in production at https://axonrelay.com. Moving to Phase 2.**
 
 ---
 
@@ -106,7 +108,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-http://localhost でダッシュボードが表示されます。
+Dashboard will be available at http://localhost
 
 ---
 
@@ -117,29 +119,52 @@ Browser ──▶ Caddy (:80) ──┬──▶ /api/* ──▶ Backend (FastA
                            │                    │
                            │                    ▼
                            │               Redis (checkpoint)
+                           │               PostgreSQL (database)
                            │
                            └──▶ /*     ──▶ Frontend (Next.js :3000)
 ```
 
 | Service | Role |
 |---------|------|
-| **Caddy** | リバースプロキシ。ローカルはHTTP、本番は自動HTTPS |
-| **Backend** | FastAPI + LangGraph。タスク管理とHuman-in-the-Loop |
-| **Frontend** | Next.js ダッシュボード。タスク投入・承認UI |
-| **Redis** | LangGraphのステート永続化 (checkpoint) |
+| **Caddy** | Reverse proxy. HTTP for local, auto-HTTPS for production |
+| **Backend** | FastAPI + LangGraph. Task management and Human-in-the-Loop |
+| **Frontend** | Next.js dashboard. Task submission and approval UI |
+| **Redis** | LangGraph state persistence (checkpoint) |
+| **PostgreSQL** | User, project, and task data storage |
 
 ---
 
 ## API
 
+### Core API
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/` | ヘルスチェック |
-| `POST` | `/api/task/start` | タスク開始。AI がドラフトを生成し承認待ちで停止 |
-| `GET` | `/api/task/{thread_id}` | タスク状態の取得 |
-| `POST` | `/api/task/approve` | ドラフトを修正(任意)して承認、処理を再開 |
+| `GET` | `/api/` | Health check |
+| `POST` | `/api/task/start` | Start task. AI generates draft and waits for approval |
+| `GET` | `/api/task/{thread_id}` | Get task status |
+| `POST` | `/api/task/approve` | Approve (optionally modify) draft and resume processing |
 
-### フロー
+### Authentication API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/auth/sync` | Sync OAuth user to database |
+
+### Project API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/projects` | List user's projects |
+| `POST` | `/api/projects` | Create new project (creates owner) |
+| `GET` | `/api/projects/{id}` | Get project details with members |
+| `PUT` | `/api/projects/{id}` | Update project (requires OWNER/ADMIN) |
+| `DELETE` | `/api/projects/{id}` | Delete project (requires OWNER) |
+| `POST` | `/api/projects/{id}/members` | Add member (requires OWNER/ADMIN) |
+| `PATCH` | `/api/projects/{id}/members/{user_id}` | Update member role (requires OWNER/ADMIN) |
+| `DELETE` | `/api/projects/{id}/members/{user_id}` | Remove member (requires OWNER/ADMIN) |
+
+### Flow
 
 ```
 POST /task/start  ──▶  AI generates draft  ──▶  status: waiting_approval
@@ -153,11 +178,46 @@ POST /task/approve ──▶  Resume with updated draft ──▶  status: compl
 
 ## Environment Variables
 
+### Core System
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CADDY_SITE_ADDRESS` | `:80` | ローカル: `:80`、本番: `yourdomain.com` (自動HTTPS) |
-| `OPENAI_API_KEY` | — | LLM機能に必要 (現在はダミーレスポンス) |
-| `REDIS_URL` | `redis://redis:6379` | docker-compose内ではデフォルトで接続可能 |
+| `CADDY_SITE_ADDRESS` | `:80` | Local: `:80`, Production: `yourdomain.com` (auto-HTTPS) |
+| `OPENAI_API_KEY` | — | Required for LLM functionality (currently using dummy response) |
+| `REDIS_URL` | `redis://redis:6379` | Auto-connected in docker-compose |
+
+### Database
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | `postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay` | PostgreSQL connection string |
+| `POSTGRES_DB` | `axonrelay` | Database name |
+| `POSTGRES_USER` | `axonrelay` | Database user |
+| `POSTGRES_PASSWORD` | `axonrelay_dev` | Database password (change in production!) |
+
+### Authentication
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTH_SECRET` | — | NextAuth.js secret (generate with `openssl rand -base64 32`) |
+| `NEXTAUTH_URL` | `http://localhost` | NextAuth.js base URL |
+| `GOOGLE_CLIENT_ID` | — | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | — | Google OAuth client secret |
+
+See [SETUP_GOOGLE_OAUTH.md](SETUP_GOOGLE_OAUTH.md) for Google OAuth setup instructions.
+
+---
+
+## Database Setup
+
+See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for PostgreSQL setup and migration instructions.
+
+### Running Migrations
+
+```bash
+# Inside backend container
+docker compose exec backend alembic upgrade head
+```
 
 ---
 
