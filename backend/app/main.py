@@ -13,7 +13,8 @@ from app.schema import (
     ProjectCreateRequest, ProjectUpdateRequest, ProjectResponse, ProjectWithMembersResponse,
     AddProjectMemberRequest, UpdateProjectMemberRoleRequest,
     ActorResponse, AgentDefinitionCreateRequest, AgentDefinitionUpdateRequest, AgentDefinitionResponse,
-    TaskAssignmentCreateRequest, TaskAssignmentResponse
+    TaskAssignmentCreateRequest, TaskAssignmentResponse,
+    TaskCreateRequest, TaskUpdateRequest, TaskResponse, TaskWithAssignmentsResponse
 )
 from app.database import get_db
 from app import crud, models
@@ -444,3 +445,276 @@ async def list_actor_assignments(request: Request, actor_id: int, db: Session = 
 
     assignments = crud.get_actor_assignments(db, actor_id)
     return assignments
+
+
+# ========== Task CRUD Endpoints ==========
+
+@app.get("/projects/{project_id}/tasks", response_model=list[TaskResponse])
+@limiter.limit("60/minute")
+async def list_project_tasks(
+    request: Request,
+    project_id: int,
+    user_id: int,
+    status: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """List all tasks in a project."""
+    # Check user is a member of the project
+    if not crud.get_project_member(db, project_id, user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.TaskStatusEnum(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+    tasks = crud.get_project_tasks(db, project_id, status=status_enum, skip=skip, limit=limit)
+    return tasks
+
+
+@app.post("/projects/{project_id}/tasks", response_model=TaskResponse)
+@limiter.limit("30/minute")
+async def create_task_in_project(
+    request: Request,
+    project_id: int,
+    task_data: TaskCreateRequest,
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """Create a new task in a project."""
+    # Check user is a member of the project
+    if not crud.get_project_member(db, project_id, user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Verify project_id matches
+    if task_data.project_id != project_id:
+        raise HTTPException(status_code=400, detail="Project ID mismatch")
+
+    # Generate thread_id
+    import uuid
+    thread_id = f"task-{uuid.uuid4().hex[:12]}"
+
+    task = crud.create_task(
+        db=db,
+        project_id=project_id,
+        thread_id=thread_id,
+        title=task_data.title,
+        creator_id=user_id,
+        description=task_data.description
+    )
+    return task
+
+
+@app.get("/projects/{project_id}/tasks/{task_id}", response_model=TaskWithAssignmentsResponse)
+@limiter.limit("60/minute")
+async def get_task_detail(
+    request: Request,
+    project_id: int,
+    task_id: int,
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get task details with assignments."""
+    # Check user is a member of the project
+    if not crud.get_project_member(db, project_id, user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Verify task belongs to the project
+    if task.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Task not found in this project")
+
+    return task
+
+
+@app.put("/projects/{project_id}/tasks/{task_id}", response_model=TaskResponse)
+@limiter.limit("30/minute")
+async def update_task_in_project(
+    request: Request,
+    project_id: int,
+    task_id: int,
+    task_data: TaskUpdateRequest,
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """Update a task."""
+    # Check user is a member of the project with appropriate role
+    if not crud.check_project_permission(db, project_id, user_id, [
+        models.RoleEnum.OWNER, models.RoleEnum.ADMIN, models.RoleEnum.MEMBER
+    ]):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Task not found in this project")
+
+    status_enum = None
+    if task_data.status:
+        try:
+            status_enum = models.TaskStatusEnum(task_data.status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+    updated_task = crud.update_task(
+        db=db,
+        task_id=task_id,
+        title=task_data.title,
+        description=task_data.description,
+        status=status_enum,
+        current_draft=task_data.current_draft,
+        feedback=task_data.feedback
+    )
+    return updated_task
+
+
+@app.delete("/projects/{project_id}/tasks/{task_id}")
+@limiter.limit("30/minute")
+async def delete_task_in_project(
+    request: Request,
+    project_id: int,
+    task_id: int,
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete a task."""
+    # Check user is a member of the project with appropriate role
+    if not crud.check_project_permission(db, project_id, user_id, [
+        models.RoleEnum.OWNER, models.RoleEnum.ADMIN
+    ]):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Task not found in this project")
+
+    crud.delete_task(db, task_id)
+    return {"message": "Task deleted successfully"}
+
+
+# ========== User Task Queries (Role-based Filters) ==========
+
+@app.get("/users/{user_id}/tasks/created", response_model=list[TaskResponse])
+@limiter.limit("60/minute")
+async def list_user_created_tasks(
+    request: Request,
+    user_id: int,
+    status: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """List all tasks created by a user."""
+    # Verify user exists
+    user = crud.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.TaskStatusEnum(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+    tasks = crud.get_user_created_tasks(db, user_id, status=status_enum, skip=skip, limit=limit)
+    return tasks
+
+
+@app.get("/users/{user_id}/tasks/assigned", response_model=list[TaskResponse])
+@limiter.limit("60/minute")
+async def list_user_assigned_tasks(
+    request: Request,
+    user_id: int,
+    role: str | None = None,
+    status: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """List all tasks assigned to a user (via their Actor)."""
+    # Verify user exists and has an actor
+    user = crud.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user.actor_id:
+        return []
+
+    role_enum = None
+    if role:
+        try:
+            role_enum = models.AssignmentRoleEnum(role)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid assignment role")
+
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.TaskStatusEnum(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+    tasks = crud.get_user_assigned_tasks(
+        db, user.actor_id, role=role_enum, status=status_enum, skip=skip, limit=limit
+    )
+    return tasks
+
+
+@app.get("/users/{user_id}/tasks/review", response_model=list[TaskResponse])
+@limiter.limit("60/minute")
+async def list_user_review_tasks(
+    request: Request,
+    user_id: int,
+    status: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """List all tasks where the user is assigned as reviewer (across all projects)."""
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.TaskStatusEnum(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+    tasks = crud.get_tasks_by_assignment_role_across_projects(
+        db, user_id, models.AssignmentRoleEnum.REVIEWER, status=status_enum, skip=skip, limit=limit
+    )
+    return tasks
+
+
+@app.get("/users/{user_id}/tasks/approve", response_model=list[TaskResponse])
+@limiter.limit("60/minute")
+async def list_user_approve_tasks(
+    request: Request,
+    user_id: int,
+    status: str | None = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """List all tasks where the user is assigned as approver (across all projects)."""
+    status_enum = None
+    if status:
+        try:
+            status_enum = models.TaskStatusEnum(status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+    tasks = crud.get_tasks_by_assignment_role_across_projects(
+        db, user_id, models.AssignmentRoleEnum.APPROVER, status=status_enum, skip=skip, limit=limit
+    )
+    return tasks

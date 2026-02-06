@@ -362,3 +362,164 @@ def delete_task_assignment_by_actor(db: Session, task_id: int, actor_id: int):
     db.delete(assignment)
     db.commit()
     return True
+
+
+# ========== Task Operations ==========
+
+def get_task(db: Session, task_id: int):
+    """Get task by ID."""
+    return db.query(models.Task).filter(models.Task.id == task_id).first()
+
+
+def get_task_by_thread_id(db: Session, thread_id: str):
+    """Get task by LangGraph thread ID."""
+    return db.query(models.Task).filter(models.Task.thread_id == thread_id).first()
+
+
+def get_project_tasks(
+    db: Session,
+    project_id: int,
+    status: models.TaskStatusEnum | None = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all tasks in a project with optional status filter."""
+    query = db.query(models.Task).filter(models.Task.project_id == project_id)
+    if status:
+        query = query.filter(models.Task.status == status)
+    return query.order_by(models.Task.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_user_created_tasks(
+    db: Session,
+    user_id: int,
+    status: models.TaskStatusEnum | None = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all tasks created by a user."""
+    query = db.query(models.Task).filter(models.Task.creator_id == user_id)
+    if status:
+        query = query.filter(models.Task.status == status)
+    return query.order_by(models.Task.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_user_assigned_tasks(
+    db: Session,
+    actor_id: int,
+    role: models.AssignmentRoleEnum | None = None,
+    status: models.TaskStatusEnum | None = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all tasks assigned to an actor with optional role and status filters."""
+    query = db.query(models.Task).join(models.TaskAssignment).filter(
+        models.TaskAssignment.actor_id == actor_id
+    )
+    if role:
+        query = query.filter(models.TaskAssignment.role == role)
+    if status:
+        query = query.filter(models.Task.status == status)
+    return query.order_by(models.Task.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_tasks_by_assignment_role_across_projects(
+    db: Session,
+    user_id: int,
+    assignment_role: models.AssignmentRoleEnum,
+    status: models.TaskStatusEnum | None = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    """
+    Get tasks across all projects where the user's actor has a specific assignment role.
+    Useful for role-based filtering (e.g., "all tasks where I'm a reviewer").
+    """
+    # Get user's actor_id
+    user = get_user(db, user_id)
+    if not user or not user.actor_id:
+        return []
+
+    query = db.query(models.Task).join(models.TaskAssignment).filter(
+        models.TaskAssignment.actor_id == user.actor_id,
+        models.TaskAssignment.role == assignment_role
+    )
+    if status:
+        query = query.filter(models.Task.status == status)
+    return query.order_by(models.Task.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def create_task(
+    db: Session,
+    project_id: int,
+    thread_id: str,
+    title: str,
+    creator_id: int | None = None,
+    description: str | None = None
+):
+    """Create a new task."""
+    db_task = models.Task(
+        project_id=project_id,
+        thread_id=thread_id,
+        title=title,
+        creator_id=creator_id,
+        description=description,
+        status=models.TaskStatusEnum.DRAFT
+    )
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    return db_task
+
+
+def update_task(
+    db: Session,
+    task_id: int,
+    title: str | None = None,
+    description: str | None = None,
+    status: models.TaskStatusEnum | None = None,
+    current_draft: str | None = None,
+    feedback: str | None = None
+):
+    """Update a task."""
+    task = get_task(db, task_id)
+    if not task:
+        return None
+
+    if title is not None:
+        task.title = title
+    if description is not None:
+        task.description = description
+    if status is not None:
+        task.status = status
+    if current_draft is not None:
+        task.current_draft = current_draft
+    if feedback is not None:
+        task.feedback = feedback
+
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def update_task_status(db: Session, task_id: int, status: models.TaskStatusEnum):
+    """Update only the task status."""
+    task = get_task(db, task_id)
+    if not task:
+        return None
+
+    task.status = status
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def delete_task(db: Session, task_id: int):
+    """Delete a task."""
+    task = get_task(db, task_id)
+    if not task:
+        return False
+
+    db.delete(task)
+    db.commit()
+    return True

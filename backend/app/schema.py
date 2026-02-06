@@ -182,3 +182,55 @@ class UserWithActorResponse(UserResponse):
 
     class Config:
         from_attributes = True
+
+
+# ========== Task Schemas ==========
+
+class TaskCreateRequest(BaseModel):
+    """Request to create a new task."""
+    project_id: int = Field(..., gt=0)
+    title: str = Field(..., min_length=1, max_length=500)
+    description: Optional[str] = None
+
+
+class TaskUpdateRequest(BaseModel):
+    """Request to update a task."""
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    description: Optional[str] = None
+    status: Optional[str] = Field(None, pattern="^(draft|waiting_approval|approved|rejected|completed|cancelled)$")
+    current_draft: Optional[str] = None
+    feedback: Optional[str] = None
+
+
+class TaskResponse(BaseModel):
+    """Task response model."""
+    id: int
+    thread_id: str
+    project_id: int
+    creator_id: Optional[int]
+    title: str
+    description: Optional[str]
+    status: str
+    current_draft: Optional[str]
+    feedback: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TaskWithAssignmentsResponse(TaskResponse):
+    """Task response with assignments list."""
+    assignments: list[TaskAssignmentResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+class TaskListResponse(BaseModel):
+    """Paginated task list response."""
+    tasks: list[TaskResponse]
+    total: int
+    skip: int
+    limit: int
