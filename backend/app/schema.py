@@ -107,3 +107,78 @@ class AddProjectMemberRequest(BaseModel):
 class UpdateProjectMemberRoleRequest(BaseModel):
     """Request to update a project member's role."""
     role: str = Field(..., pattern="^(owner|admin|member|reviewer|viewer)$")
+
+
+# ========== Actor Schemas (ADR-005) ==========
+
+class ActorResponse(BaseModel):
+    """Actor response model (lightweight reference)."""
+    id: int
+    type: str  # "human" or "ai"
+    name: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AgentDefinitionCreateRequest(BaseModel):
+    """Request to create a new AI agent definition."""
+    name: str = Field(..., min_length=1, max_length=255)
+    agent_type: str = Field(..., pattern="^(writer|reviewer|validator|researcher|assistant|custom)$")
+    description: Optional[str] = None
+    config: Optional[dict] = None
+
+
+class AgentDefinitionUpdateRequest(BaseModel):
+    """Request to update an AI agent definition."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    agent_type: Optional[str] = Field(None, pattern="^(writer|reviewer|validator|researcher|assistant|custom)$")
+    description: Optional[str] = None
+    config: Optional[dict] = None
+    is_active: Optional[bool] = None
+
+
+class AgentDefinitionResponse(BaseModel):
+    """AI agent definition response model."""
+    id: int
+    actor_id: int
+    agent_type: str
+    description: Optional[str]
+    config: Optional[dict]
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    actor: ActorResponse
+
+    class Config:
+        from_attributes = True
+
+
+# ========== Task Assignment Schemas ==========
+
+class TaskAssignmentCreateRequest(BaseModel):
+    """Request to create a task assignment."""
+    actor_id: int = Field(..., gt=0)
+    role: str = Field(..., pattern="^(executor|reviewer|approver|observer)$")
+
+
+class TaskAssignmentResponse(BaseModel):
+    """Task assignment response model."""
+    id: int
+    task_id: int
+    actor_id: int
+    role: str
+    assigned_at: datetime
+    actor: ActorResponse
+
+    class Config:
+        from_attributes = True
+
+
+class UserWithActorResponse(UserResponse):
+    """User response with actor information."""
+    actor: Optional[ActorResponse] = None
+
+    class Config:
+        from_attributes = True

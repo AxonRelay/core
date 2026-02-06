@@ -1,10 +1,38 @@
 """Database models for AxonRelay."""
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum, JSON, Boolean
 from sqlalchemy.orm import relationship
 import enum
 
 from app.database import Base
+
+
+# =============================================================================
+# Enums
+# =============================================================================
+
+class ActorTypeEnum(str, enum.Enum):
+    """Actor types - human or AI."""
+    HUMAN = "human"
+    AI = "ai"
+
+
+class AgentTypeEnum(str, enum.Enum):
+    """AI Agent types."""
+    WRITER = "writer"
+    REVIEWER = "reviewer"
+    VALIDATOR = "validator"
+    RESEARCHER = "researcher"
+    ASSISTANT = "assistant"
+    CUSTOM = "custom"
+
+
+class AssignmentRoleEnum(str, enum.Enum):
+    """Task assignment roles."""
+    EXECUTOR = "executor"      # Executes the task (AI or human)
+    REVIEWER = "reviewer"      # Reviews the output
+    APPROVER = "approver"      # Approves/rejects the task
+    OBSERVER = "observer"      # Receives notifications only
 
 
 class RoleEnum(str, enum.Enum):
@@ -26,11 +54,76 @@ class TaskStatusEnum(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+# =============================================================================
+# Actor Unified Model (ADR-005)
+# =============================================================================
+
+class Actor(Base):
+    """
+    Unified abstraction for humans and AI agents.
+    Serves as a lightweight reference point for assignments.
+    """
+    __tablename__ = "actors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(Enum(ActorTypeEnum), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Relationships (1:1 with User or AgentDefinition)
+    user = relationship("User", back_populates="actor", uselist=False)
+    agent_definition = relationship("AgentDefinition", back_populates="actor", uselist=False)
+    task_assignments = relationship("TaskAssignment", back_populates="actor", cascade="all, delete-orphan")
+
+
+class AgentDefinition(Base):
+    """
+    AI Agent definition with configuration.
+    Linked to Actor via 1:1 relationship.
+    """
+    __tablename__ = "agent_definitions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="CASCADE"), unique=True, nullable=False)
+    agent_type = Column(Enum(AgentTypeEnum), nullable=False, index=True)
+    description = Column(Text)
+    config = Column(JSON)  # Agent-specific configuration (model, prompts, etc.)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Relationships
+    actor = relationship("Actor", back_populates="agent_definition")
+
+
+class TaskAssignment(Base):
+    """
+    Assignment of actors (human or AI) to tasks with specific roles.
+    """
+    __tablename__ = "task_assignments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(Enum(AssignmentRoleEnum), nullable=False, index=True)
+    assigned_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Relationships
+    task = relationship("Task", back_populates="assignments")
+    actor = relationship("Actor", back_populates="task_assignments")
+
+
+# =============================================================================
+# Core Models
+# =============================================================================
+
+
 class User(Base):
-    """User account (authenticated via OAuth)."""
+    """User account (authenticated via OAuth). Linked to Actor via 1:1 relationship."""
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), unique=True, index=True)
     email = Column(String(255), unique=True, index=True, nullable=False)
     name = Column(String(255))
     oauth_provider = Column(String(50))  # e.g., "google"
@@ -39,6 +132,7 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     # Relationships
+    actor = relationship("Actor", back_populates="user")
     project_memberships = relationship("ProjectMember", back_populates="user", cascade="all, delete-orphan")
     created_tasks = relationship("Task", back_populates="creator", foreign_keys="Task.creator_id")
 
@@ -96,6 +190,7 @@ class Task(Base):
     # Relationships
     project = relationship("Project", back_populates="tasks")
     creator = relationship("User", back_populates="created_tasks", foreign_keys=[creator_id])
+    assignments = relationship("TaskAssignment", back_populates="task", cascade="all, delete-orphan")
     drafts = relationship("Draft", back_populates="task", cascade="all, delete-orphan")
     approvals = relationship("Approval", back_populates="task", cascade="all, delete-orphan")
     external_links = relationship("ExternalLink", back_populates="task", cascade="all, delete-orphan")

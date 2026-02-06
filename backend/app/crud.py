@@ -25,8 +25,19 @@ def get_user(db: Session, user_id: int):
 
 
 def create_user(db: Session, email: str, name: str | None, oauth_provider: str, oauth_id: str):
-    """Create a new user."""
+    """Create a new user with associated Actor."""
+    # Create Actor first
+    display_name = name if name else email.split('@')[0]
+    db_actor = models.Actor(
+        type=models.ActorTypeEnum.HUMAN,
+        name=display_name
+    )
+    db.add(db_actor)
+    db.flush()  # Get actor ID
+
+    # Create User linked to Actor
     db_user = models.User(
+        actor_id=db_actor.id,
         email=email,
         name=name,
         oauth_provider=oauth_provider,
@@ -45,6 +56,9 @@ def get_or_create_user(db: Session, email: str, name: str | None, oauth_provider
         # Update name if changed
         if name and user.name != name:
             user.name = name
+            # Also update Actor name
+            if user.actor:
+                user.actor.name = name
             db.commit()
             db.refresh(user)
         return user
@@ -169,3 +183,182 @@ def check_project_permission(db: Session, project_id: int, user_id: int, require
     if not member:
         return False
     return member.role in required_roles
+
+
+# ========== Actor Operations (ADR-005) ==========
+
+def get_actor(db: Session, actor_id: int):
+    """Get actor by ID."""
+    return db.query(models.Actor).filter(models.Actor.id == actor_id).first()
+
+
+def get_actors(db: Session, actor_type: models.ActorTypeEnum | None = None, skip: int = 0, limit: int = 100):
+    """Get all actors, optionally filtered by type."""
+    query = db.query(models.Actor)
+    if actor_type:
+        query = query.filter(models.Actor.type == actor_type)
+    return query.offset(skip).limit(limit).all()
+
+
+# ========== AgentDefinition Operations ==========
+
+def get_agent_definition(db: Session, agent_id: int):
+    """Get agent definition by ID."""
+    return db.query(models.AgentDefinition).filter(models.AgentDefinition.id == agent_id).first()
+
+
+def get_agent_definition_by_actor(db: Session, actor_id: int):
+    """Get agent definition by actor ID."""
+    return db.query(models.AgentDefinition).filter(models.AgentDefinition.actor_id == actor_id).first()
+
+
+def get_agent_definitions(
+    db: Session,
+    agent_type: models.AgentTypeEnum | None = None,
+    is_active: bool | None = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    """Get all agent definitions with optional filters."""
+    query = db.query(models.AgentDefinition)
+    if agent_type:
+        query = query.filter(models.AgentDefinition.agent_type == agent_type)
+    if is_active is not None:
+        query = query.filter(models.AgentDefinition.is_active == is_active)
+    return query.offset(skip).limit(limit).all()
+
+
+def create_agent_definition(
+    db: Session,
+    name: str,
+    agent_type: models.AgentTypeEnum,
+    description: str | None = None,
+    config: dict | None = None
+):
+    """Create a new AI agent definition with associated Actor."""
+    # Create Actor first
+    db_actor = models.Actor(
+        type=models.ActorTypeEnum.AI,
+        name=name
+    )
+    db.add(db_actor)
+    db.flush()  # Get actor ID
+
+    # Create AgentDefinition linked to Actor
+    db_agent = models.AgentDefinition(
+        actor_id=db_actor.id,
+        agent_type=agent_type,
+        description=description,
+        config=config
+    )
+    db.add(db_agent)
+    db.commit()
+    db.refresh(db_agent)
+    return db_agent
+
+
+def update_agent_definition(
+    db: Session,
+    agent_id: int,
+    name: str | None = None,
+    agent_type: models.AgentTypeEnum | None = None,
+    description: str | None = None,
+    config: dict | None = None,
+    is_active: bool | None = None
+):
+    """Update an AI agent definition."""
+    agent = get_agent_definition(db, agent_id)
+    if not agent:
+        return None
+
+    if name is not None:
+        agent.actor.name = name  # Update Actor name
+    if agent_type is not None:
+        agent.agent_type = agent_type
+    if description is not None:
+        agent.description = description
+    if config is not None:
+        agent.config = config
+    if is_active is not None:
+        agent.is_active = is_active
+
+    db.commit()
+    db.refresh(agent)
+    return agent
+
+
+def delete_agent_definition(db: Session, agent_id: int):
+    """Delete an AI agent definition (also deletes associated Actor)."""
+    agent = get_agent_definition(db, agent_id)
+    if not agent:
+        return False
+
+    # Delete Actor (will cascade to AgentDefinition)
+    db.delete(agent.actor)
+    db.commit()
+    return True
+
+
+# ========== TaskAssignment Operations ==========
+
+def get_task_assignment(db: Session, assignment_id: int):
+    """Get task assignment by ID."""
+    return db.query(models.TaskAssignment).filter(models.TaskAssignment.id == assignment_id).first()
+
+
+def get_task_assignments(db: Session, task_id: int):
+    """Get all assignments for a task."""
+    return db.query(models.TaskAssignment).filter(
+        models.TaskAssignment.task_id == task_id
+    ).all()
+
+
+def get_actor_assignments(db: Session, actor_id: int, skip: int = 0, limit: int = 100):
+    """Get all task assignments for an actor."""
+    return db.query(models.TaskAssignment).filter(
+        models.TaskAssignment.actor_id == actor_id
+    ).offset(skip).limit(limit).all()
+
+
+def create_task_assignment(
+    db: Session,
+    task_id: int,
+    actor_id: int,
+    role: models.AssignmentRoleEnum
+):
+    """Create a new task assignment."""
+    db_assignment = models.TaskAssignment(
+        task_id=task_id,
+        actor_id=actor_id,
+        role=role
+    )
+    db.add(db_assignment)
+    db.commit()
+    db.refresh(db_assignment)
+    return db_assignment
+
+
+def delete_task_assignment(db: Session, assignment_id: int):
+    """Delete a task assignment."""
+    assignment = get_task_assignment(db, assignment_id)
+    if not assignment:
+        return False
+
+    db.delete(assignment)
+    db.commit()
+    return True
+
+
+def delete_task_assignment_by_actor(db: Session, task_id: int, actor_id: int):
+    """Delete a task assignment by task and actor ID."""
+    assignment = db.query(models.TaskAssignment).filter(
+        models.TaskAssignment.task_id == task_id,
+        models.TaskAssignment.actor_id == actor_id
+    ).first()
+
+    if not assignment:
+        return False
+
+    db.delete(assignment)
+    db.commit()
+    return True
