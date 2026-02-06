@@ -1,24 +1,38 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Path, Request, Depends
+from fastapi import Depends, FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-
-from app.graph import graph_app, checkpointer
-from app.schema import (
-    TaskRequest, ApprovalRequest, StatusResponse, UserSyncRequest, UserResponse,
-    ProjectCreateRequest, ProjectUpdateRequest, ProjectResponse, ProjectWithMembersResponse,
-    AddProjectMemberRequest, UpdateProjectMemberRoleRequest,
-    ActorResponse, AgentDefinitionCreateRequest, AgentDefinitionUpdateRequest, AgentDefinitionResponse,
-    TaskAssignmentCreateRequest, TaskAssignmentResponse,
-    TaskCreateRequest, TaskUpdateRequest, TaskResponse, TaskWithAssignmentsResponse
-)
-from app.database import get_db
-from app import crud, models
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
+
+from app import crud, models
+from app.database import get_db
+from app.graph import checkpointer, graph_app
+from app.schema import (
+    ActorResponse,
+    AddProjectMemberRequest,
+    AgentDefinitionCreateRequest,
+    AgentDefinitionResponse,
+    AgentDefinitionUpdateRequest,
+    ApprovalRequest,
+    ProjectCreateRequest,
+    ProjectResponse,
+    ProjectUpdateRequest,
+    ProjectWithMembersResponse,
+    StatusResponse,
+    TaskAssignmentCreateRequest,
+    TaskAssignmentResponse,
+    TaskCreateRequest,
+    TaskRequest,
+    TaskResponse,
+    TaskUpdateRequest,
+    TaskWithAssignmentsResponse,
+    UpdateProjectMemberRoleRequest,
+    UserResponse,
+    UserSyncRequest,
+)
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -60,7 +74,7 @@ async def sync_user(request: Request, user_data: UserSyncRequest, db: Session = 
         email=user_data.email,
         name=user_data.name,
         oauth_provider=user_data.oauth_provider,
-        oauth_id=user_data.oauth_id
+        oauth_id=user_data.oauth_id,
     )
     return user
 
@@ -82,7 +96,9 @@ async def start_task(request: Request, req: TaskRequest):
 
 @app.get("/task/{thread_id}", response_model=StatusResponse)
 @limiter.limit("60/minute")
-async def get_status(request: Request, thread_id: str = Path(..., min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_\-]+$")):
+async def get_status(
+    request: Request, thread_id: str = Path(..., min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_\-]+$")
+):
     config = {"configurable": {"thread_id": thread_id}}
     snapshot = await graph_app.aget_state(config)
     if not snapshot.values:
@@ -115,6 +131,7 @@ async def approve_task(request: Request, req: ApprovalRequest):
 
 # ========== Project Endpoints ==========
 
+
 @app.get("/projects", response_model=list[ProjectResponse])
 @limiter.limit("60/minute")
 async def list_user_projects(request: Request, user_id: int, db: Session = Depends(get_db)):
@@ -125,19 +142,16 @@ async def list_user_projects(request: Request, user_id: int, db: Session = Depen
 
 @app.post("/projects", response_model=ProjectResponse)
 @limiter.limit("30/minute")
-async def create_project(request: Request, project_data: ProjectCreateRequest, user_id: int, db: Session = Depends(get_db)):
+async def create_project(
+    request: Request, project_data: ProjectCreateRequest, user_id: int, db: Session = Depends(get_db)
+):
     """Create a new project with the user as owner."""
     # Verify user exists
     user = crud.get_user(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    project = crud.create_project(
-        db=db,
-        name=project_data.name,
-        description=project_data.description,
-        owner_id=user_id
-    )
+    project = crud.create_project(db=db, name=project_data.name, description=project_data.description, owner_id=user_id)
     return project
 
 
@@ -159,17 +173,16 @@ async def get_project(request: Request, project_id: int, user_id: int, db: Sessi
 
 @app.put("/projects/{project_id}", response_model=ProjectResponse)
 @limiter.limit("30/minute")
-async def update_project(request: Request, project_id: int, project_data: ProjectUpdateRequest, user_id: int, db: Session = Depends(get_db)):
+async def update_project(
+    request: Request, project_id: int, project_data: ProjectUpdateRequest, user_id: int, db: Session = Depends(get_db)
+):
     """Update project details (requires OWNER or ADMIN role)."""
     # Check permission
     if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     project = crud.update_project(
-        db=db,
-        project_id=project_id,
-        name=project_data.name,
-        description=project_data.description
+        db=db, project_id=project_id, name=project_data.name, description=project_data.description
     )
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -194,9 +207,12 @@ async def delete_project(request: Request, project_id: int, user_id: int, db: Se
 
 # ========== Project Member Endpoints ==========
 
+
 @app.post("/projects/{project_id}/members")
 @limiter.limit("30/minute")
-async def add_project_member(request: Request, project_id: int, member_data: AddProjectMemberRequest, user_id: int, db: Session = Depends(get_db)):
+async def add_project_member(
+    request: Request, project_id: int, member_data: AddProjectMemberRequest, user_id: int, db: Session = Depends(get_db)
+):
     """Add a member to a project (requires OWNER or ADMIN role)."""
     # Check permission
     if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
@@ -213,17 +229,21 @@ async def add_project_member(request: Request, project_id: int, member_data: Add
         raise HTTPException(status_code=400, detail="User is already a member")
 
     member = crud.add_project_member(
-        db=db,
-        project_id=project_id,
-        user_id=member_data.user_id,
-        role=models.RoleEnum(member_data.role)
+        db=db, project_id=project_id, user_id=member_data.user_id, role=models.RoleEnum(member_data.role)
     )
     return member
 
 
 @app.patch("/projects/{project_id}/members/{member_user_id}")
 @limiter.limit("30/minute")
-async def update_member_role(request: Request, project_id: int, member_user_id: int, role_data: UpdateProjectMemberRoleRequest, user_id: int, db: Session = Depends(get_db)):
+async def update_member_role(
+    request: Request,
+    project_id: int,
+    member_user_id: int,
+    role_data: UpdateProjectMemberRoleRequest,
+    user_id: int,
+    db: Session = Depends(get_db),
+):
     """Update a project member's role (requires OWNER or ADMIN role)."""
     # Check permission
     if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
@@ -239,10 +259,7 @@ async def update_member_role(request: Request, project_id: int, member_user_id: 
                 raise HTTPException(status_code=400, detail="Cannot remove the last owner")
 
     member = crud.update_project_member_role(
-        db=db,
-        project_id=project_id,
-        user_id=member_user_id,
-        role=models.RoleEnum(role_data.role)
+        db=db, project_id=project_id, user_id=member_user_id, role=models.RoleEnum(role_data.role)
     )
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
@@ -252,7 +269,9 @@ async def update_member_role(request: Request, project_id: int, member_user_id: 
 
 @app.delete("/projects/{project_id}/members/{member_user_id}")
 @limiter.limit("30/minute")
-async def remove_project_member(request: Request, project_id: int, member_user_id: int, user_id: int, db: Session = Depends(get_db)):
+async def remove_project_member(
+    request: Request, project_id: int, member_user_id: int, user_id: int, db: Session = Depends(get_db)
+):
     """Remove a member from a project (requires OWNER or ADMIN role)."""
     # Check permission
     if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
@@ -274,6 +293,7 @@ async def remove_project_member(request: Request, project_id: int, member_user_i
 
 
 # ========== Actor Endpoints (ADR-005) ==========
+
 
 @app.get("/actors", response_model=list[ActorResponse])
 @limiter.limit("60/minute")
@@ -302,13 +322,11 @@ async def get_actor(request: Request, actor_id: int, db: Session = Depends(get_d
 
 # ========== Agent Definition Endpoints ==========
 
+
 @app.get("/agents", response_model=list[AgentDefinitionResponse])
 @limiter.limit("60/minute")
 async def list_agents(
-    request: Request,
-    agent_type: str | None = None,
-    is_active: bool | None = None,
-    db: Session = Depends(get_db)
+    request: Request, agent_type: str | None = None, is_active: bool | None = None, db: Session = Depends(get_db)
 ):
     """List all AI agent definitions."""
     agent_type_enum = None
@@ -332,11 +350,7 @@ async def create_agent(request: Request, agent_data: AgentDefinitionCreateReques
         raise HTTPException(status_code=400, detail="Invalid agent type")
 
     agent = crud.create_agent_definition(
-        db=db,
-        name=agent_data.name,
-        agent_type=agent_type,
-        description=agent_data.description,
-        config=agent_data.config
+        db=db, name=agent_data.name, agent_type=agent_type, description=agent_data.description, config=agent_data.config
     )
     return agent
 
@@ -353,7 +367,9 @@ async def get_agent(request: Request, agent_id: int, db: Session = Depends(get_d
 
 @app.put("/agents/{agent_id}", response_model=AgentDefinitionResponse)
 @limiter.limit("30/minute")
-async def update_agent(request: Request, agent_id: int, agent_data: AgentDefinitionUpdateRequest, db: Session = Depends(get_db)):
+async def update_agent(
+    request: Request, agent_id: int, agent_data: AgentDefinitionUpdateRequest, db: Session = Depends(get_db)
+):
     """Update an AI agent definition."""
     agent_type = None
     if agent_data.agent_type:
@@ -369,7 +385,7 @@ async def update_agent(request: Request, agent_id: int, agent_data: AgentDefinit
         agent_type=agent_type,
         description=agent_data.description,
         config=agent_data.config,
-        is_active=agent_data.is_active
+        is_active=agent_data.is_active,
     )
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -388,6 +404,7 @@ async def delete_agent(request: Request, agent_id: int, db: Session = Depends(ge
 
 # ========== Task Assignment Endpoints ==========
 
+
 @app.get("/tasks/{task_id}/assignments", response_model=list[TaskAssignmentResponse])
 @limiter.limit("60/minute")
 async def list_task_assignments(request: Request, task_id: int, db: Session = Depends(get_db)):
@@ -399,10 +416,7 @@ async def list_task_assignments(request: Request, task_id: int, db: Session = De
 @app.post("/tasks/{task_id}/assignments", response_model=TaskAssignmentResponse)
 @limiter.limit("30/minute")
 async def create_task_assignment(
-    request: Request,
-    task_id: int,
-    assignment_data: TaskAssignmentCreateRequest,
-    db: Session = Depends(get_db)
+    request: Request, task_id: int, assignment_data: TaskAssignmentCreateRequest, db: Session = Depends(get_db)
 ):
     """Assign an actor (human or AI) to a task."""
     # Verify actor exists
@@ -415,12 +429,7 @@ async def create_task_assignment(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assignment role")
 
-    assignment = crud.create_task_assignment(
-        db=db,
-        task_id=task_id,
-        actor_id=assignment_data.actor_id,
-        role=role
-    )
+    assignment = crud.create_task_assignment(db=db, task_id=task_id, actor_id=assignment_data.actor_id, role=role)
     return assignment
 
 
@@ -449,6 +458,7 @@ async def list_actor_assignments(request: Request, actor_id: int, db: Session = 
 
 # ========== Task CRUD Endpoints ==========
 
+
 @app.get("/projects/{project_id}/tasks", response_model=list[TaskResponse])
 @limiter.limit("60/minute")
 async def list_project_tasks(
@@ -458,7 +468,7 @@ async def list_project_tasks(
     status: str | None = None,
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """List all tasks in a project."""
     # Check user is a member of the project
@@ -479,11 +489,7 @@ async def list_project_tasks(
 @app.post("/projects/{project_id}/tasks", response_model=TaskResponse)
 @limiter.limit("30/minute")
 async def create_task_in_project(
-    request: Request,
-    project_id: int,
-    task_data: TaskCreateRequest,
-    user_id: int,
-    db: Session = Depends(get_db)
+    request: Request, project_id: int, task_data: TaskCreateRequest, user_id: int, db: Session = Depends(get_db)
 ):
     """Create a new task in a project."""
     # Check user is a member of the project
@@ -496,6 +502,7 @@ async def create_task_in_project(
 
     # Generate thread_id
     import uuid
+
     thread_id = f"task-{uuid.uuid4().hex[:12]}"
 
     task = crud.create_task(
@@ -504,20 +511,14 @@ async def create_task_in_project(
         thread_id=thread_id,
         title=task_data.title,
         creator_id=user_id,
-        description=task_data.description
+        description=task_data.description,
     )
     return task
 
 
 @app.get("/projects/{project_id}/tasks/{task_id}", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("60/minute")
-async def get_task_detail(
-    request: Request,
-    project_id: int,
-    task_id: int,
-    user_id: int,
-    db: Session = Depends(get_db)
-):
+async def get_task_detail(request: Request, project_id: int, task_id: int, user_id: int, db: Session = Depends(get_db)):
     """Get task details with assignments."""
     # Check user is a member of the project
     if not crud.get_project_member(db, project_id, user_id):
@@ -542,13 +543,13 @@ async def update_task_in_project(
     task_id: int,
     task_data: TaskUpdateRequest,
     user_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Update a task."""
     # Check user is a member of the project with appropriate role
-    if not crud.check_project_permission(db, project_id, user_id, [
-        models.RoleEnum.OWNER, models.RoleEnum.ADMIN, models.RoleEnum.MEMBER
-    ]):
+    if not crud.check_project_permission(
+        db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN, models.RoleEnum.MEMBER]
+    ):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     task = crud.get_task(db, task_id)
@@ -572,7 +573,7 @@ async def update_task_in_project(
         description=task_data.description,
         status=status_enum,
         current_draft=task_data.current_draft,
-        feedback=task_data.feedback
+        feedback=task_data.feedback,
     )
     return updated_task
 
@@ -580,17 +581,11 @@ async def update_task_in_project(
 @app.delete("/projects/{project_id}/tasks/{task_id}")
 @limiter.limit("30/minute")
 async def delete_task_in_project(
-    request: Request,
-    project_id: int,
-    task_id: int,
-    user_id: int,
-    db: Session = Depends(get_db)
+    request: Request, project_id: int, task_id: int, user_id: int, db: Session = Depends(get_db)
 ):
     """Delete a task."""
     # Check user is a member of the project with appropriate role
-    if not crud.check_project_permission(db, project_id, user_id, [
-        models.RoleEnum.OWNER, models.RoleEnum.ADMIN
-    ]):
+    if not crud.check_project_permission(db, project_id, user_id, [models.RoleEnum.OWNER, models.RoleEnum.ADMIN]):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     task = crud.get_task(db, task_id)
@@ -606,6 +601,7 @@ async def delete_task_in_project(
 
 # ========== User Task Queries (Role-based Filters) ==========
 
+
 @app.get("/users/{user_id}/tasks/created", response_model=list[TaskResponse])
 @limiter.limit("60/minute")
 async def list_user_created_tasks(
@@ -614,7 +610,7 @@ async def list_user_created_tasks(
     status: str | None = None,
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """List all tasks created by a user."""
     # Verify user exists
@@ -642,7 +638,7 @@ async def list_user_assigned_tasks(
     status: str | None = None,
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """List all tasks assigned to a user (via their Actor)."""
     # Verify user exists and has an actor
@@ -666,9 +662,7 @@ async def list_user_assigned_tasks(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid status")
 
-    tasks = crud.get_user_assigned_tasks(
-        db, user.actor_id, role=role_enum, status=status_enum, skip=skip, limit=limit
-    )
+    tasks = crud.get_user_assigned_tasks(db, user.actor_id, role=role_enum, status=status_enum, skip=skip, limit=limit)
     return tasks
 
 
@@ -680,7 +674,7 @@ async def list_user_review_tasks(
     status: str | None = None,
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """List all tasks where the user is assigned as reviewer (across all projects)."""
     status_enum = None
@@ -704,7 +698,7 @@ async def list_user_approve_tasks(
     status: str | None = None,
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """List all tasks where the user is assigned as approver (across all projects)."""
     status_enum = None

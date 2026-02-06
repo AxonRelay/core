@@ -1,0 +1,5 @@
+# Development dependencies
+-r requirements.txt
+
+# Linting & Formatting
+ruff>=0.8.0

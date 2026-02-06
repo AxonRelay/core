@@ -1,20 +1,19 @@
 """Database connection and session management."""
+
 import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay"
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay")
 
 # SQLAlchemy engine
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,  # Verify connections before using them
     pool_size=5,
-    max_overflow=10
+    max_overflow=10,
 )
 
 # Session factory

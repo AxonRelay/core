@@ -1,24 +1,28 @@
 """Database models for AxonRelay."""
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum, JSON, Boolean
-from sqlalchemy.orm import relationship
+
 import enum
+from datetime import datetime
+
+from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import relationship
 
 from app.database import Base
-
 
 # =============================================================================
 # Enums
 # =============================================================================
 
-class ActorTypeEnum(str, enum.Enum):
+
+class ActorTypeEnum(enum.StrEnum):
     """Actor types - human or AI."""
+
     HUMAN = "human"
     AI = "ai"
 
 
-class AgentTypeEnum(str, enum.Enum):
+class AgentTypeEnum(enum.StrEnum):
     """AI Agent types."""
+
     WRITER = "writer"
     REVIEWER = "reviewer"
     VALIDATOR = "validator"
@@ -27,16 +31,18 @@ class AgentTypeEnum(str, enum.Enum):
     CUSTOM = "custom"
 
 
-class AssignmentRoleEnum(str, enum.Enum):
+class AssignmentRoleEnum(enum.StrEnum):
     """Task assignment roles."""
-    EXECUTOR = "executor"      # Executes the task (AI or human)
-    REVIEWER = "reviewer"      # Reviews the output
-    APPROVER = "approver"      # Approves/rejects the task
-    OBSERVER = "observer"      # Receives notifications only
+
+    EXECUTOR = "executor"  # Executes the task (AI or human)
+    REVIEWER = "reviewer"  # Reviews the output
+    APPROVER = "approver"  # Approves/rejects the task
+    OBSERVER = "observer"  # Receives notifications only
 
 
-class RoleEnum(str, enum.Enum):
+class RoleEnum(enum.StrEnum):
     """Project member roles."""
+
     OWNER = "owner"
     ADMIN = "admin"
     MEMBER = "member"
@@ -44,8 +50,9 @@ class RoleEnum(str, enum.Enum):
     VIEWER = "viewer"
 
 
-class TaskStatusEnum(str, enum.Enum):
+class TaskStatusEnum(enum.StrEnum):
     """Task status."""
+
     DRAFT = "draft"
     WAITING_APPROVAL = "waiting_approval"
     APPROVED = "approved"
@@ -58,11 +65,13 @@ class TaskStatusEnum(str, enum.Enum):
 # Actor Unified Model (ADR-005)
 # =============================================================================
 
+
 class Actor(Base):
     """
     Unified abstraction for humans and AI agents.
     Serves as a lightweight reference point for assignments.
     """
+
     __tablename__ = "actors"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -81,6 +90,7 @@ class AgentDefinition(Base):
     AI Agent definition with configuration.
     Linked to Actor via 1:1 relationship.
     """
+
     __tablename__ = "agent_definitions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -100,6 +110,7 @@ class TaskAssignment(Base):
     """
     Assignment of actors (human or AI) to tasks with specific roles.
     """
+
     __tablename__ = "task_assignments"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -120,6 +131,7 @@ class TaskAssignment(Base):
 
 class User(Base):
     """User account (authenticated via OAuth). Linked to Actor via 1:1 relationship."""
+
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -139,6 +151,7 @@ class User(Base):
 
 class Project(Base):
     """Project workspace for organizing tasks."""
+
     __tablename__ = "projects"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -154,6 +167,7 @@ class Project(Base):
 
 class ProjectMember(Base):
     """Many-to-many relationship between Users and Projects with roles."""
+
     __tablename__ = "project_members"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -169,6 +183,7 @@ class ProjectMember(Base):
 
 class Task(Base):
     """Task managed by AI agents with human-in-the-loop approval."""
+
     __tablename__ = "tasks"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -198,6 +213,7 @@ class Task(Base):
 
 class Draft(Base):
     """Version history of task drafts."""
+
     __tablename__ = "drafts"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -212,6 +228,7 @@ class Draft(Base):
 
 class Approval(Base):
     """Approval/rejection history for tasks."""
+
     __tablename__ = "approvals"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -228,6 +245,7 @@ class Approval(Base):
 
 class ExternalLink(Base):
     """Links to external resources (GitHub issues, Notion pages, etc.)."""
+
     __tablename__ = "external_links"
 
     id = Column(Integer, primary_key=True, index=True)
