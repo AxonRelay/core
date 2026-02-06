@@ -1,0 +1,29 @@
+#!/bin/bash
+# Pre-push hook to prevent force push to main branch
+
+protected_branch="main"
+current_branch=$(git symbolic-ref HEAD | sed -e 's,.*/\(.*\),\1,')
+
+# Check if pushing to protected branch with force
+push_command=$(ps -ocommand= -p $PPID)
+
+if [[ "$current_branch" == "$protected_branch" ]] && [[ "$push_command" == *"--force"* || "$push_command" == *"-f"* ]]; then
+    echo "=========================================="
+    echo "ERROR: Force push to '$protected_branch' is not allowed!"
+    echo "=========================================="
+    echo ""
+    echo "If you need to undo changes, use:"
+    echo "  git revert HEAD"
+    echo "  git push origin main"
+    echo ""
+    exit 1
+fi
+
+# Check if pushing directly to main (warn only, allow for now)
+if [[ "$current_branch" == "$protected_branch" ]]; then
+    echo "WARNING: Pushing directly to '$protected_branch'."
+    echo "Consider using a feature branch and Pull Request instead."
+    echo ""
+fi
+
+exit 0
