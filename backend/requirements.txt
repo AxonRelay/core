@@ -7,3 +7,4 @@ sqlalchemy
 alembic
 psycopg2-binary
 langgraph-sdk
+mcp
