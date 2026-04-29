@@ -4,6 +4,10 @@
 # Local session notes
 WORK_LOG.md
 
+# Per-clone working area (only tmp/README.md is tracked)
+tmp/*
+!tmp/README.md
+
 # Python
 __pycache__/
 *.pyc
