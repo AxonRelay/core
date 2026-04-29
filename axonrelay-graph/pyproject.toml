@@ -1,0 +1,18 @@
+[project]
+name = "axonrelay-graph"
+version = "0.1.0"
+description = "AxonRelay agent graph deployed to LangGraph Platform."
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.50",
+    "langchain-anthropic>=0.2.0",
+    "langchain-openai>=0.2.0",
+    "langchain-core>=0.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
