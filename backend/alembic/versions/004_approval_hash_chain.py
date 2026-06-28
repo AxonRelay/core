@@ -5,9 +5,10 @@ Revises: 003
 Create Date: 2026-06-28
 
 Phase 3 ledger hardening: each approval is chained to the prior one for the
-same task via SHA-256 (see app/ledger.py). Adds nullable prev_hash / entry_hash;
-existing rows (if any) stay NULL and verification simply treats them as the
-chain start. Personal PoC — no backfill.
+same task via SHA-256 (see app/ledger.py). Adds nullable prev_hash / entry_hash.
+Existing rows (if any) keep NULL hashes; crud.verify_approval_chain treats such
+rows as "legacy" — not covered by tamper-evidence — and verifies only the
+hash-chained rows recorded after this migration. Personal PoC — no backfill.
 """
 
 from collections.abc import Sequence

@@ -2,6 +2,7 @@
 
 from datetime import datetime
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import ledger, models
@@ -147,7 +148,20 @@ def create_task_assignment(db: Session, task_id: int, actor_id: int, role: model
         return existing
     db_assignment = models.TaskAssignment(task_id=task_id, actor_id=actor_id, role=role)
     db.add(db_assignment)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Concurrent insert won the race; the unique constraint rejected ours.
+        db.rollback()
+        return (
+            db.query(models.TaskAssignment)
+            .filter(
+                models.TaskAssignment.task_id == task_id,
+                models.TaskAssignment.actor_id == actor_id,
+                models.TaskAssignment.role == role,
+            )
+            .first()
+        )
     db.refresh(db_assignment)
     return db_assignment
 
@@ -350,7 +364,7 @@ def record_approval(
         reviewer_actor_id=reviewer_actor_id,
         action=action,
         comment=comment,
-        created_at_iso=now.isoformat(),
+        created_at=now,
     )
     db_approval = models.Approval(
         task_id=task_id,
@@ -374,22 +388,30 @@ def get_approvals(db: Session, task_id: int):
 def verify_approval_chain(db: Session, task_id: int) -> dict:
     """Recompute the approval hash chain for a task and report tampering.
 
-    Returns {"valid": bool, "broken_at": <approval id or None>, "count": int}.
-    A mismatch means a recorded approval was altered (or the chain was reordered)
-    after the fact.
+    Returns {"valid": bool, "broken_at": <approval id or None>, "count": int,
+    "legacy": int}. ``legacy`` counts pre-migration-004 rows (entry_hash IS NULL)
+    that predate the hash chain; these are not covered by tamper-evidence and are
+    skipped (the chain restarts after them, matching record_approval). A mismatch
+    among hashed rows means a recorded approval was altered or reordered.
     """
     approvals = get_approvals(db, task_id)
     prev_hash = None
+    legacy = 0
     for approval in approvals:
+        if approval.entry_hash is None:
+            # Legacy row (recorded before the hash chain existed); not verifiable.
+            legacy += 1
+            prev_hash = None
+            continue
         expected = ledger.compute_entry_hash(
             prev_hash,
             task_id=approval.task_id,
             reviewer_actor_id=approval.reviewer_actor_id,
             action=approval.action,
             comment=approval.comment,
-            created_at_iso=approval.created_at.isoformat(),
+            created_at=approval.created_at,
         )
         if approval.prev_hash != prev_hash or approval.entry_hash != expected:
-            return {"valid": False, "broken_at": approval.id, "count": len(approvals)}
+            return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
         prev_hash = approval.entry_hash
-    return {"valid": True, "broken_at": None, "count": len(approvals)}
+    return {"valid": True, "broken_at": None, "count": len(approvals), "legacy": legacy}
