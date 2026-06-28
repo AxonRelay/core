@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, isAbort } from "../api";
 import type { Approval, Draft, Task } from "../types";
 import { LedgerBadge } from "./LedgerBadge";
 
@@ -7,26 +7,46 @@ function formatTime(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 export function TaskDetail({ taskId }: { taskId: number }) {
   const [task, setTask] = useState<Task | null>(null);
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [draftsError, setDraftsError] = useState<string | null>(null);
+  const [approvalsError, setApprovalsError] = useState<string | null>(null);
 
+  // Each section fetches independently so a single failed sub-request doesn't
+  // blank the whole pane (the task header still renders if drafts/approvals fail).
   useEffect(() => {
-    let alive = true;
+    const controller = new AbortController();
+    let cancelled = false;
     setError(null);
     setTask(null);
-    Promise.all([api.getTask(taskId), api.getDrafts(taskId), api.getApprovals(taskId)])
-      .then(([t, d, a]) => {
-        if (!alive) return;
-        setTask(t);
-        setDrafts(d);
-        setApprovals(a);
-      })
-      .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
+    setDrafts([]);
+    setDraftsError(null);
+    setApprovals([]);
+    setApprovalsError(null);
+
+    api
+      .getTask(taskId, controller.signal)
+      .then((t) => !cancelled && setTask(t))
+      .catch((e: unknown) => !cancelled && !isAbort(e) && setError(message(e)));
+    api
+      .getDrafts(taskId, controller.signal)
+      .then((d) => !cancelled && setDrafts(d))
+      .catch((e: unknown) => !cancelled && !isAbort(e) && setDraftsError(message(e)));
+    api
+      .getApprovals(taskId, controller.signal)
+      .then((a) => !cancelled && setApprovals(a))
+      .catch((e: unknown) => !cancelled && !isAbort(e) && setApprovalsError(message(e)));
+
     return () => {
-      alive = false;
+      cancelled = true;
+      controller.abort();
     };
   }, [taskId]);
 
@@ -60,7 +80,8 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       )}
 
       <h3>Drafts ({drafts.length})</h3>
-      {drafts.length === 0 && <p className="muted">No drafts yet.</p>}
+      {draftsError && <p className="badge badge-warn">{draftsError}</p>}
+      {!draftsError && drafts.length === 0 && <p className="muted">No drafts yet.</p>}
       {drafts.map((d) => (
         <details key={d.id} className="draft">
           <summary>
@@ -71,7 +92,8 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       ))}
 
       <h3>Approval ledger ({approvals.length})</h3>
-      {approvals.length === 0 && <p className="muted">No approvals recorded.</p>}
+      {approvalsError && <p className="badge badge-warn">{approvalsError}</p>}
+      {!approvalsError && approvals.length === 0 && <p className="muted">No approvals recorded.</p>}
       <ol className="timeline">
         {approvals.map((a) => (
           <li key={a.id} className={`event event-${a.action}`}>

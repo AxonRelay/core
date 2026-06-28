@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "./api";
+import { api, isAbort } from "./api";
 import { TaskDetail } from "./components/TaskDetail";
 import { TaskList } from "./components/TaskList";
 import type { Task, TaskStatus } from "./types";
@@ -11,19 +11,18 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let alive = true;
+    const controller = new AbortController();
     setError(null);
     api
-      .listTasks(statusFilter === "all" ? undefined : statusFilter)
+      .listTasks(statusFilter === "all" ? undefined : statusFilter, controller.signal)
       .then((ts) => {
-        if (!alive) return;
         setTasks(ts);
         setSelectedId((cur) => (cur && ts.some((t) => t.id === cur) ? cur : (ts[0]?.id ?? null)));
       })
-      .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      alive = false;
-    };
+      .catch((e: unknown) => {
+        if (!isAbort(e)) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => controller.abort();
   }, [statusFilter]);
 
   return (

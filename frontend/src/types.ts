@@ -46,11 +46,13 @@ export interface Draft {
   created_at: string;
 }
 
+export type ApprovalAction = "approved" | "rejected";
+
 export interface Approval {
   id: number;
   task_id: number;
   reviewer_actor_id: number | null;
-  action: string;
+  action: ApprovalAction;
   comment: string | null;
   created_at: string;
 }

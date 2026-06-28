@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, isAbort } from "../api";
 import type { LedgerVerdict } from "../types";
 
 // Shows the tamper-evidence verdict for a task's approval hash chain.
@@ -8,16 +8,16 @@ export function LedgerBadge({ taskId }: { taskId: number }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let alive = true;
+    const controller = new AbortController();
     setVerdict(null);
     setError(null);
     api
-      .verifyLedger(taskId)
-      .then((v) => alive && setVerdict(v))
-      .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      alive = false;
-    };
+      .verifyLedger(taskId, controller.signal)
+      .then(setVerdict)
+      .catch((e: unknown) => {
+        if (!isAbort(e)) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => controller.abort();
   }, [taskId]);
 
   if (error) return <span className="badge badge-warn">ledger: {error}</span>;
