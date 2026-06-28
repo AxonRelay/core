@@ -42,7 +42,7 @@ IDE (Claude Code / Cursor / Zed)
    │  MCP（ローカルは stdio、将来は Tunnel 経由の Streamable HTTP）
    ▼
 AxonRelay Backend（FastAPI + MCP サーバ同居）
-   │   - MCP : 12 tools + 2 resources（メインインターフェース）
+   │   - MCP : 14 tools + 2 resources（メインインターフェース）
    │   - REST: /tasks /agents /actors（読み取り中心・ダッシュボード用）
    │   - Postgres: Platform thread state の射影 → 台帳
    │
@@ -70,7 +70,7 @@ REST API は主にダッシュボードから台帳を読むためにある。
 | `Actor` | 人と AI を同型で扱う統一抽象。人間 Actor（`name="self"`）1 件がオペレータ。AI Actor は `AgentDefinition` と 1:1。 |
 | `TaskAssignment` | Actor を Task にロール付きで紐付け: `executor` / `reviewer` / `approver` / `observer`。 |
 | `Draft` | タスク出力の版付き履歴。 |
-| `Approval` | 追記専用の記録: `action`（approved/rejected）/ `comment` / `reviewer_actor_id` / timestamp。 |
+| `Approval` | 追記専用の記録: `action`（approved/rejected）/ `comment` / `reviewer_actor_id` / timestamp。per-task SHA-256 hash chain（`prev_hash` / `entry_hash`・[`app/ledger.py`](backend/app/ledger.py)）で改ざん検出可能。 |
 | `ExternalLink` | 外部成果物へのリンク（将来の MCP リソース URI など）。 |
 
 ステートマシン:
@@ -87,8 +87,9 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 
 ### MCP サーバ（一次）
 
-12 tools（`list_tasks`, `create_task`, `get_task`, `run_task`,
-`list_pending_approvals`, `approve_task`, `reject_task`, `get_drafts`,
+14 tools（`list_tasks`, `create_task`, `get_task`, `run_task`,
+`list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
+（MCP elicitation による対話的承認）, `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`）と 2 resources
 （`axonrelay://tasks/{id}`, `axonrelay://tasks/{id}/drafts/{version}`）。
 
@@ -106,6 +107,7 @@ tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-s
 | `GET` | `/tasks/pending/approvals` | 統一承認受信箱 |
 | `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | 承認 / 差戻し |
 | `GET` | `/tasks/{id}/drafts` | ドラフト履歴 |
+| `GET` | `/tasks/{id}/ledger/verify` | 承認 hash chain の改ざん検証 |
 | `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | タスク割り当て |
 
 書き込み系は MCP 側からも公開され、IDE からはそちらが一次経路。
@@ -158,7 +160,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは **一部完了** — backend は完了、frontend/インフラの掃除が未着手:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（12 tools / 2 resources）、LangGraph Platform クライアント、migration 003。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（14 tools / 2 resources）、LangGraph Platform クライアント、migration 005 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）。台帳は単一書き込み者（オペレータ）前提で、同一 task への並行承認は PoC では対象外（[delta-mvp-spec §11.6](docs/delta-mvp-spec.md) 参照）。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: ピボット前の Next.js（NextAuth / `/projects` / 旧 `/task/start` UI）を撤去済み。薄い読み取り専用 AG-UI ダッシュボードを新規に作り直す予定（Phase 2.5）。
 - 🚧 **Infra**: `infra/`（AWS DNS）と旧 `Caddyfile` / 本番構成は撤去予定（Cloudflare Tunnel + Tailscale へ切替、Phase 2.4）。

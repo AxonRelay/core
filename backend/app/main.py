@@ -436,6 +436,19 @@ async def get_drafts_endpoint(request: Request, task_id: int, db: Session = Depe
     return crud.get_drafts(db, task_id)
 
 
+# ========== Ledger Integrity ==========
+
+
+@app.get("/tasks/{task_id}/ledger/verify")
+@limiter.limit("60/minute")
+async def verify_ledger_endpoint(request: Request, task_id: int, db: Session = Depends(get_db)):
+    """Verify the tamper-evident approval hash chain for a task."""
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return crud.verify_approval_chain(db, task_id)
+
+
 # ========== Task Assignments ==========
 
 
@@ -453,6 +466,9 @@ async def create_task_assignment_endpoint(
     assignment_data: TaskAssignmentCreateRequest,
     db: Session = Depends(get_db),
 ):
+    if not crud.get_task(db, task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+
     actor = crud.get_actor(db, assignment_data.actor_id)
     if not actor:
         raise HTTPException(status_code=404, detail="Actor not found")

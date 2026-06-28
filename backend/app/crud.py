@@ -1,8 +1,11 @@
 """CRUD operations for database models (personal PoC, post-migration 003)."""
 
+from datetime import datetime
+
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import models
+from app import ledger, models
 
 # ========== Actor Operations ==========
 
@@ -129,9 +132,41 @@ def get_actor_assignments(db: Session, actor_id: int, skip: int = 0, limit: int 
 
 
 def create_task_assignment(db: Session, task_id: int, actor_id: int, role: models.AssignmentRoleEnum):
+    """Assign an actor to a task with a role. Idempotent on (task_id, actor_id,
+    role): a repeat call returns the existing row instead of violating the
+    unique constraint."""
+    existing = (
+        db.query(models.TaskAssignment)
+        .filter(
+            models.TaskAssignment.task_id == task_id,
+            models.TaskAssignment.actor_id == actor_id,
+            models.TaskAssignment.role == role,
+        )
+        .first()
+    )
+    if existing:
+        return existing
     db_assignment = models.TaskAssignment(task_id=task_id, actor_id=actor_id, role=role)
     db.add(db_assignment)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Only treat this as idempotent if a matching row now exists (a concurrent
+        # insert won the unique-constraint race). Any other integrity error (e.g.
+        # a bad task_id / actor_id FK) is re-raised rather than silently swallowed.
+        db.rollback()
+        winner = (
+            db.query(models.TaskAssignment)
+            .filter(
+                models.TaskAssignment.task_id == task_id,
+                models.TaskAssignment.actor_id == actor_id,
+                models.TaskAssignment.role == role,
+            )
+            .first()
+        )
+        if winner is None:
+            raise
+        return winner
     db.refresh(db_assignment)
     return db_assignment
 
@@ -195,8 +230,9 @@ def get_actor_tasks_by_role(
         db.query(models.Task)
         .join(models.TaskAssignment)
         .filter(models.TaskAssignment.actor_id == actor_id, models.TaskAssignment.role == role)
-        # distinct(): a task must appear once even if the actor somehow holds the
-        # same role on it more than once (no UniqueConstraint on TaskAssignment yet).
+        # distinct(): defence in depth against a task appearing twice via the
+        # join (the (task_id, actor_id, role) unique constraint should already
+        # prevent duplicate assignments).
         .distinct()
     )
     if status:
@@ -317,12 +353,32 @@ def record_approval(
     action: str,
     comment: str | None = None,
 ):
-    """Record an approval / rejection event."""
+    """Record an approval / rejection event, chained to the task's prior entry.
+
+    created_at is set explicitly here (not via the column default) so the value
+    that is hashed is exactly the value persisted.
+    """
+    now = datetime.utcnow()
+    last = (
+        db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
+    )
+    prev_hash = last.entry_hash if last else None
+    entry_hash = ledger.compute_entry_hash(
+        prev_hash,
+        task_id=task_id,
+        reviewer_actor_id=reviewer_actor_id,
+        action=action,
+        comment=comment,
+        created_at=now,
+    )
     db_approval = models.Approval(
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action=action,
         comment=comment,
+        created_at=now,
+        prev_hash=prev_hash,
+        entry_hash=entry_hash,
     )
     db.add(db_approval)
     db.commit()
@@ -331,9 +387,41 @@ def record_approval(
 
 
 def get_approvals(db: Session, task_id: int):
-    return (
-        db.query(models.Approval)
-        .filter(models.Approval.task_id == task_id)
-        .order_by(models.Approval.created_at.asc())
-        .all()
-    )
+    return db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.asc()).all()
+
+
+def verify_approval_chain(db: Session, task_id: int) -> dict:
+    """Recompute the approval hash chain for a task and report tampering.
+
+    Returns {"valid": bool, "broken_at": <approval id or None>, "count": int,
+    "legacy": int}. ``legacy`` counts pre-migration-004 rows (entry_hash IS NULL)
+    that predate the hash chain; these are not covered by tamper-evidence and are
+    skipped (the chain restarts after them, matching record_approval). A mismatch
+    among hashed rows means a recorded approval was altered or reordered.
+    """
+    approvals = get_approvals(db, task_id)
+    prev_hash = None
+    legacy = 0
+    seen_hashed = False
+    for approval in approvals:
+        if approval.entry_hash is None:
+            # A NULL hash is only acceptable as a leading legacy prefix (rows that
+            # predate the hash chain). A NULL appearing *after* the chain has
+            # started means a hashed row was blanked out — that is tampering.
+            if seen_hashed:
+                return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
+            legacy += 1
+            continue
+        seen_hashed = True
+        expected = ledger.compute_entry_hash(
+            prev_hash,
+            task_id=approval.task_id,
+            reviewer_actor_id=approval.reviewer_actor_id,
+            action=approval.action,
+            comment=approval.comment,
+            created_at=approval.created_at,
+        )
+        if approval.prev_hash != prev_hash or approval.entry_hash != expected:
+            return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
+        prev_hash = approval.entry_hash
+    return {"valid": True, "broken_at": None, "count": len(approvals), "legacy": legacy}

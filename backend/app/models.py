@@ -3,7 +3,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -99,6 +99,7 @@ class TaskAssignment(Base):
     """Assignment of an Actor (human or AI) to a Task with a specific role."""
 
     __tablename__ = "task_assignments"
+    __table_args__ = (UniqueConstraint("task_id", "actor_id", "role", name="uq_assignment_task_actor_role"),)
 
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -166,6 +167,11 @@ class Approval(Base):
     action = Column(String(20), nullable=False)
     comment = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Tamper-evident hash chain (see app/ledger.py). prev_hash links to the
+    # previous approval's entry_hash for the same task; entry_hash is this row's.
+    prev_hash = Column(String(64))
+    entry_hash = Column(String(64))
 
     task = relationship("Task", back_populates="approvals")
     reviewer = relationship("Actor", back_populates="approvals", foreign_keys=[reviewer_actor_id])

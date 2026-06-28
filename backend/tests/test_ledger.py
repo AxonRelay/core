@@ -5,6 +5,9 @@ draft versions are monotonic, approvals are append-only, and the approval inbox
 only surfaces tasks that genuinely await the operator's decision.
 """
 
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from app import crud, models
 
 
@@ -68,3 +71,25 @@ def test_pending_approvals_does_not_duplicate_on_repeated_assignment(db, self_ac
 
     pending = crud.list_pending_approvals(db, actor_id=self_actor.id)
     assert [t.thread_id for t in pending] == ["t-dup"]
+
+
+def test_create_assignment_is_idempotent_on_task_actor_role(db, self_actor):
+    """A repeat (task, actor, role) assignment returns the existing row, not a dup."""
+    task = _task(db, thread_id="t-idem")
+    role = models.AssignmentRoleEnum.APPROVER
+
+    first = crud.create_task_assignment(db, task_id=task.id, actor_id=self_actor.id, role=role)
+    second = crud.create_task_assignment(db, task_id=task.id, actor_id=self_actor.id, role=role)
+
+    assert first.id == second.id
+    assert len(crud.get_task_assignments(db, task.id)) == 1
+
+    # A different role for the same actor is a distinct assignment.
+    crud.create_task_assignment(db, task_id=task.id, actor_id=self_actor.id, role=models.AssignmentRoleEnum.REVIEWER)
+    assert len(crud.get_task_assignments(db, task.id)) == 2
+
+
+def test_create_assignment_reraises_non_unique_integrity_errors(db, self_actor):
+    """A bad FK (non-existent task) must raise, not be swallowed as a 'race win'."""
+    with pytest.raises(IntegrityError):
+        crud.create_task_assignment(db, task_id=999999, actor_id=self_actor.id, role=models.AssignmentRoleEnum.APPROVER)

@@ -17,7 +17,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.session import ServerSession
+from pydantic import BaseModel, Field
 
 from app import crud, langgraph_client, models, service
 from app.database import SessionLocal
@@ -108,6 +110,20 @@ def get_drafts(task_id: int) -> list[dict]:
 
 
 @mcp.tool()
+def verify_task_ledger(task_id: int) -> dict:
+    """Verify the tamper-evident approval hash chain for a task.
+
+    Returns {"valid": bool, "broken_at": approval id or None, "count": int,
+    "legacy": int}. valid=False means a recorded approval was altered or reordered
+    after the fact; "legacy" counts pre-hash-chain rows that are not covered.
+    """
+    with _session() as db:
+        if not crud.get_task(db, task_id):
+            raise ValueError(f"Task {task_id} not found")
+        return crud.verify_approval_chain(db, task_id)
+
+
+@mcp.tool()
 async def create_task(
     title: str,
     description: str | None = None,
@@ -179,13 +195,18 @@ async def run_task(task_id: int) -> dict:
         return task_to_dict(task)
 
 
-@mcp.tool()
-async def approve_task(
+async def _apply_decision(
     task_id: int,
-    comment: str | None = None,
+    *,
+    action: str,
+    comment: str | None,
     modified_draft: str | None = None,
 ) -> dict:
-    """Approve a task that's WAITING_APPROVAL. Optionally include comment / edit."""
+    """Record an approve/reject in the ledger and resume the Platform thread.
+
+    Shared by the approve_task / reject_task tools and the interactive
+    review_pending_task (elicitation) tool so they cannot drift.
+    """
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
@@ -200,20 +221,26 @@ async def approve_task(
             db,
             task_id=task_id,
             reviewer_actor_id=reviewer_actor_id,
-            action="approved",
+            action=action,
             comment=comment,
         )
-        result = await langgraph_client.resume_thread(
-            task.thread_id,
-            {
-                "decision": "approved",
-                "human_comment": comment,
-                "modified_draft": modified_draft,
-            },
-        )
+        resume_payload = {"decision": action, "human_comment": comment}
+        if action == "approved":
+            resume_payload["modified_draft"] = modified_draft
+        result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
         _sync_state(db, task, result)
         db.refresh(task)
         return task_to_dict(task)
+
+
+@mcp.tool()
+async def approve_task(
+    task_id: int,
+    comment: str | None = None,
+    modified_draft: str | None = None,
+) -> dict:
+    """Approve a task that's WAITING_APPROVAL. Optionally include comment / edit."""
+    return await _apply_decision(task_id, action="approved", comment=comment, modified_draft=modified_draft)
 
 
 @mcp.tool()
@@ -223,31 +250,74 @@ async def reject_task(
     reason: str | None = None,
 ) -> dict:
     """Reject a task; revision loop continues unless the iteration cap is hit."""
+    combined = " | ".join(p for p in [comment, reason] if p) or None
+    return await _apply_decision(task_id, action="rejected", comment=combined)
+
+
+class _ApprovalDecision(BaseModel):
+    """Elicitation schema for an interactive approval decision."""
+
+    approve: bool = Field(description="Approve the draft? false = reject / request revision.")
+    comment: str = Field(default="", description="Optional note recorded in the approval ledger.")
+    modified_draft: str = Field(
+        default="",
+        description="Optional edited draft text (used only when approving); leave blank to keep the draft as-is.",
+    )
+
+
+@mcp.tool()
+async def review_pending_task(task_id: int, ctx: Context[ServerSession, None]) -> dict:
+    """Interactively review a WAITING_APPROVAL task.
+
+    Shows the current draft and reviewer feedback, then asks for your decision
+    through the MCP client's native elicitation prompt, records it in the
+    tamper-evident ledger, and resumes the graph. Clients that do not support
+    elicitation should use approve_task / reject_task directly instead.
+
+    If the task changes between display and decision (the draft no longer matches
+    what was shown, or it is no longer waiting), the call returns
+    status="stale_decision" and records nothing, so you never approve unseen content.
+    """
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
+        title, draft, feedback = task.title, task.current_draft, task.feedback
 
-        self_actor = crud.get_self_actor(db)
-        reviewer_actor_id = self_actor.id if self_actor else None
+    # Elicit outside the DB session — don't pin a session across user interaction.
+    message = (
+        f"Task #{task_id}: {title}\n\n"
+        f"--- Draft ---\n{draft or '(no draft)'}\n\n"
+        f"--- Reviewer feedback ---\n{feedback or '(none)'}\n\n"
+        "Approve this draft?"
+    )
+    result = await ctx.elicit(message=message, schema=_ApprovalDecision)
+    if result.action != "accept" or not result.data:
+        return {"status": "no_decision", "elicitation_action": result.action, "task_id": task_id}
 
-        combined = " | ".join(p for p in [comment, reason] if p) or None
-        crud.record_approval(
-            db,
-            task_id=task_id,
-            reviewer_actor_id=reviewer_actor_id,
-            action="rejected",
-            comment=combined,
+    # Staleness guard: the task may have changed while we awaited the human's
+    # response. Only record a decision against the exact draft that was shown;
+    # otherwise the operator would approve content they never saw.
+    with _session() as db:
+        current = crud.get_task(db, task_id)
+        if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL or current.current_draft != draft:
+            return {
+                "status": "stale_decision",
+                "task_id": task_id,
+                "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
+            }
+
+    decision = result.data
+    if decision.approve:
+        return await _apply_decision(
+            task_id,
+            action="approved",
+            comment=decision.comment or None,
+            modified_draft=decision.modified_draft or None,
         )
-        result = await langgraph_client.resume_thread(
-            task.thread_id,
-            {"decision": "rejected", "human_comment": combined},
-        )
-        _sync_state(db, task, result)
-        db.refresh(task)
-        return task_to_dict(task)
+    return await _apply_decision(task_id, action="rejected", comment=decision.comment or None)
 
 
 # ========== Agent / Actor Tools ==========
