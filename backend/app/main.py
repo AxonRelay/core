@@ -436,6 +436,16 @@ async def get_drafts_endpoint(request: Request, task_id: int, db: Session = Depe
     return crud.get_drafts(db, task_id)
 
 
+@app.get("/tasks/{task_id}/approvals", response_model=list[ApprovalResponse])
+@limiter.limit("60/minute")
+async def get_approvals_endpoint(request: Request, task_id: int, db: Session = Depends(get_db)):
+    """Approval / rejection history for a task (read-only, for the dashboard)."""
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return crud.get_approvals(db, task_id)
+
+
 # ========== Ledger Integrity ==========
 
 

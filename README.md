@@ -167,7 +167,7 @@ The pivot is **partially complete** — backend done, frontend/infra cleanup pen
 
 - ✅ **Backend**: Actor-based ledger, MCP server (14 tools / 2 resources), LangGraph Platform client, migrations through 005. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`). The ledger assumes a single serial writer (the operator); concurrent approvals on one task are out of scope for the PoC (see [delta-mvp-spec §11.6](docs/delta-mvp-spec.md)).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
-- ✅ **Frontend**: the pre-pivot Next.js (NextAuth, `/projects`, old `/task/start` UI) has been removed. A thin read-only AG-UI dashboard is to be rebuilt from scratch (Phase 2.5).
+- ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
 - 🚧 **Infra**: `infra/` (AWS DNS) and the old `Caddyfile` / production setup are slated for removal (cutover to Cloudflare Tunnel + Tailscale, Phase 2.4).
 - 🚧 **Tests**: pytest suite covering the ledger invariants and the run-state projection's idempotency (`backend/tests/`, runs in CI on 3.12). Broader coverage still to come.
 
