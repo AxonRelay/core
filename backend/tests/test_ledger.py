@@ -68,3 +68,19 @@ def test_pending_approvals_does_not_duplicate_on_repeated_assignment(db, self_ac
 
     pending = crud.list_pending_approvals(db, actor_id=self_actor.id)
     assert [t.thread_id for t in pending] == ["t-dup"]
+
+
+def test_create_assignment_is_idempotent_on_task_actor_role(db, self_actor):
+    """A repeat (task, actor, role) assignment returns the existing row, not a dup."""
+    task = _task(db, thread_id="t-idem")
+    role = models.AssignmentRoleEnum.APPROVER
+
+    first = crud.create_task_assignment(db, task_id=task.id, actor_id=self_actor.id, role=role)
+    second = crud.create_task_assignment(db, task_id=task.id, actor_id=self_actor.id, role=role)
+
+    assert first.id == second.id
+    assert len(crud.get_task_assignments(db, task.id)) == 1
+
+    # A different role for the same actor is a distinct assignment.
+    crud.create_task_assignment(db, task_id=task.id, actor_id=self_actor.id, role=models.AssignmentRoleEnum.REVIEWER)
+    assert len(crud.get_task_assignments(db, task.id)) == 2

@@ -47,7 +47,7 @@ IDE (Claude Code / Cursor / Zed)
    │  MCP (stdio locally; Streamable HTTP via tunnel later)
    ▼
 AxonRelay Backend (FastAPI + MCP server, co-located)
-   │   - MCP: 12 tools + 2 resources  (primary interface)
+   │   - MCP: 14 tools + 2 resources  (primary interface)
    │   - REST: /tasks /agents /actors  (read-heavy, for the dashboard)
    │   - Postgres: projection of Platform thread state → the ledger
    │
@@ -75,7 +75,7 @@ through MCP; the REST API is mostly for reading the ledger from a dashboard.
 | `Actor` | Unified abstraction for humans and AI. A single human Actor (`name="self"`) is the operator; AI actors are 1:1 with `AgentDefinition`. |
 | `TaskAssignment` | Binds an Actor to a Task with a role: `executor` / `reviewer` / `approver` / `observer`. |
 | `Draft` | Versioned history of a task's output. |
-| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp. |
+| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp. Tamper-evident via a per-task SHA-256 hash chain (`prev_hash` / `entry_hash`, see [`app/ledger.py`](backend/app/ledger.py)). |
 | `ExternalLink` | Link to an external artifact (e.g. a future MCP resource URI). |
 
 State machine:
@@ -92,8 +92,9 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 
 ### MCP server (primary)
 
-12 tools (`list_tasks`, `create_task`, `get_task`, `run_task`,
-`list_pending_approvals`, `approve_task`, `reject_task`, `get_drafts`,
+14 tools (`list_tasks`, `create_task`, `get_task`, `run_task`,
+`list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
+(interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`) and 2 resources
 (`axonrelay://tasks/{id}`, `axonrelay://tasks/{id}/drafts/{version}`).
 
@@ -111,6 +112,7 @@ Full tool reference and Claude Code setup: **[docs/mcp-server.md](docs/mcp-serve
 | `GET` | `/tasks/pending/approvals` | The unified approval inbox |
 | `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | Approve / reject |
 | `GET` | `/tasks/{id}/drafts` | Draft history |
+| `GET` | `/tasks/{id}/ledger/verify` | Verify the tamper-evident approval hash chain |
 | `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | Task assignments |
 
 Writes are also exposed via MCP and are the primary path from the IDE.
@@ -163,7 +165,7 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is **partially complete** — backend done, frontend/infra cleanup pending:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (12 tools / 2 resources), LangGraph Platform client, migration 003.
+- ✅ **Backend**: Actor-based ledger, MCP server (14 tools / 2 resources), LangGraph Platform client, migrations through 005. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: the pre-pivot Next.js (NextAuth, `/projects`, old `/task/start` UI) has been removed. A thin read-only AG-UI dashboard is to be rebuilt from scratch (Phase 2.5).
 - 🚧 **Infra**: `infra/` (AWS DNS) and the old `Caddyfile` / production setup are slated for removal (cutover to Cloudflare Tunnel + Tailscale, Phase 2.4).

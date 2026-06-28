@@ -61,6 +61,8 @@ def approval_to_dict(approval: models.Approval) -> dict:
         "action": approval.action,
         "comment": approval.comment,
         "created_at": approval.created_at.isoformat(),
+        "prev_hash": approval.prev_hash,
+        "entry_hash": approval.entry_hash,
     }
 
 
