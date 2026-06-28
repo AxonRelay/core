@@ -151,9 +151,11 @@ def create_task_assignment(db: Session, task_id: int, actor_id: int, role: model
     try:
         db.commit()
     except IntegrityError:
-        # Concurrent insert won the race; the unique constraint rejected ours.
+        # Only treat this as idempotent if a matching row now exists (a concurrent
+        # insert won the unique-constraint race). Any other integrity error (e.g.
+        # a bad task_id / actor_id FK) is re-raised rather than silently swallowed.
         db.rollback()
-        return (
+        winner = (
             db.query(models.TaskAssignment)
             .filter(
                 models.TaskAssignment.task_id == task_id,
@@ -162,6 +164,9 @@ def create_task_assignment(db: Session, task_id: int, actor_id: int, role: model
             )
             .first()
         )
+        if winner is None:
+            raise
+        return winner
     db.refresh(db_assignment)
     return db_assignment
 

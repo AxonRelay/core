@@ -466,6 +466,9 @@ async def create_task_assignment_endpoint(
     assignment_data: TaskAssignmentCreateRequest,
     db: Session = Depends(get_db),
 ):
+    if not crud.get_task(db, task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+
     actor = crud.get_actor(db, assignment_data.actor_id)
     if not actor:
         raise HTTPException(status_code=404, detail="Actor not found")

@@ -113,8 +113,9 @@ def get_drafts(task_id: int) -> list[dict]:
 def verify_task_ledger(task_id: int) -> dict:
     """Verify the tamper-evident approval hash chain for a task.
 
-    Returns {"valid": bool, "broken_at": approval id or None, "count": int}.
-    valid=False means a recorded approval was altered or reordered after the fact.
+    Returns {"valid": bool, "broken_at": approval id or None, "count": int,
+    "legacy": int}. valid=False means a recorded approval was altered or reordered
+    after the fact; "legacy" counts pre-hash-chain rows that are not covered.
     """
     with _session() as db:
         if not crud.get_task(db, task_id):

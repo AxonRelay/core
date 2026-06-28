@@ -48,7 +48,7 @@ python -m app.mcp.server
 | `approve_task(task_id, comment?, modified_draft?)` | 承認（任意で edit） |
 | `reject_task(task_id, comment?, reason?)` | 差戻し（revision loop） |
 | `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。elicitation 非対応クライアントは `approve_task`/`reject_task` を使う |
-| `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count}`） |
+| `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy}`。`legacy` は hash chain 導入前の行数） |
 | `list_agents(agent_type?, is_active?)` | AI Actor 一覧 |
 | `create_agent(name, agent_type, ...)` | AI Actor 定義 |
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
