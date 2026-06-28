@@ -18,10 +18,7 @@ docker compose up --build -d
 
 これにより、以下のコンテナが起動します：
 - `postgres` (PostgreSQL 16)
-- `redis` (Redis)
-- `backend` (FastAPI)
-- `frontend` (Next.js)
-- `caddy` (リバースプロキシ)
+- `backend` (FastAPI + MCP サーバ)
 
 ### 2. データベースマイグレーションの実行
 

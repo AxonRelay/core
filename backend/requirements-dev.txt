@@ -3,3 +3,6 @@
 
 # Linting & Formatting
 ruff>=0.8.0
+
+# Testing
+pytest>=8.0.0

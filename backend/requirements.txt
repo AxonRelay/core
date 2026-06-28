@@ -1,14 +1,10 @@
 fastapi
 uvicorn[standard]
-langchain-openai
-langgraph
-langgraph-checkpoint-redis
-redis
 pydantic
 python-dotenv
 slowapi
 sqlalchemy
 alembic
 psycopg2-binary
-pyjwt
-cryptography
+langgraph-sdk
+mcp

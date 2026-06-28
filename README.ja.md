@@ -2,225 +2,176 @@
 
 日本語 | **[English](README.md)**
 
-AI Agent Orchestration with Human-in-the-Loop — コアシステム
+**人＋AI 混成チームのためのガバナンス台帳を、MCP サーバとして公開する。**
+
+AxonRelay は「**誰が**（人か AI か）、**どのドラフト版**に対して、**何をしたか**、そして
+**誰が・どんなコメントで・いつ承認/差戻したか**」を記録する。エージェントランタイム、
+人間の介入（承認待ち）、UI はすべて標準（LangGraph Platform / MCP / AG-UI）に委譲する。
+AxonRelay が自分で持ち続けるのは、それらの標準が**提供しない**部分——
+**永続的で、セッションをまたぎ、Actor をまたぐ承認・改稿台帳**だけ。
+
+> **状態: 個人 PoC（ピボット後）。** 元は汎用「AI Agent Orchestration」基盤だったが、
+> その層は LangGraph Platform + MCP + AG-UI でコモディティ化したため、唯一持つ価値の
+> ある「ガバナンス台帳」に絞り込んだ。backend（Actor モデル / 台帳 / MCP サーバ /
+> Platform クライアント）は移行済み。旧 Next.js の auth/projects UI と AWS インフラは
+> 撤去途中——[現状](#現状) を参照。
 
 ---
 
-## Phase 1 Roadmap
+## なぜ存在するのか（2026 年中盤の文脈）
 
-> 🔴 Not Started  🟡 In Progress  🟢 Done
+2026 年中盤までに agentic スタックは 3 層に定着した——ツールは **MCP**、エージェント間は
+**A2A**、エージェント↔UI は **AG-UI**。そして「人間に確認を求めて一時停止する」ことは
+MCP のネイティブ機能（`elicitation`）になった。**承認のための一時停止は、もはや差別化要因ではない。**
 
-```mermaid
-flowchart LR
-    subgraph M1["M1: プロジェクト基盤"]
-        I1["#1 .gitignore\n.env.example 🟢"]
-        I2["#2 README.md 🟢"]
-        I3["#3 docker-compose.yml 🟢"]
-        I4["#4 Caddyfile 🟢"]
-    end
+これらの層が与えてくれないのは「**説明責任の永続的な記録**」だ。elicitation は揮発的で
+セッション内限り、observability ツールは run を記録するが「誰が何を承認したか」は記録しない。
+一方で EU AI Act の高リスク義務は **2026-08-02 に full enforcement** を迎え、その中核要求は
+まさに——改ざん耐性のある行動ログ、高影響行動への人間承認ゲート、そしてすべての行動を
+責任ある identity（人**または**エージェント）に帰属させること——である。
 
-    subgraph M2["M2: Backend"]
-        I5["#5 Dockerfile 🟢"]
-        I6["#6 Python依存関係 🟢"]
-        I7["#7 FastAPI骨格 🟢"]
-        I8["#8 Stateスキーマ 🟢"]
-        I9["#9 LangGraphグラフ 🟢"]
-        I10["#10 Redis統合 🟢"]
-        I11["#11 API: start/status 🟢"]
-        I12["#12 API: approve 🟢"]
-    end
+AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（interrupt 境界の外側の例外としてではなく）。
+これがこのリポジトリが保持し、dogfood する残存価値だ。
 
-    subgraph M3["M3: Frontend"]
-        I13["#13 Next.js Setup 🟢"]
-        I14["#14 タスク入力UI 🟢"]
-        I15["#15 承認UI 🟢"]
-    end
+---
 
-    subgraph M4["M4: Docker統合"]
-        I16["#16 フルスタック起動 🟢"]
-        I17["#17 E2Eフロー検証 🟢"]
-    end
+## アーキテクチャ
 
-    subgraph M5["M5: AWSデプロイ"]
-        I18["#18 EC2構築 🟢"]
-        I19["#19 DNS設定 🟢"]
-        I20["#20 本番デプロイ 🟢"]
-    end
-
-    %% 依存関係
-    I1 --> I3
-    I1 --> I5
-    I1 --> I13
-    I3 --> I16
-    I4 --> I16
-
-    I5 --> I7
-    I6 --> I7
-    I7 --> I8
-    I8 --> I9
-    I9 --> I10
-    I10 --> I11
-    I11 --> I12
-
-    I13 --> I14
-    I14 --> I15
-
-    I12 --> I16
-    I15 --> I16
-    I16 --> I17
-
-    I17 --> I18
-    I18 --> I19
-    I19 --> I20
-
-    %% スタイル
-    style M1 fill:#1e293b,stroke:#facc15,color:#fef9c3
-    style M2 fill:#1e293b,stroke:#ef4444,color:#fecaca
-    style M3 fill:#1e293b,stroke:#a855f7,color:#e9d5ff
-    style M4 fill:#1e293b,stroke:#3b82f6,color:#bfdbfe
-    style M5 fill:#1e293b,stroke:#22c55e,color:#bbf7d0
+```
+IDE (Claude Code / Cursor / Zed)
+   │  MCP（ローカルは stdio、将来は Tunnel 経由の Streamable HTTP）
+   ▼
+AxonRelay Backend（FastAPI + MCP サーバ同居）
+   │   - MCP : 12 tools + 2 resources（メインインターフェース）
+   │   - REST: /tasks /agents /actors（読み取り中心・ダッシュボード用）
+   │   - Postgres: Platform thread state の射影 → 台帳
+   │
+   └──▶ LangGraph Platform（runtime / checkpoint / observability）
+            └──▶ writer → reviewer → [interrupt: human_approval] → finalize
+                     └──▶ LLM (Claude / GPT)
 ```
 
-### 進捗
+| 構成要素 | 役割 |
+|---------|------|
+| **MCP サーバ** | メインインターフェース。IDE からタスク作成・承認・差戻し。backend と同居（[`backend/app/mcp/`](backend/app/mcp/)）。 |
+| **Backend (FastAPI)** | 薄い REST 層 ＋ 台帳を所有する SQLAlchemy service 層。 |
+| **PostgreSQL** | 台帳本体: Actor / TaskAssignment / Draft（版付き）/ Approval / ExternalLink。Platform thread state の射影。 |
+| **LangGraph Platform** | エージェントランタイム・checkpoint・observability。graph は [`axonrelay-graph/`](axonrelay-graph/)。（現在は *LangSmith Deployment* に改称。Aegra 等で self-host も可。） |
 
-**M1 → M2/M3 (並行可) → M4 → M5** の順に進行します。
+backend は **読み取り中心**の設計: 書き込み（作成・承認・差戻し）は MCP 経由が一次経路で、
+REST API は主にダッシュボードから台帳を読むためにある。
 
-| Milestone | 内容 | Issue | 状態 |
-|-----------|------|-------|------|
-| **M1: プロジェクト基盤** | Docker/リバプロ/環境変数の土台 | #1 #2 #3 #4 | 🟢 |
-| **M2: Backend** | FastAPI + LangGraph + Redis | #5 #6 #7 #8 #9 #10 #11 #12 | 🟢 |
-| **M3: Frontend** | Next.js 人間介入ダッシュボード | #13 #14 #15 | 🟢 |
-| **M4: Docker統合** | フルスタック起動 + E2E検証 | #16 #17 | 🟢 |
-| **M5: AWSデプロイ** | EC2 + DNS + SSL + 本番稼働 | #18 #19 #20 | 🟢 |
+---
 
-### 現在地
+## データモデル — 台帳
 
-> **Phase 1 完了。本番 https://axonrelay.com で稼働中。Phase 2 に移行。**
+| モデル | 役割 |
+|-------|------|
+| `Actor` | 人と AI を同型で扱う統一抽象。人間 Actor（`name="self"`）1 件がオペレータ。AI Actor は `AgentDefinition` と 1:1。 |
+| `TaskAssignment` | Actor を Task にロール付きで紐付け: `executor` / `reviewer` / `approver` / `observer`。 |
+| `Draft` | タスク出力の版付き履歴。 |
+| `Approval` | 追記専用の記録: `action`（approved/rejected）/ `comment` / `reviewer_actor_id` / timestamp。 |
+| `ExternalLink` | 外部成果物へのリンク（将来の MCP リソース URI など）。 |
+
+ステートマシン:
+
+```
+DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
+            │                    │
+            └─► NEEDS_REVISION ◄─┘ ─► DRAFT / CANCELLED
+```
+
+---
+
+## インターフェース
+
+### MCP サーバ（一次）
+
+12 tools（`list_tasks`, `create_task`, `get_task`, `run_task`,
+`list_pending_approvals`, `approve_task`, `reject_task`, `get_drafts`,
+`list_agents`, `create_agent`, `update_agent`, `get_self_actor`）と 2 resources
+（`axonrelay://tasks/{id}`, `axonrelay://tasks/{id}/drafts/{version}`）。
+
+tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-server.md)**。
+
+### REST API（読み取り中心・ダッシュボード用）
+
+| Method | Path | 説明 |
+|--------|------|------|
+| `GET` | `/` | ヘルスチェック |
+| `GET` | `/actors` `/actors/{id}` `/actors/me` | Actor |
+| `GET`/`POST`/`PUT`/`DELETE` | `/agents` `/agents/{id}` | AI エージェント定義 |
+| `GET`/`POST`/`PUT`/`DELETE` | `/tasks` `/tasks/{id}` | タスク |
+| `POST` | `/tasks/{id}/run` | Platform で interrupt/完了まで実行 |
+| `GET` | `/tasks/pending/approvals` | 統一承認受信箱 |
+| `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | 承認 / 差戻し |
+| `GET` | `/tasks/{id}/drafts` | ドラフト履歴 |
+| `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | タスク割り当て |
+
+書き込み系は MCP 側からも公開され、IDE からはそちらが一次経路。
 
 ---
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/AxonRelay/core.git
-cd core
-cp .env.example .env
-docker compose up --build
+cp .env.example .env          # LANGGRAPH_* と ANTHROPIC_API_KEY を記入
+docker compose up -d postgres # Postgres のみ。runtime は Platform 側
+
+# backend（venv 推奨）
+pip install -r backend/requirements.txt
+cd backend && alembic upgrade head   # migration 003 適用・"self" Actor を seed
+
+# IDE 用に MCP サーバ（stdio）を起動
+python -m app.mcp.server
 ```
 
-http://localhost でダッシュボードが表示されます。
+その後 Claude Code を接続する — [docs/mcp-server.md](docs/mcp-server.md) を参照。
 
----
-
-## Architecture
-
-```
-Browser ──▶ Caddy (:80) ──┬──▶ /api/* ──▶ Backend (FastAPI :8000)
-                           │                    │
-                           │                    ▼
-                           │               Redis (checkpoint)
-                           │               PostgreSQL (database)
-                           │
-                           └──▶ /*     ──▶ Frontend (Next.js :3000)
-```
-
-| Service | Role |
-|---------|------|
-| **Caddy** | リバースプロキシ。ローカルはHTTP、本番は自動HTTPS |
-| **Backend** | FastAPI + LangGraph。タスク管理とHuman-in-the-Loop |
-| **Frontend** | Next.js ダッシュボード。タスク投入・承認UI |
-| **Redis** | LangGraphのステート永続化 (checkpoint) |
-| **PostgreSQL** | ユーザー、プロジェクト、タスクデータの保存 |
-
----
-
-## API
-
-### コアAPI
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/` | ヘルスチェック |
-| `POST` | `/api/task/start` | タスク開始。AI がドラフトを生成し承認待ちで停止 |
-| `GET` | `/api/task/{thread_id}` | タスク状態の取得 |
-| `POST` | `/api/task/approve` | ドラフトを修正(任意)して承認、処理を再開 |
-
-### 認証API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/auth/sync` | OAuth ユーザーをデータベースに同期 |
-
-### プロジェクトAPI
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/projects` | ユーザーのプロジェクト一覧を取得 |
-| `POST` | `/api/projects` | 新規プロジェクトを作成（オーナーとして） |
-| `GET` | `/api/projects/{id}` | プロジェクト詳細とメンバー一覧を取得 |
-| `PUT` | `/api/projects/{id}` | プロジェクトを更新（OWNER/ADMIN権限必要） |
-| `DELETE` | `/api/projects/{id}` | プロジェクトを削除（OWNER権限必要） |
-| `POST` | `/api/projects/{id}/members` | メンバーを追加（OWNER/ADMIN権限必要） |
-| `PATCH` | `/api/projects/{id}/members/{user_id}` | メンバーロールを更新（OWNER/ADMIN権限必要） |
-| `DELETE` | `/api/projects/{id}/members/{user_id}` | メンバーを削除（OWNER/ADMIN権限必要） |
-
-### フロー
-
-```
-POST /task/start  ──▶  AI generates draft  ──▶  status: waiting_approval
-                                                        │
-                                              Human reviews & edits
-                                                        │
-POST /task/approve ──▶  Resume with updated draft ──▶  status: completed
-```
-
----
-
-## Environment Variables
-
-### コアシステム
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CADDY_SITE_ADDRESS` | `:80` | ローカル: `:80`、本番: `yourdomain.com` (自動HTTPS) |
-| `OPENAI_API_KEY` | — | LLM機能に必要 (現在はダミーレスポンス) |
-| `REDIS_URL` | `redis://redis:6379` | docker-compose内ではデフォルトで接続可能 |
-
-### データベース
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay` | PostgreSQL接続文字列 |
-| `POSTGRES_DB` | `axonrelay` | データベース名 |
-| `POSTGRES_USER` | `axonrelay` | データベースユーザー |
-| `POSTGRES_PASSWORD` | `axonrelay_dev` | データベースパスワード（本番環境では変更必須！） |
-
-### 認証
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AUTH_SECRET` | — | NextAuth.js シークレット（`openssl rand -base64 32` で生成） |
-| `NEXTAUTH_URL` | `http://localhost` | NextAuth.js ベースURL |
-| `GOOGLE_CLIENT_ID` | — | Google OAuth クライアントID |
-| `GOOGLE_CLIENT_SECRET` | — | Google OAuth クライアントシークレット |
-
-Google OAuth のセットアップ手順は [SETUP_GOOGLE_OAUTH.md](SETUP_GOOGLE_OAUTH.md) を参照してください。
-
----
-
-## データベースセットアップ
-
-PostgreSQL のセットアップとマイグレーション手順は [SETUP_POSTGRES.md](SETUP_POSTGRES.md) を参照してください。
-
-### マイグレーション実行
+Platform にデプロイする前にローカルで graph を動かす:
 
 ```bash
-# backend コンテナ内で
-docker compose exec backend alembic upgrade head
+cd axonrelay-graph && pip install -e . && langgraph dev
 ```
 
 ---
 
-## Links
+## 環境変数
 
-- [Project Board](https://github.com/orgs/AxonRelay/projects/1)
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `DATABASE_URL` | `postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay` | Postgres 接続文字列 |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `axonrelay` / `axonrelay` / `axonrelay_dev` | Postgres 初期化（ローカル以外ではパスワード変更） |
+| `LANGGRAPH_API_URL` | — | LangGraph Platform エンドポイント（タスク実行に必須） |
+| `LANGGRAPH_API_KEY` | — | Platform API キー |
+| `LANGGRAPH_ASSISTANT_ID` | `axonrelay` | デプロイ済み graph / assistant id |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` または `openai`（graph が使用） |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | LLM 認証情報 |
+| `WRITER_MODEL` / `REVIEWER_MODEL` | `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` | ロール別モデル |
+| `DISCORD_*` | — | Discord モバイル承認（Phase 2.6・未接続） |
+
+データベースのセットアップとマイグレーションは [SETUP_POSTGRES.md](SETUP_POSTGRES.md) を参照。
+
+---
+
+## 現状
+
+ピボットは **一部完了** — backend は完了、frontend/インフラの掃除が未着手:
+
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（12 tools / 2 resources）、LangGraph Platform クライアント、migration 003。
+- ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
+- ✅ **Frontend**: ピボット前の Next.js（NextAuth / `/projects` / 旧 `/task/start` UI）を撤去済み。薄い読み取り専用 AG-UI ダッシュボードを新規に作り直す予定（Phase 2.5）。
+- 🚧 **Infra**: `infra/`（AWS DNS）と旧 `Caddyfile` / 本番構成は撤去予定（Cloudflare Tunnel + Tailscale へ切替、Phase 2.4）。
+- 🚧 **Tests**: 台帳の不変条件と run-state 投影の idempotency を pytest で整備（`backend/tests/`・CI の py3.12 で実行）。より広いカバレッジは今後。
+
+ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。
+
+---
+
+## ドキュメント
+
+- [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — ピボット仕様（Actor モデル / スコープ / dogfood シナリオ）
+- [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
+- [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
+- [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ
+- [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL セットアップ & マイグレーション
