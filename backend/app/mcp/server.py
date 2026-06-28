@@ -19,13 +19,12 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from app import crud, langgraph_client, models
+from app import crud, langgraph_client, models, service
 from app.database import SessionLocal
 from app.mcp.serializers import (
     actor_to_dict,
     agent_definition_to_dict,
     approval_to_dict,
-    assignment_to_dict,
     draft_to_dict,
     task_to_dict,
 )
@@ -149,34 +148,13 @@ async def create_task(
 
 
 def _sync_state(db, task: models.Task, result: dict[str, Any]) -> None:
-    """Project a Platform run result back into Postgres."""
+    """Project a Platform run result back into the Postgres ledger.
+
+    Delegates to the shared service so the MCP and HTTP paths cannot drift.
+    """
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)
-
-    new_drafts = values.get("drafts") or []
-    existing_versions = {d.version for d in crud.get_drafts(db, task.id)}
-    for idx, content in enumerate(new_drafts, start=1):
-        if idx not in existing_versions:
-            crud.add_draft(db, task_id=task.id, content=content)
-
-    reviewer_comments = values.get("reviewer_comments") or []
-    feedback = reviewer_comments[-1] if reviewer_comments else None
-    current_draft = new_drafts[-1] if new_drafts else None
-
-    if waiting:
-        new_status = models.TaskStatusEnum.WAITING_APPROVAL
-    elif values.get("final_output"):
-        new_status = models.TaskStatusEnum.COMPLETED
-    else:
-        new_status = task.status
-
-    crud.update_task(
-        db,
-        task_id=task.id,
-        status=new_status,
-        current_draft=current_draft,
-        feedback=feedback,
-    )
+    service.project_run_state(db, task, values, waiting)
 
 
 @mcp.tool()
@@ -364,7 +342,7 @@ def task_resource(task_id: int) -> str:
 
         lines = [
             f"# Task #{task.id}: {task.title}",
-            f"",
+            "",
             f"- Status: `{task.status}`",
             f"- Thread: `{task.thread_id}`",
             f"- Created: {task.created_at.isoformat()}",

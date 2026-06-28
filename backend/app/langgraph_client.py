@@ -24,9 +24,7 @@ class PlatformNotConfiguredError(RuntimeError):
 def _client():
     api_url = os.environ.get(API_URL_ENV)
     if not api_url:
-        raise PlatformNotConfiguredError(
-            f"{API_URL_ENV} is not set. Configure the LangGraph Platform endpoint."
-        )
+        raise PlatformNotConfiguredError(f"{API_URL_ENV} is not set. Configure the LangGraph Platform endpoint.")
     api_key = os.environ.get(API_KEY_ENV)
     return get_client(url=api_url, api_key=api_key)
 
@@ -80,10 +78,7 @@ def is_waiting_for_human(state_or_result: dict[str, Any]) -> bool:
     if "human_approval" in next_nodes:
         return True
     interrupts = state_or_result.get("tasks") or []
-    for task in interrupts:
-        if isinstance(task, dict) and task.get("interrupts"):
-            return True
-    return False
+    return any(isinstance(task, dict) and task.get("interrupts") for task in interrupts)
 
 
 def extract_values(state_or_result: dict[str, Any]) -> dict[str, Any]:

@@ -17,7 +17,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
-from app import crud, langgraph_client, models
+from app import crud, langgraph_client, models, service
 from app.database import get_db
 from app.schema import (
     ActorResponse,
@@ -123,9 +123,7 @@ async def list_agents(
 
 @app.post("/agents", response_model=AgentDefinitionResponse)
 @limiter.limit("30/minute")
-async def create_agent(
-    request: Request, agent_data: AgentDefinitionCreateRequest, db: Session = Depends(get_db)
-):
+async def create_agent(request: Request, agent_data: AgentDefinitionCreateRequest, db: Session = Depends(get_db)):
     try:
         agent_type = models.AgentTypeEnum(agent_data.agent_type)
     except ValueError as e:
@@ -208,9 +206,7 @@ async def list_tasks_endpoint(
 
 @app.post("/tasks", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("30/minute")
-async def create_task_endpoint(
-    request: Request, task_data: TaskCreateRequest, db: Session = Depends(get_db)
-):
+async def create_task_endpoint(request: Request, task_data: TaskCreateRequest, db: Session = Depends(get_db)):
     self_actor = crud.get_self_actor(db)
     creator_actor_id = self_actor.id if self_actor else None
 
@@ -291,31 +287,11 @@ async def delete_task_endpoint(request: Request, task_id: int, db: Session = Dep
 
 
 def _sync_state_to_db(db: Session, task: models.Task, values: dict, waiting_for_human: bool) -> None:
-    """Project Platform thread state into Postgres Draft / Task rows."""
-    new_drafts = values.get("drafts") or []
-    existing_versions = {d.version for d in crud.get_drafts(db, task.id)}
-    for idx, content in enumerate(new_drafts, start=1):
-        if idx not in existing_versions:
-            crud.add_draft(db, task_id=task.id, content=content)
+    """Project Platform thread state into the Postgres ledger.
 
-    reviewer_comments = values.get("reviewer_comments") or []
-    feedback = reviewer_comments[-1] if reviewer_comments else None
-    current_draft = new_drafts[-1] if new_drafts else None
-
-    if waiting_for_human:
-        new_status = models.TaskStatusEnum.WAITING_APPROVAL
-    elif values.get("final_output"):
-        new_status = models.TaskStatusEnum.COMPLETED
-    else:
-        new_status = task.status  # unchanged
-
-    crud.update_task(
-        db,
-        task_id=task.id,
-        status=new_status,
-        current_draft=current_draft,
-        feedback=feedback,
-    )
+    Thin wrapper over the shared service so the HTTP and MCP paths cannot drift.
+    """
+    service.project_run_state(db, task, values, waiting_for_human)
 
 
 @app.post("/tasks/{task_id}/run", response_model=TaskWithAssignmentsResponse)
@@ -465,9 +441,7 @@ async def get_drafts_endpoint(request: Request, task_id: int, db: Session = Depe
 
 @app.get("/tasks/{task_id}/assignments", response_model=list[TaskAssignmentResponse])
 @limiter.limit("60/minute")
-async def list_task_assignments_endpoint(
-    request: Request, task_id: int, db: Session = Depends(get_db)
-):
+async def list_task_assignments_endpoint(request: Request, task_id: int, db: Session = Depends(get_db)):
     return crud.get_task_assignments(db, task_id)
 
 

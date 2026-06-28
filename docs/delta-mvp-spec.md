@@ -195,3 +195,35 @@ AxonRelay は **MCP サーバ** として `axonrelay-mcp` を公開する。IDE�
 - **MCP サーバ実装**（`axonrelay-mcp`、tools / resources の整備）
 - **Cloudflare Tunnel + Tailscale + Vercel/Pages** へのホスティング切替
 - **AWS EC2 解約・本番ドメイン切替** の段取り（DNS 切替時のダウンタイム計画）
+
+---
+
+## 11. 2026-06 アップデート（地形の変化と方針調整）
+
+> 追記: 2026-06 / 本仕様（§1–10）は 2026-04-29 時点の決定ログ。以下は実地確認した業界変化と、それに伴う方針の調整。§1–10 の記述自体は履歴として保持する。
+
+### 11.1 確定した価値の軸 — 「ガバナンス台帳」特化
+
+AxonRelay の残存価値を **「人＋AI 混成チームの永続的な承認・改稿台帳（誰が／どの版に／何を／誰がどのコメントで承認・差戻したか）を MCP で公開する」** ことに一点集中する。オーケストレーションや HITL の一時停止では戦わない。
+
+### 11.2 MCP `elicitation` の標準化 → HITL 一時停止はコモディティ化
+
+MCP に `elicitation`（サーバが人間に構造化入力を accept/decline/cancel で要求）が標準化された。「人間に承認を求めて止まる」こと自体は **もはや差別化要因ではない**。
+- **含意:** AxonRelay の差別化は「一時停止」ではなく「**揮発しない台帳**」にある（elicitation はセッション内・記録なし）。
+- **将来オプション:** 承認モーメントを elicitation 経由でも公開し、任意の MCP クライアントがネイティブ承認 UI を得られるようにする（台帳への記録は AxonRelay 側で担保）。Phase 3 候補。
+
+### 11.3 A2A v1.0 stable → §8 の「対象外」スタンスを撤回（候補に格上げ）
+
+§8 で「A2A は採用が固まり切っていない（対象外）」としたが、A2A は **2026-04 に v1.0 stable**（Linux Foundation ホスト、150+ 組織、署名付き Agent Card、決済 AP2、Google/MS/AWS が GA）。
+- **調整:** A2A を恒久的対象外から **「採用候補（個人 PoC では優先度低）」** に格上げ。
+- **設計余地の確保:** AI Actor 間連携（A2A 由来のアクション）も将来 `Approval` / `ExternalLink` 台帳に記録できる余地を残す。実装は急がない。
+
+### 11.4 EU AI Act full enforcement（2026-08-02）→ 台帳を value prop の中核に
+
+高リスク AI の義務が 2026-08-02 に full enforcement。その3本柱（①改ざん耐性の行動ログ ②高影響行動の人間承認ゲート ③全行動の identity 帰属）は AxonRelay の残存核とほぼ一致する。
+- **調整:** §8 で「規制グレード対応は対象外」とした方針は維持する（電子署名 / タイムスタンプ局 / 21 CFR Part 11 等は引き続き対象外）。ただし **「監査台帳」という value prop は中核に据える** — 規制準拠製品ではなく、その思想のリファレンス実装として dogfood する。
+
+### 11.5 LangGraph Platform → LangSmith Deployment 改称 / self-host 退避路
+
+LangGraph Platform は **LangSmith Deployment** に改称。OSS の drop-in 代替 **Aegra** が登場。
+- **調整:** [step2-plan.md](./step2-plan.md) のリスク表「Platform 料金が過剰」の退避策に **Aegra（self-host drop-in）** を追加（既存の self-hosted LangGraph Server 案に加えて）。

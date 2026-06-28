@@ -2,225 +2,181 @@
 
 **[日本語](README.ja.md)** | English
 
-AI Agent Orchestration with Human-in-the-Loop — Core System
+**A governance ledger for mixed human + AI teams, exposed as an MCP server.**
+
+AxonRelay records *who* — human or AI — did *what*, on *which draft version*, and
+*who approved or rejected it with what comment, and when*. The agent runtime,
+the human-in-the-loop pause, and the UI are all delegated to standards
+(LangGraph Platform, MCP, AG-UI). What AxonRelay keeps for itself is the
+**durable, cross-session, cross-actor approval & revision ledger** — the part
+that those standards do *not* provide.
+
+> **Status: personal PoC (post-pivot).** Originally a general-purpose "AI Agent
+> Orchestration" stack; that layer has been commoditized by LangGraph Platform +
+> MCP + AG-UI, so AxonRelay was re-scoped to the one thing still worth owning:
+> the governance ledger. The backend (Actor model, ledger, MCP server, Platform
+> client) is migrated. The old Next.js auth/projects UI and AWS infra are being
+> removed — see [Current state](#current-state).
 
 ---
 
-## Phase 1 Roadmap
+## Why this exists (mid-2026 context)
 
-> 🔴 Not Started  🟡 In Progress  🟢 Done
+By mid-2026 the agentic stack settled into three layers — **MCP** for tools,
+**A2A** for agent-to-agent, **AG-UI** for agent↔UI — and "pause to ask a human"
+became a native MCP primitive (`elicitation`). Pausing for approval is no longer
+a differentiator.
 
-```mermaid
-flowchart LR
-    subgraph M1["M1: Project Foundation"]
-        I1["#1 .gitignore\n.env.example 🟢"]
-        I2["#2 README.md 🟢"]
-        I3["#3 docker-compose.yml 🟢"]
-        I4["#4 Caddyfile 🟢"]
-    end
+What none of those layers give you is a **persistent record of accountability**:
+elicitation is ephemeral and per-session; observability tools log runs, not
+*who approved what*. Meanwhile the EU AI Act's high-risk obligations reach full
+enforcement on 2026-08-02, and their core asks are exactly: an immutable action
+log, a human approval gate for high-impact actions, and attribution of every
+action to a responsible identity (human **or** agent).
 
-    subgraph M2["M2: Backend"]
-        I5["#5 Dockerfile 🟢"]
-        I6["#6 Python Dependencies 🟢"]
-        I7["#7 FastAPI Scaffold 🟢"]
-        I8["#8 State Schema 🟢"]
-        I9["#9 LangGraph Graph 🟢"]
-        I10["#10 Redis Integration 🟢"]
-        I11["#11 API: start/status 🟢"]
-        I12["#12 API: approve 🟢"]
-    end
-
-    subgraph M3["M3: Frontend"]
-        I13["#13 Next.js Setup 🟢"]
-        I14["#14 Task Input UI 🟢"]
-        I15["#15 Approval UI 🟢"]
-    end
-
-    subgraph M4["M4: Docker Integration"]
-        I16["#16 Full Stack Launch 🟢"]
-        I17["#17 E2E Flow Validation 🟢"]
-    end
-
-    subgraph M5["M5: AWS Deployment"]
-        I18["#18 EC2 Setup 🟢"]
-        I19["#19 DNS Configuration 🟢"]
-        I20["#20 Production Deploy 🟢"]
-    end
-
-    %% Dependencies
-    I1 --> I3
-    I1 --> I5
-    I1 --> I13
-    I3 --> I16
-    I4 --> I16
-
-    I5 --> I7
-    I6 --> I7
-    I7 --> I8
-    I8 --> I9
-    I9 --> I10
-    I10 --> I11
-    I11 --> I12
-
-    I13 --> I14
-    I14 --> I15
-
-    I12 --> I16
-    I15 --> I16
-    I16 --> I17
-
-    I17 --> I18
-    I18 --> I19
-    I19 --> I20
-
-    %% Styles
-    style M1 fill:#1e293b,stroke:#facc15,color:#fef9c3
-    style M2 fill:#1e293b,stroke:#ef4444,color:#fecaca
-    style M3 fill:#1e293b,stroke:#a855f7,color:#e9d5ff
-    style M4 fill:#1e293b,stroke:#3b82f6,color:#bfdbfe
-    style M5 fill:#1e293b,stroke:#22c55e,color:#bbf7d0
-```
-
-### Progress
-
-**M1 → M2/M3 (parallel) → M4 → M5** in this order.
-
-| Milestone | Description | Issue | Status |
-|-----------|-------------|-------|--------|
-| **M1: Project Foundation** | Docker/Reverse Proxy/Environment Variables | #1 #2 #3 #4 | 🟢 |
-| **M2: Backend** | FastAPI + LangGraph + Redis | #5 #6 #7 #8 #9 #10 #11 #12 | 🟢 |
-| **M3: Frontend** | Next.js Human-in-the-Loop Dashboard | #13 #14 #15 | 🟢 |
-| **M4: Docker Integration** | Full Stack Launch + E2E Validation | #16 #17 | 🟢 |
-| **M5: AWS Deployment** | EC2 + DNS + SSL + Production | #18 #19 #20 | 🟢 |
-
-### Current Status
-
-> **Phase 1 Complete. Running in production at https://axonrelay.com. Moving to Phase 2.**
-
----
-
-## Quick Start
-
-```bash
-git clone https://github.com/AxonRelay/core.git
-cd core
-cp .env.example .env
-docker compose up --build
-```
-
-Dashboard will be available at http://localhost
+AxonRelay treats the human as a **first-class Actor** in that ledger, not an
+exception at the interrupt boundary. That is the residual value this repo
+preserves and dogfoods.
 
 ---
 
 ## Architecture
 
 ```
-Browser ──▶ Caddy (:80) ──┬──▶ /api/* ──▶ Backend (FastAPI :8000)
-                           │                    │
-                           │                    ▼
-                           │               Redis (checkpoint)
-                           │               PostgreSQL (database)
-                           │
-                           └──▶ /*     ──▶ Frontend (Next.js :3000)
+IDE (Claude Code / Cursor / Zed)
+   │  MCP (stdio locally; Streamable HTTP via tunnel later)
+   ▼
+AxonRelay Backend (FastAPI + MCP server, co-located)
+   │   - MCP: 12 tools + 2 resources  (primary interface)
+   │   - REST: /tasks /agents /actors  (read-heavy, for the dashboard)
+   │   - Postgres: projection of Platform thread state → the ledger
+   │
+   └──▶ LangGraph Platform  (agent runtime / checkpoint / observability)
+            └──▶ writer → reviewer → [interrupt: human_approval] → finalize
+                     └──▶ LLM (Claude / GPT)
 ```
 
-| Service | Role |
-|---------|------|
-| **Caddy** | Reverse proxy. HTTP for local, auto-HTTPS for production |
-| **Backend** | FastAPI + LangGraph. Task management and Human-in-the-Loop |
-| **Frontend** | Next.js dashboard. Task submission and approval UI |
-| **Redis** | LangGraph state persistence (checkpoint) |
-| **PostgreSQL** | User, project, and task data storage |
+| Component | Role |
+|-----------|------|
+| **MCP server** | Primary interface. Drive tasks / approvals from the IDE. Co-located with the backend ([`backend/app/mcp/`](backend/app/mcp/)). |
+| **Backend (FastAPI)** | Thin REST layer + the SQLAlchemy service layer that owns the ledger. |
+| **PostgreSQL** | The ledger: Actor / TaskAssignment / Draft (versioned) / Approval / ExternalLink. A projection of Platform thread state. |
+| **LangGraph Platform** | Agent runtime, checkpointing, observability. Graph lives in [`axonrelay-graph/`](axonrelay-graph/). (Now branded *LangSmith Deployment*; self-hostable, e.g. via Aegra.) |
+
+The backend is **read-heavy by design**: writes (create / approve / reject) come
+through MCP; the REST API is mostly for reading the ledger from a dashboard.
 
 ---
 
-## API
+## Data model — the ledger
 
-### Core API
+| Model | Purpose |
+|-------|---------|
+| `Actor` | Unified abstraction for humans and AI. A single human Actor (`name="self"`) is the operator; AI actors are 1:1 with `AgentDefinition`. |
+| `TaskAssignment` | Binds an Actor to a Task with a role: `executor` / `reviewer` / `approver` / `observer`. |
+| `Draft` | Versioned history of a task's output. |
+| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp. |
+| `ExternalLink` | Link to an external artifact (e.g. a future MCP resource URI). |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/` | Health check |
-| `POST` | `/api/task/start` | Start task. AI generates draft and waits for approval |
-| `GET` | `/api/task/{thread_id}` | Get task status |
-| `POST` | `/api/task/approve` | Approve (optionally modify) draft and resume processing |
-
-### Authentication API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/auth/sync` | Sync OAuth user to database |
-
-### Project API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/projects` | List user's projects |
-| `POST` | `/api/projects` | Create new project (creates owner) |
-| `GET` | `/api/projects/{id}` | Get project details with members |
-| `PUT` | `/api/projects/{id}` | Update project (requires OWNER/ADMIN) |
-| `DELETE` | `/api/projects/{id}` | Delete project (requires OWNER) |
-| `POST` | `/api/projects/{id}/members` | Add member (requires OWNER/ADMIN) |
-| `PATCH` | `/api/projects/{id}/members/{user_id}` | Update member role (requires OWNER/ADMIN) |
-| `DELETE` | `/api/projects/{id}/members/{user_id}` | Remove member (requires OWNER/ADMIN) |
-
-### Flow
+State machine:
 
 ```
-POST /task/start  ──▶  AI generates draft  ──▶  status: waiting_approval
-                                                        │
-                                              Human reviews & edits
-                                                        │
-POST /task/approve ──▶  Resume with updated draft ──▶  status: completed
+DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
+            │                    │
+            └─► NEEDS_REVISION ◄─┘ ─► DRAFT / CANCELLED
+```
+
+---
+
+## Interfaces
+
+### MCP server (primary)
+
+12 tools (`list_tasks`, `create_task`, `get_task`, `run_task`,
+`list_pending_approvals`, `approve_task`, `reject_task`, `get_drafts`,
+`list_agents`, `create_agent`, `update_agent`, `get_self_actor`) and 2 resources
+(`axonrelay://tasks/{id}`, `axonrelay://tasks/{id}/drafts/{version}`).
+
+Full tool reference and Claude Code setup: **[docs/mcp-server.md](docs/mcp-server.md)**.
+
+### REST API (read-heavy, for the dashboard)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Health check |
+| `GET` | `/actors` `/actors/{id}` `/actors/me` | Actors |
+| `GET`/`POST`/`PUT`/`DELETE` | `/agents` `/agents/{id}` | AI agent definitions |
+| `GET`/`POST`/`PUT`/`DELETE` | `/tasks` `/tasks/{id}` | Tasks |
+| `POST` | `/tasks/{id}/run` | Run on Platform until interrupt/completion |
+| `GET` | `/tasks/pending/approvals` | The unified approval inbox |
+| `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | Approve / reject |
+| `GET` | `/tasks/{id}/drafts` | Draft history |
+| `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | Task assignments |
+
+Writes are also exposed via MCP and are the primary path from the IDE.
+
+---
+
+## Quick Start
+
+```bash
+cp .env.example .env          # fill in LANGGRAPH_* and ANTHROPIC_API_KEY
+docker compose up -d postgres # Postgres only; runtime is on Platform
+
+# backend (venv recommended)
+pip install -r backend/requirements.txt
+cd backend && alembic upgrade head   # applies migration 003; seeds the "self" Actor
+
+# run the MCP server (stdio) for the IDE
+python -m app.mcp.server
+```
+
+Then point Claude Code at it — see [docs/mcp-server.md](docs/mcp-server.md).
+
+To run the LangGraph graph locally before deploying to Platform:
+
+```bash
+cd axonrelay-graph && pip install -e . && langgraph dev
 ```
 
 ---
 
 ## Environment Variables
 
-### Core System
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CADDY_SITE_ADDRESS` | `:80` | Local: `:80`, Production: `yourdomain.com` (auto-HTTPS) |
-| `OPENAI_API_KEY` | — | Required for LLM functionality (currently using dummy response) |
-| `REDIS_URL` | `redis://redis:6379` | Auto-connected in docker-compose |
+| `DATABASE_URL` | `postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay` | Postgres connection string |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `axonrelay` / `axonrelay` / `axonrelay_dev` | Postgres bootstrap (change password outside local) |
+| `LANGGRAPH_API_URL` | — | LangGraph Platform endpoint (required to run tasks) |
+| `LANGGRAPH_API_KEY` | — | Platform API key |
+| `LANGGRAPH_ASSISTANT_ID` | `axonrelay` | Deployed graph / assistant id |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` (used by the graph) |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | LLM credentials |
+| `WRITER_MODEL` / `REVIEWER_MODEL` | `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` | Per-role models |
+| `DISCORD_*` | — | Mobile approval via Discord (Phase 2.6, not yet wired) |
 
-### Database
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay` | PostgreSQL connection string |
-| `POSTGRES_DB` | `axonrelay` | Database name |
-| `POSTGRES_USER` | `axonrelay` | Database user |
-| `POSTGRES_PASSWORD` | `axonrelay_dev` | Database password (change in production!) |
-
-### Authentication
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AUTH_SECRET` | — | NextAuth.js secret (generate with `openssl rand -base64 32`) |
-| `NEXTAUTH_URL` | `http://localhost` | NextAuth.js base URL |
-| `GOOGLE_CLIENT_ID` | — | Google OAuth client ID |
-| `GOOGLE_CLIENT_SECRET` | — | Google OAuth client secret |
-
-See [SETUP_GOOGLE_OAUTH.md](SETUP_GOOGLE_OAUTH.md) for Google OAuth setup instructions.
+See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 ---
 
-## Database Setup
+## Current state
 
-See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for PostgreSQL setup and migration instructions.
+The pivot is **partially complete** — backend done, frontend/infra cleanup pending:
 
-### Running Migrations
+- ✅ **Backend**: Actor-based ledger, MCP server (12 tools / 2 resources), LangGraph Platform client, migration 003.
+- ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
+- ✅ **Frontend**: the pre-pivot Next.js (NextAuth, `/projects`, old `/task/start` UI) has been removed. A thin read-only AG-UI dashboard is to be rebuilt from scratch (Phase 2.5).
+- 🚧 **Infra**: `infra/` (AWS DNS) and the old `Caddyfile` / production setup are slated for removal (cutover to Cloudflare Tunnel + Tailscale, Phase 2.4).
+- 🚧 **Tests**: pytest suite covering the ledger invariants and the run-state projection's idempotency (`backend/tests/`, runs in CI on 3.12). Broader coverage still to come.
 
-```bash
-# Inside backend container
-docker compose exec backend alembic upgrade head
-```
+Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md).
 
 ---
 
-## Links
+## Docs
 
-- [Project Board](https://github.com/orgs/AxonRelay/projects/1)
+- [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — pivot spec (Actor model, scope, dogfood scenarios)
+- [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
+- [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
+- [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup
+- [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL setup & migrations

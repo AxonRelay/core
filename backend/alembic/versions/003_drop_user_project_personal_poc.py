@@ -41,12 +41,7 @@ def upgrade() -> None:
     op.drop_column("tasks", "project_id")
 
     op.drop_constraint("tasks_creator_id_fkey", "tasks", type_="foreignkey")
-    connection.execute(
-        sa.text(
-            "UPDATE tasks SET creator_id = u.actor_id "
-            "FROM users u WHERE tasks.creator_id = u.id"
-        )
-    )
+    connection.execute(sa.text("UPDATE tasks SET creator_id = u.actor_id FROM users u WHERE tasks.creator_id = u.id"))
     op.alter_column("tasks", "creator_id", new_column_name="creator_actor_id")
     op.create_foreign_key(
         "fk_tasks_creator_actor_id",
@@ -60,10 +55,7 @@ def upgrade() -> None:
     # 3. approvals: reviewer_id -> reviewer_actor_id
     op.drop_constraint("approvals_reviewer_id_fkey", "approvals", type_="foreignkey")
     connection.execute(
-        sa.text(
-            "UPDATE approvals SET reviewer_id = u.actor_id "
-            "FROM users u WHERE approvals.reviewer_id = u.id"
-        )
+        sa.text("UPDATE approvals SET reviewer_id = u.actor_id FROM users u WHERE approvals.reviewer_id = u.id")
     )
     op.alter_column("approvals", "reviewer_id", new_column_name="reviewer_actor_id")
     op.create_foreign_key(
@@ -92,21 +84,13 @@ def upgrade() -> None:
     sa.Enum(name="roleenum").drop(op.get_bind(), checkfirst=True)
 
     # 6. Seed a single human Actor "self" if none exists
-    result = connection.execute(
-        sa.text("SELECT COUNT(*) FROM actors WHERE type = 'human'")
-    ).fetchone()
+    result = connection.execute(sa.text("SELECT COUNT(*) FROM actors WHERE type = 'human'")).fetchone()
     human_count = result[0] if result else 0
     if human_count == 0:
-        connection.execute(
-            sa.text(
-                "INSERT INTO actors (type, name, created_at) "
-                "VALUES ('human', 'self', NOW())"
-            )
-        )
+        connection.execute(sa.text("INSERT INTO actors (type, name, created_at) VALUES ('human', 'self', NOW())"))
 
 
 def downgrade() -> None:
     raise NotImplementedError(
-        "Downgrade from migration 003 is not supported (personal PoC). "
-        "Restore from a database snapshot instead."
+        "Downgrade from migration 003 is not supported (personal PoC). Restore from a database snapshot instead."
     )

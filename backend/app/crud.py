@@ -195,6 +195,9 @@ def get_actor_tasks_by_role(
         db.query(models.Task)
         .join(models.TaskAssignment)
         .filter(models.TaskAssignment.actor_id == actor_id, models.TaskAssignment.role == role)
+        # distinct(): a task must appear once even if the actor somehow holds the
+        # same role on it more than once (no UniqueConstraint on TaskAssignment yet).
+        .distinct()
     )
     if status:
         query = query.filter(models.Task.status == status)
@@ -301,12 +304,7 @@ def add_draft(db: Session, task_id: int, content: str):
 
 
 def get_drafts(db: Session, task_id: int):
-    return (
-        db.query(models.Draft)
-        .filter(models.Draft.task_id == task_id)
-        .order_by(models.Draft.version.asc())
-        .all()
-    )
+    return db.query(models.Draft).filter(models.Draft.task_id == task_id).order_by(models.Draft.version.asc()).all()
 
 
 # ========== Approval Operations ==========
