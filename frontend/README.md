@@ -23,7 +23,7 @@ pnpm dev        # proxies /api -> http://localhost:8000 (override: VITE_API_PROX
 ```bash
 pnpm typecheck  # tsc --noEmit
 pnpm lint       # eslint
-pnpm build      # tsc -b && vite build -> dist/
+pnpm build      # tsc --noEmit && vite build -> dist/
 ```
 
 ## Config
