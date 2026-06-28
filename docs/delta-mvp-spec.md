@@ -227,3 +227,12 @@ MCP に `elicitation`（サーバが人間に構造化入力を accept/decline/c
 
 LangGraph Platform は **LangSmith Deployment** に改称。OSS の drop-in 代替 **Aegra** が登場。
 - **調整:** [step2-plan.md](./step2-plan.md) のリスク表「Platform 料金が過剰」の退避策に **Aegra（self-host drop-in）** を追加（既存の self-hosted LangGraph Server 案に加えて）。
+
+### 11.6 既知の制約 — 承認台帳は「単一書き込み者」前提
+
+承認台帳の hash chain と承認フローは **単一オペレータが直列に承認する前提**で設計している（§2 の self = 人間1人固定に整合）。以下は **個人 PoC では発生しない**として意図的に対象外:
+
+- **同一 task への並行承認**: `record_approval` は「直前行読取 → prev_hash 計算 → INSERT」をロックなしで行うため、同一 task を**同時に**承認/差戻しすると hash chain が分岐し `verify_approval_chain` が後発行を誤検知し得る。複数書き込み者を導入する際は承認追記を task 単位で直列化（行ロック / 楽観ロック）する必要がある。
+- **`review_pending_task` の TOCTOU**: elicitation 応答待ちの間に task が変化した場合、表示時の draft と一致しなければ `stale_decision` を返して**記録しない**ガードを実装済み（見ていない内容を承認しない）。最終 append との極小窓のみ単一ユーザ前提で許容。
+
+複数アクター / リモート同時利用に拡張する際はここを設計し直す（Phase 3+ 候補）。

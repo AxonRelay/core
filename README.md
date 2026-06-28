@@ -165,7 +165,7 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is **partially complete** — backend done, frontend/infra cleanup pending:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (14 tools / 2 resources), LangGraph Platform client, migrations through 005. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`).
+- ✅ **Backend**: Actor-based ledger, MCP server (14 tools / 2 resources), LangGraph Platform client, migrations through 005. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`). The ledger assumes a single serial writer (the operator); concurrent approvals on one task are out of scope for the PoC (see [delta-mvp-spec §11.6](docs/delta-mvp-spec.md)).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: the pre-pivot Next.js (NextAuth, `/projects`, old `/task/start` UI) has been removed. A thin read-only AG-UI dashboard is to be rebuilt from scratch (Phase 2.5).
 - 🚧 **Infra**: `infra/` (AWS DNS) and the old `Caddyfile` / production setup are slated for removal (cutover to Cloudflare Tunnel + Tailscale, Phase 2.4).

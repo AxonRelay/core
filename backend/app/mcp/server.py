@@ -273,6 +273,10 @@ async def review_pending_task(task_id: int, ctx: Context[ServerSession, None]) -
     through the MCP client's native elicitation prompt, records it in the
     tamper-evident ledger, and resumes the graph. Clients that do not support
     elicitation should use approve_task / reject_task directly instead.
+
+    If the task changes between display and decision (the draft no longer matches
+    what was shown, or it is no longer waiting), the call returns
+    status="stale_decision" and records nothing, so you never approve unseen content.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
@@ -292,6 +296,18 @@ async def review_pending_task(task_id: int, ctx: Context[ServerSession, None]) -
     result = await ctx.elicit(message=message, schema=_ApprovalDecision)
     if result.action != "accept" or not result.data:
         return {"status": "no_decision", "elicitation_action": result.action, "task_id": task_id}
+
+    # Staleness guard: the task may have changed while we awaited the human's
+    # response. Only record a decision against the exact draft that was shown;
+    # otherwise the operator would approve content they never saw.
+    with _session() as db:
+        current = crud.get_task(db, task_id)
+        if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL or current.current_draft != draft:
+            return {
+                "status": "stale_decision",
+                "task_id": task_id,
+                "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
+            }
 
     decision = result.data
     if decision.approve:

@@ -160,7 +160,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは **一部完了** — backend は完了、frontend/インフラの掃除が未着手:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（14 tools / 2 resources）、LangGraph Platform クライアント、migration 005 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（14 tools / 2 resources）、LangGraph Platform クライアント、migration 005 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）。台帳は単一書き込み者（オペレータ）前提で、同一 task への並行承認は PoC では対象外（[delta-mvp-spec §11.6](docs/delta-mvp-spec.md) 参照）。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: ピボット前の Next.js（NextAuth / `/projects` / 旧 `/task/start` UI）を撤去済み。薄い読み取り専用 AG-UI ダッシュボードを新規に作り直す予定（Phase 2.5）。
 - 🚧 **Infra**: `infra/`（AWS DNS）と旧 `Caddyfile` / 本番構成は撤去予定（Cloudflare Tunnel + Tailscale へ切替、Phase 2.4）。
