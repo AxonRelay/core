@@ -402,12 +402,17 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
     approvals = get_approvals(db, task_id)
     prev_hash = None
     legacy = 0
+    seen_hashed = False
     for approval in approvals:
         if approval.entry_hash is None:
-            # Legacy row (recorded before the hash chain existed); not verifiable.
+            # A NULL hash is only acceptable as a leading legacy prefix (rows that
+            # predate the hash chain). A NULL appearing *after* the chain has
+            # started means a hashed row was blanked out — that is tampering.
+            if seen_hashed:
+                return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
             legacy += 1
-            prev_hash = None
             continue
+        seen_hashed = True
         expected = ledger.compute_entry_hash(
             prev_hash,
             task_id=approval.task_id,

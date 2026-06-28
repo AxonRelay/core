@@ -42,6 +42,23 @@ def test_legacy_unhashed_rows_are_skipped_then_chain_verifies(db, self_actor):
     assert result == {"valid": True, "broken_at": None, "count": 3, "legacy": 1}
 
 
+def test_nulling_a_hashed_rows_hash_is_detected_not_treated_as_legacy(db, self_actor):
+    """Blanking out a hashed row's entry_hash (after the chain started) is tampering."""
+    task = _task(db)
+    crud.record_approval(db, task_id=task.id, reviewer_actor_id=self_actor.id, action="approved", comment="a")
+    crud.record_approval(db, task_id=task.id, reviewer_actor_id=self_actor.id, action="approved", comment="b")
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+    # Tamper: null out the last (hashed) row's entry_hash to try to drop it silently.
+    victim = crud.get_approvals(db, task.id)[-1]
+    victim.entry_hash = None
+    db.commit()
+
+    result = crud.verify_approval_chain(db, task.id)
+    assert result["valid"] is False
+    assert result["broken_at"] == victim.id
+
+
 def test_tampering_with_a_recorded_comment_is_detected(db, self_actor):
     task = _task(db)
     crud.record_approval(db, task_id=task.id, reviewer_actor_id=self_actor.id, action="approved", comment="ship it")
