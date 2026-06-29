@@ -1,0 +1,17 @@
+# Optional Cloudflare Tunnel sidecar (Phase 2.4).
+#
+# Run alongside the base stack to expose the backend without a public IP:
+#   TUNNEL_TOKEN=... docker compose -f docker-compose.yml -f deploy/docker-compose.tunnel.yml up -d
+#
+# Get TUNNEL_TOKEN from: Cloudflare Zero Trust > Networks > Tunnels > (your tunnel) > token.
+# Keep it in .env (gitignored) — never commit it.
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?set TUNNEL_TOKEN in your .env}
+    depends_on:
+      - backend

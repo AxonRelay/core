@@ -1,0 +1,21 @@
+# cloudflared tunnel config (template) — Phase 2.4 hosting.
+#
+# Copy to ~/.cloudflared/config.yml (or mount into the cloudflared container)
+# and fill in your tunnel id / hostnames. The tunnel gives api.axonrelay.com a
+# public HTTPS endpoint with NO public IP / inbound ports on the host.
+#
+# Prereqs (run once, on your machine — see DEPLOYMENT.md):
+#   cloudflared tunnel login
+#   cloudflared tunnel create axonrelay
+#   cloudflared tunnel route dns axonrelay api.axonrelay.com
+
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_ID.json
+
+ingress:
+  # AxonRelay backend (FastAPI). When running via docker compose on the same
+  # host, "backend" resolves on the compose network; otherwise use localhost:8000.
+  - hostname: api.axonrelay.com
+    service: http://backend:8000
+  # Everything else 404s.
+  - service: http_status:404
