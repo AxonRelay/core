@@ -168,7 +168,7 @@ The pivot is **partially complete** — backend done, frontend/infra cleanup pen
 - ✅ **Backend**: Actor-based ledger, MCP server (14 tools / 2 resources), LangGraph Platform client, migrations through 005. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`). The ledger assumes a single serial writer (the operator); concurrent approvals on one task are out of scope for the PoC (see [delta-mvp-spec §11.6](docs/delta-mvp-spec.md)).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
-- 🚧 **Infra**: `infra/` (AWS DNS) and the old `Caddyfile` / production setup are slated for removal (cutover to Cloudflare Tunnel + Tailscale, Phase 2.4).
+- 🚧 **Infra**: legacy `infra/` (AWS EC2 DNS) and `Caddyfile` removed. The cutover to Cloudflare Tunnel + Tailscale + Vercel/Pages is templated and documented in [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md); the account-side steps (DNS switch, EC2 decommission) remain a manual operator action.
 - 🚧 **Tests**: pytest suite covering the ledger invariants and the run-state projection's idempotency (`backend/tests/`, runs in CI on 3.12). Broader coverage still to come.
 
 Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md).
@@ -181,4 +181,5 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup
+- [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) — Phase 2.4 hosting cutover (Cloudflare Tunnel / Tailscale / Vercel)
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL setup & migrations

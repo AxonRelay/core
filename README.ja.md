@@ -163,7 +163,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - ✅ **Backend**: Actor ベースの台帳、MCP サーバ（14 tools / 2 resources）、LangGraph Platform クライアント、migration 005 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）。台帳は単一書き込み者（オペレータ）前提で、同一 task への並行承認は PoC では対象外（[delta-mvp-spec §11.6](docs/delta-mvp-spec.md) 参照）。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
-- 🚧 **Infra**: `infra/`（AWS DNS）と旧 `Caddyfile` / 本番構成は撤去予定（Cloudflare Tunnel + Tailscale へ切替、Phase 2.4）。
+- 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋[deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。
 - 🚧 **Tests**: 台帳の不変条件と run-state 投影の idempotency を pytest で整備（`backend/tests/`・CI の py3.12 で実行）。より広いカバレッジは今後。
 
 ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。
@@ -176,4 +176,5 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ
+- [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) — Phase 2.4 ホスティング切替（Cloudflare Tunnel / Tailscale / Vercel）
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL セットアップ & マイグレーション
