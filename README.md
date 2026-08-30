@@ -2,14 +2,18 @@
 
 **[日本語](README.ja.md)** | English
 
-**A governance ledger for mixed human + AI teams, exposed as an MCP server.**
+**A governance ledger and coordination board for mixed human + AI teams, exposed as an MCP server.**
 
 AxonRelay records *who* — human or AI — did *what*, on *which draft version*, and
-*who approved or rejected it with what comment, and when*. The agent runtime,
-the human-in-the-loop pause, and the UI are all delegated to standards
-(LangGraph Platform, MCP, AG-UI). What AxonRelay keeps for itself is the
-**durable, cross-session, cross-actor approval & revision ledger** — the part
-that those standards do *not* provide.
+*who approved or rejected it with what comment, and when*. It also answers the
+question that comes *before* the decision, once several agents work at once
+across several machines and several clones of one repository: **who is working
+where, on what, and are we about to collide?**
+
+The agent runtime, the human-in-the-loop pause, and the UI are all delegated to
+standards (LangGraph Platform, MCP, AG-UI). What AxonRelay keeps for itself is
+the **durable, cross-session, cross-actor ledger and the shared board** — the
+parts those standards do *not* provide.
 
 > **Status: personal PoC (post-pivot).** Originally a general-purpose "AI Agent
 > Orchestration" stack; that layer has been commoditized by LangGraph Platform +
@@ -43,24 +47,28 @@ preserves and dogfoods.
 ## Architecture
 
 ```
-IDE (Claude Code / Cursor / Zed)
-   │  MCP (stdio locally; Streamable HTTP via tunnel later)
-   ▼
-AxonRelay Backend (FastAPI + MCP server, co-located)
-   │   - MCP: 14 tools + 2 resources  (primary interface)
-   │   - REST: /tasks /agents /actors  (read-heavy, for the dashboard)
-   │   - Postgres: projection of Platform thread state → the ledger
-   │
-   └──▶ LangGraph Platform  (agent runtime / checkpoint / observability)
-            └──▶ writer → reviewer → [interrupt: human_approval] → finalize
-                     └──▶ LLM (Claude / GPT)
+  Claude @ clone A        Codex @ clone B        Claude @ another repo
+  (laptop)                (desktop)              (laptop)
+      │                       │                       │
+      └───────────────────────┼───────────────────────┘
+           MCP (stdio locally · Streamable HTTP over Tailscale/Tunnel)
+                              ▼
+              AxonRelay Backend (FastAPI + MCP server, co-located)
+                 │   - MCP: 24 tools + 3 resources  (primary interface)
+                 │   - REST: /tasks /agents /coordination  (read-heavy)
+                 │   - Postgres: the ledger + the coordination board
+                 │
+                 └──▶ LangGraph Platform  (runtime / checkpoint / observability)
+                          └──▶ writer → reviewer → [interrupt] → finalize
+                                   └──▶ LLM (Claude / GPT)
 ```
 
 | Component | Role |
 |-----------|------|
 | **MCP server** | Primary interface. Drive tasks / approvals from the IDE. Co-located with the backend ([`backend/app/mcp/`](backend/app/mcp/)). |
 | **Backend (FastAPI)** | Thin REST layer + the SQLAlchemy service layer that owns the ledger. |
-| **PostgreSQL** | The ledger: Actor / TaskAssignment / Draft (versioned) / Approval / ExternalLink. A projection of Platform thread state. |
+| **PostgreSQL** | The ledger (Actor / TaskAssignment / Draft / Approval / ExternalLink — a projection of Platform thread state) **and** the coordination board (Workspace / Session / Claim / Relay). |
+| **Coordination board** | Presence, advisory territory claims, and durable messages between agents ([`app/coordination.py`](backend/app/coordination.py)). Pull-based: nothing interrupts a peer. |
 | **LangGraph Platform** | Agent runtime, checkpointing, observability. Graph lives in [`axonrelay-graph/`](axonrelay-graph/). (Now branded *LangSmith Deployment*; self-hostable, e.g. via Aegra.) |
 
 The backend is **read-heavy by design**: writes (create / approve / reject) come
@@ -86,19 +94,47 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
             └─► NEEDS_REVISION ◄─┘ ─► DRAFT / CANCELLED
 ```
 
+The ledger is safe for concurrent writers: `record_approval` locks the task row
+before reading the chain head, so two agents approving the same task cannot fork
+its hash chain.
+
+---
+
+## Data model — the coordination board
+
+| Model | Purpose |
+|-------|---------|
+| `Workspace` | One checkout of one repo on one machine, identified by `(host, repo, clone_path)`. Two clones of the same repo are two workspaces. |
+| `Session` | An Actor working inside a Workspace over a stretch of time. Holds claims, receives relays. Re-registering resumes it, so an agent restart loses nothing. |
+| `Claim` | An **advisory, expiring** lease on paths within a repo. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
+| `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. |
+| `RelayReceipt` | Per-recipient read/ack state, so one peer acking a broadcast does not hide it from the others. |
+
+Design, semantics, and the per-turn protocol agents follow:
+**[docs/coordination-spec.md](docs/coordination-spec.md)**.
+
 ---
 
 ## Interfaces
 
 ### MCP server (primary)
 
-14 tools (`list_tasks`, `create_task`, `get_task`, `run_task`,
+**Ledger — 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
 `list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
 (interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
-`list_agents`, `create_agent`, `update_agent`, `get_self_actor`) and 2 resources
-(`axonrelay://tasks/{id}`, `axonrelay://tasks/{id}/drafts/{version}`).
+`list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
+
+**Coordination — 10 tools**: `register_session`, `heartbeat_session`,
+`end_session`, `get_board`, `check_conflicts`, `claim_territory`,
+`release_territory`, `send_relay`, `read_inbox`, `ack_relay`.
+
+**3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
+`axonrelay://tasks/{id}/drafts/{version}`.
 
 Full tool reference and Claude Code setup: **[docs/mcp-server.md](docs/mcp-server.md)**.
+
+Requires `mcp>=2.1,<3` — the 2.0 release renamed `FastMCP` to `MCPServer`, so the
+dependency is pinned.
 
 ### REST API (read-heavy, for the dashboard)
 
@@ -114,6 +150,9 @@ Full tool reference and Claude Code setup: **[docs/mcp-server.md](docs/mcp-serve
 | `GET` | `/tasks/{id}/drafts` | Draft history |
 | `GET` | `/tasks/{id}/ledger/verify` | Verify the tamper-evident approval hash chain |
 | `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | Task assignments |
+| `GET` | `/coordination/board` | Active sessions, live claims, open relays |
+| `GET` | `/coordination/sessions` `/coordination/claims` | Who is working where; what is claimed |
+| `GET` | `/coordination/sessions/{id}/inbox` | A session's relay inbox |
 
 Writes are also exposed via MCP and are the primary path from the IDE.
 
@@ -127,13 +166,19 @@ docker compose up -d postgres # Postgres only; runtime is on Platform
 
 # backend (venv recommended)
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # applies migration 003; seeds the "self" Actor
+cd backend && alembic upgrade head   # applies migrations through 006; seeds the "self" Actor
 
-# run the MCP server (stdio) for the IDE
-python -m app.mcp.server
+# run the MCP server for the IDE
+python -m app.mcp.server                      # stdio — one machine
+python -m app.mcp.server --http --port 8765   # Streamable HTTP — several devices
 ```
 
 Then point Claude Code at it — see [docs/mcp-server.md](docs/mcp-server.md).
+
+Several devices must share **one** instance for the coordination board to mean
+anything. Serve `--http` and reach it over Tailscale or a Cloudflare Tunnel; the
+transport has no per-caller auth, so it must stay on a private network
+([deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md)).
 
 To run the LangGraph graph locally before deploying to Platform:
 
@@ -163,21 +208,24 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 ## Current state
 
-The pivot is **partially complete** — backend done, frontend/infra cleanup pending:
+The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (14 tools / 2 resources), LangGraph Platform client, migrations through 005. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`). The ledger assumes a single serial writer (the operator); concurrent approvals on one task are out of scope for the PoC (see [delta-mvp-spec §11.6](docs/delta-mvp-spec.md)).
+- ✅ **Backend**: Actor-based ledger, MCP server (24 tools / 3 resources), LangGraph Platform client, migrations through 006. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
 - 🚧 **Infra**: legacy `infra/` (AWS EC2 DNS) and `Caddyfile` removed. The cutover to Cloudflare Tunnel + Tailscale + Vercel/Pages is templated and documented in [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md); the account-side steps (DNS switch, EC2 decommission) remain a manual operator action.
-- 🚧 **Tests**: pytest suite covering the ledger invariants and the run-state projection's idempotency (`backend/tests/`, runs in CI on 3.12). Broader coverage still to come.
+- 🚧 **Tests**: 107 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, the MCP tool surface) plus 16 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
 
-Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md).
+Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md). Coordination design: [docs/coordination-spec.md](docs/coordination-spec.md).
 
 ---
 
 ## Docs
 
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — pivot spec (Actor model, scope, dogfood scenarios)
+- [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: presence, territory claims, relays
+- [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — why the coordination layer has no message broker
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup

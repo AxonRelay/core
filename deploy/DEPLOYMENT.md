@@ -22,8 +22,12 @@ On the home PC or a small VPS:
 ```bash
 cp .env.example .env          # fill DATABASE_URL, LANGGRAPH_*, ANTHROPIC_API_KEY
 docker compose up -d postgres backend
-docker compose exec backend alembic upgrade head
+docker compose exec backend alembic upgrade head   # applies 001..007
 ```
+
+`alembic upgrade head` must reach `007`. Migrations 002 and 007 fix a chain that
+could not apply to a fresh Postgres and an enum-label mismatch that made every
+Actor insert fail — an install stopping short of 007 cannot register a session.
 
 ## 2. Cloudflare Tunnel  →  api.axonrelay.com
 
@@ -47,12 +51,74 @@ Then either:
 The tunnel terminates TLS at Cloudflare and forwards to `backend:8000` — no
 inbound ports open on the host.
 
-## 3. Tailscale (private MCP path)
+## 3. Tailscale + the shared MCP endpoint (required for the coordination board)
 
-**[you]** Join the home PC and your laptop to a Tailscale tailnet so the IDE can
-reach the backend / MCP server privately (e.g. for the Streamable HTTP MCP
-transport added in a later phase). The stdio MCP transport stays local and needs
-no network.
+The coordination board (Phase 3) only means anything if **every device and every
+clone talks to the same AxonRelay instance**. One Postgres per laptop gives you
+two disconnected boards and no conflict detection at all. stdio cannot do this —
+it is one server process per client — so remote devices use Streamable HTTP.
+
+**[you]** Join the host and every device you code on to a Tailscale tailnet.
+
+On the host, run the MCP server on the tailnet interface:
+
+```bash
+cd backend
+python -m app.mcp.server --http --host 0.0.0.0 --port 8765
+```
+
+> **`--host 0.0.0.0` is only safe behind Tailscale.** This transport has **no
+> per-caller authentication**: anyone who can reach the port can read the ledger
+> and approve tasks. Bind it to the tailnet (or keep the default `127.0.0.1` and
+> front it with the tunnel); never expose it to the public internet. Do not add
+> `8765` to the Cloudflare Tunnel ingress unless you put Cloudflare Access in
+> front of it.
+
+Then point each device's MCP client at the one endpoint:
+
+```json
+{
+  "mcpServers": {
+    "axonrelay": {
+      "type": "http",
+      "url": "http://<host>.<tailnet>.ts.net:8765/mcp"
+    }
+  }
+}
+```
+
+Codex CLI takes the same URL in its own MCP config. Each agent then calls
+`register_session` with its own `host` / `clone_path`, and they see each other on
+the board.
+
+**Sanity check** from a second device — it should list 24 tools:
+
+```bash
+python - <<'EOF'
+import asyncio
+from contextlib import AsyncExitStack
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+URL = "http://<host>.<tailnet>.ts.net:8765/mcp"
+
+async def main():
+    async with AsyncExitStack() as stack:
+        read, write = await stack.enter_async_context(streamable_http_client(URL))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        info = await session.initialize()
+        tools = await session.list_tools()
+        print(info.server_info.name, len(tools.tools), "tools")
+
+asyncio.run(main())
+EOF
+```
+
+Keeping it running across reboots is an operator choice — a user launchd agent on
+macOS, or a systemd unit on Linux. Nothing in this repo installs one.
+
+The stdio transport still works for a single machine and needs no network:
+`python -m app.mcp.server`.
 
 ## 4. Dashboard  →  app.axonrelay.com
 

@@ -207,6 +207,31 @@
 
 ---
 
+## Phase 3: 調整レイヤー（2026-08-30 実装済み）
+
+Step 2 の完了後、dogfood の実態が §2 の想定（self + 2〜3 AI、1 台）を超えた — 複数デバイス・
+複数リポジトリ・**同一リポジトリの複数 clone** で Claude と Codex が並行して動く形になった。
+台帳が答えない問い（誰がどこで何を触っているか / これから編集する場所は空いているか /
+別 clone にどう伝えるか）を AxonRelay 自身の機能として引き取った。
+
+| # | タスク | 状態 |
+|---|---|---|
+| 3.1 | Workspace / Session / Claim / Relay / RelayReceipt スキーマ + migration 006 | ✅ |
+| 3.2 | パス重なり判定（`app/territory.py`）— 保守的・見逃さない | ✅ |
+| 3.3 | 調整サービス層（`app/coordination.py`）— 在席 / claim / relay / board | ✅ |
+| 3.4 | MCP tools 10 本 + `axonrelay://board` resource | ✅ |
+| 3.5 | REST 読み取り `/coordination/*`（ダッシュボード・人間用） | ✅ |
+| 3.6 | **§11.6 解消** — `record_approval` に task 行ロックを入れ並行承認を直列化 | ✅ |
+| 3.7 | MCP Streamable HTTP transport（複数デバイスで 1 インスタンス共有） | ✅ |
+| 3.8 | mcp SDK 2.x 移行（`FastMCP` → `MCPServer`）+ バージョンピン + import を守る CI テスト | ✅ |
+| 3.9 | ダッシュボードにボード表示を足す | 未着手 |
+| 3.10 | `focus` の自動更新（IDE フックから heartbeat） | 未着手 |
+
+仕様: [coordination-spec.md](./coordination-spec.md)。メッセージブローカーを入れない判断:
+[adr-006-no-message-broker.md](./adr-006-no-message-broker.md)（issue #21 / #38 / PR #35 の打ち切り理由を含む）。
+
+---
+
 ## オープン論点（Step 2 着手前に決めたい）
 
 1. **MCP サーバを Backend と同居させるか分離するか？**

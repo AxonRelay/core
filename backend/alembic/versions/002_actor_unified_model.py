@@ -4,11 +4,17 @@ Revision ID: 002
 Revises: 001
 Create Date: 2026-02-06
 
+The enum types are declared with ``create_type=False`` so that only the explicit
+``.create(..., checkfirst=True)`` calls below emit ``CREATE TYPE``. Passing a
+plain ``sa.Enum`` to ``op.create_table`` makes the table creation emit its own
+``CREATE TYPE`` as well - which does not honour ``checkfirst`` - and the second
+one fails with "type already exists" on a fresh database.
 """
 
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -21,17 +27,19 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     # Create actor_type enum
-    actor_type_enum = sa.Enum("human", "ai", name="actortypeenum")
+    actor_type_enum = postgresql.ENUM("human", "ai", name="actortypeenum", create_type=False)
     actor_type_enum.create(op.get_bind(), checkfirst=True)
 
     # Create agent_type enum
-    agent_type_enum = sa.Enum(
-        "writer", "reviewer", "validator", "researcher", "assistant", "custom", name="agenttypeenum"
+    agent_type_enum = postgresql.ENUM(
+        "writer", "reviewer", "validator", "researcher", "assistant", "custom", name="agenttypeenum", create_type=False
     )
     agent_type_enum.create(op.get_bind(), checkfirst=True)
 
     # Create assignment_role enum
-    assignment_role_enum = sa.Enum("executor", "reviewer", "approver", "observer", name="assignmentroleenum")
+    assignment_role_enum = postgresql.ENUM(
+        "executor", "reviewer", "approver", "observer", name="assignmentroleenum", create_type=False
+    )
     assignment_role_enum.create(op.get_bind(), checkfirst=True)
 
     # Create actors table

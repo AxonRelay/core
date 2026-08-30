@@ -6,11 +6,16 @@ SQLAlchemy models, which is enough to exercise the application-layer ledger /
 projection logic.
 
 Caveats — this fixture does NOT guarantee parity with production Postgres:
-it is built from `Base.metadata`, not the Alembic migrations (003), so it does
-not validate migration correctness; Enum columns degrade to VARCHAR and JSON to
+it is built from `Base.metadata`, not the Alembic migrations, so it does not
+validate migration correctness; Enum columns degrade to VARCHAR and JSON to
 TEXT on SQLite. We enable `PRAGMA foreign_keys=ON` so FK constraints behave like
 Postgres, but server-side defaults (e.g. `NOW()`) and enum check semantics may
 differ. Treat these as logic tests, not schema-parity tests.
+
+That gap is not hypothetical: it hid a broken migration chain and an enum-label
+mismatch that made every Actor insert fail on Postgres. Schema parity is covered
+separately by `test_postgres_schema.py`, which applies the real migrations to a
+real database and runs in CI against postgres:16.
 """
 
 import pytest

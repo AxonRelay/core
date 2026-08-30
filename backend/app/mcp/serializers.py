@@ -76,3 +76,65 @@ def agent_definition_to_dict(agent: models.AgentDefinition) -> dict:
         "is_active": agent.is_active,
         "actor": actor_to_dict(agent.actor),
     }
+
+
+# ========== Coordination layer ==========
+
+
+def workspace_to_dict(workspace: models.Workspace | None) -> dict | None:
+    if not workspace:
+        return None
+    return {
+        "id": workspace.id,
+        "host": workspace.host,
+        "repo": workspace.repo,
+        "clone_path": workspace.clone_path,
+        "label": workspace.label,
+    }
+
+
+def session_to_dict(session: models.Session) -> dict:
+    return {
+        "session_id": session.id,
+        "actor_id": session.actor_id,
+        "actor": actor_to_dict(session.actor),
+        "workspace": workspace_to_dict(session.workspace),
+        "branch": session.branch,
+        "focus": session.focus,
+        "status": str(session.status),
+        "started_at": session.started_at.isoformat(),
+        "last_heartbeat_at": session.last_heartbeat_at.isoformat(),
+        "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+    }
+
+
+def claim_to_dict(claim: models.Claim) -> dict:
+    return {
+        "claim_id": claim.id,
+        "session_id": claim.session_id,
+        "repo": claim.repo,
+        "paths": list(claim.paths or []),
+        "mode": str(claim.mode),
+        "reason": claim.reason,
+        "status": str(claim.status),
+        "forced_over": claim.forced_over,
+        "created_at": claim.created_at.isoformat(),
+        "expires_at": claim.expires_at.isoformat(),
+        "released_at": claim.released_at.isoformat() if claim.released_at else None,
+    }
+
+
+def relay_to_dict(relay: models.Relay) -> dict:
+    return {
+        "relay_id": relay.id,
+        "kind": str(relay.kind),
+        "subject": relay.subject,
+        "body": relay.body,
+        "from_session_id": relay.from_session_id,
+        "from_actor_id": relay.from_actor_id,
+        "to_actor_id": relay.to_actor_id,
+        "to_workspace_id": relay.to_workspace_id,
+        "to_repo": relay.to_repo,
+        "in_reply_to_id": relay.in_reply_to_id,
+        "created_at": relay.created_at.isoformat(),
+    }

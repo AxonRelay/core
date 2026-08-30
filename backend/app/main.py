@@ -17,8 +17,9 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
-from app import crud, langgraph_client, models, service
+from app import coordination, crud, langgraph_client, models, service
 from app.database import get_db
+from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.schema import (
     ActorResponse,
     AgentDefinitionCreateRequest,
@@ -502,3 +503,56 @@ async def remove_task_assignment_endpoint(
     if not crud.delete_task_assignment_by_actor(db, task_id, actor_id):
         raise HTTPException(status_code=404, detail="Assignment not found")
     return {"message": "Assignment removed successfully"}
+
+
+# ========== Coordination Board (read-only; writes go through MCP) ==========
+#
+# The board is how a human sees what the fleet of agents is doing. Agents drive
+# it through the MCP tools (register_session / claim_territory / send_relay);
+# these endpoints exist so the dashboard - and a person with curl - can read the
+# same picture without an MCP client.
+
+
+@app.get("/coordination/board")
+@limiter.limit("60/minute")
+async def coordination_board_endpoint(request: Request, repo: str | None = None, db: Session = Depends(get_db)):
+    """Active sessions, live territory claims, and unacknowledged relays."""
+    return coordination.board(db, repo=repo)
+
+
+@app.get("/coordination/sessions")
+@limiter.limit("60/minute")
+async def coordination_sessions_endpoint(
+    request: Request,
+    repo: str | None = None,
+    include_ended: bool = False,
+    db: Session = Depends(get_db),
+):
+    """Who is working where, most recently active first."""
+    sessions = coordination.list_sessions(db, repo=repo, include_ended=include_ended)
+    return [{**session_to_dict(s), "stale": coordination.is_stale(s)} for s in sessions]
+
+
+@app.get("/coordination/claims")
+@limiter.limit("60/minute")
+async def coordination_claims_endpoint(request: Request, repo: str | None = None, db: Session = Depends(get_db)):
+    """Territory claims currently in force (held and not yet expired)."""
+    return [
+        {**claim_to_dict(c), "holder": coordination.describe_holder(c.session)}
+        for c in coordination.live_claims(db, repo=repo)
+    ]
+
+
+@app.get("/coordination/sessions/{session_id}/inbox")
+@limiter.limit("60/minute")
+async def coordination_inbox_endpoint(
+    request: Request,
+    session_id: int = Path(..., gt=0),
+    include_acked: bool = False,
+    db: Session = Depends(get_db),
+):
+    """A session's relay inbox. Reading here marks the relays read, as MCP does."""
+    try:
+        return coordination.read_inbox(db, session_id, include_acked=include_acked)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e

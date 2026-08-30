@@ -50,6 +50,46 @@ jobs:
       - name: Run pytest
         run: pytest -q
 
+  test-migrations:
+    name: Test Migrations (Postgres)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: axonrelay
+          POSTGRES_PASSWORD: axonrelay_dev
+          POSTGRES_DB: axonrelay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U axonrelay"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # The SQLite suite builds its schema from Base.metadata and degrades Enum
+      # to VARCHAR, so it can validate neither the migration chain nor the enum
+      # labels. Both hid real production-only defects; this job runs the real
+      # migrations against the real database engine.
+      - name: Run Postgres schema-parity tests
+        env:
+          AXONRELAY_TEST_POSTGRES_URL: postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay_test
+        run: pytest tests/test_postgres_schema.py -q
+
   build-frontend:
     name: Build Frontend (pnpm)
     runs-on: ubuntu-latest

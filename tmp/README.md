@@ -12,7 +12,30 @@
 
 ---
 
-## 同一リポジトリの複数クローン間での同期方法
+## クローン間の共有は AxonRelay 本体でやる（推奨）
+
+> **2026-08-30 更新.** 以下の手動同期手順は、AxonRelay 自身の**調整レイヤー**（Phase 3）が
+> 引き取った。複数 clone・複数デバイス・複数エージェントで作業しているなら、
+> `session-progress.md` を手で配る代わりに MCP tool を使う:
+>
+> | 手動でやっていたこと | 対応する MCP tool |
+> |---|---|
+> | `session-progress.md` に進捗と focus を書く | `heartbeat_session(session_id, focus=...)` |
+> | 別 clone の `session-progress.md` を読む | `get_board(repo=...)` |
+> | territory 衝突を目視で確認する | `check_conflicts(repo, paths)` / `claim_territory(...)` |
+> | INBOX を書いて相手に渡す | `send_relay(...)` / `read_inbox(session_id)` |
+>
+> 全 clone が同じ AxonRelay インスタンスを見るので、コピーも scp も gist も要らない。
+> 設計と運用プロトコル: [docs/coordination-spec.md](../docs/coordination-spec.md)。
+>
+> このディレクトリは引き続き**このクローン限りのスクラッチ**として使う — 試行錯誤のメモ、
+> 仮の出力、共有する価値のない中間物。**他の clone と共有したい状態は AxonRelay に置く。**
+
+---
+
+## 手動同期（AxonRelay を立てていないとき / 単独 clone のとき）
+
+以下は調整レイヤーを使わない場合の従来手順。
 
 同じ `AxonRelay/core` を **複数の場所にクローン**している場合（別マシン、worktree、CI 用、レビュー用など）、`tmp/` の中身は **git では同期されません**。
 

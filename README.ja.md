@@ -2,13 +2,17 @@
 
 日本語 | **[English](README.md)**
 
-**人＋AI 混成チームのためのガバナンス台帳を、MCP サーバとして公開する。**
+**人＋AI 混成チームのためのガバナンス台帳と調整ボードを、MCP サーバとして公開する。**
 
 AxonRelay は「**誰が**（人か AI か）、**どのドラフト版**に対して、**何をしたか**、そして
-**誰が・どんなコメントで・いつ承認/差戻したか**」を記録する。エージェントランタイム、
-人間の介入（承認待ち）、UI はすべて標準（LangGraph Platform / MCP / AG-UI）に委譲する。
-AxonRelay が自分で持ち続けるのは、それらの標準が**提供しない**部分——
-**永続的で、セッションをまたぎ、Actor をまたぐ承認・改稿台帳**だけ。
+**誰が・どんなコメントで・いつ承認/差戻したか**」を記録する。加えて、複数のマシン・
+複数のリポジトリ・**同一リポジトリの複数 clone** で複数のエージェントが同時に動き出した
+瞬間に発生する、決定の**手前**の問い——**いま誰がどこで何を触っていて、これから衝突しないか**
+——にも答える。
+
+エージェントランタイム、人間の介入（承認待ち）、UI はすべて標準（LangGraph Platform /
+MCP / AG-UI）に委譲する。AxonRelay が自分で持ち続けるのは、それらの標準が**提供しない**
+部分——**永続的で、セッションをまたぎ、Actor をまたぐ台帳と、共有された調整ボード**だけ。
 
 > **状態: 個人 PoC（ピボット後）。** 元は汎用「AI Agent Orchestration」基盤だったが、
 > その層は LangGraph Platform + MCP + AG-UI でコモディティ化したため、唯一持つ価値の
@@ -38,24 +42,28 @@ AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（inte
 ## アーキテクチャ
 
 ```
-IDE (Claude Code / Cursor / Zed)
-   │  MCP（ローカルは stdio、将来は Tunnel 経由の Streamable HTTP）
-   ▼
-AxonRelay Backend（FastAPI + MCP サーバ同居）
-   │   - MCP : 14 tools + 2 resources（メインインターフェース）
-   │   - REST: /tasks /agents /actors（読み取り中心・ダッシュボード用）
-   │   - Postgres: Platform thread state の射影 → 台帳
-   │
-   └──▶ LangGraph Platform（runtime / checkpoint / observability）
-            └──▶ writer → reviewer → [interrupt: human_approval] → finalize
-                     └──▶ LLM (Claude / GPT)
+  Claude @ clone A        Codex @ clone B        Claude @ 別リポジトリ
+  (ラップトップ)           (デスクトップ)          (ラップトップ)
+      │                       │                       │
+      └───────────────────────┼───────────────────────┘
+        MCP（ローカルは stdio / Tailscale・Tunnel 経由の Streamable HTTP）
+                              ▼
+              AxonRelay Backend（FastAPI + MCP サーバ同居）
+                 │   - MCP : 24 tools + 3 resources（メインインターフェース）
+                 │   - REST: /tasks /agents /coordination（読み取り中心）
+                 │   - Postgres: 台帳 ＋ 調整ボード
+                 │
+                 └──▶ LangGraph Platform（runtime / checkpoint / observability）
+                          └──▶ writer → reviewer → [interrupt] → finalize
+                                   └──▶ LLM (Claude / GPT)
 ```
 
 | 構成要素 | 役割 |
 |---------|------|
 | **MCP サーバ** | メインインターフェース。IDE からタスク作成・承認・差戻し。backend と同居（[`backend/app/mcp/`](backend/app/mcp/)）。 |
 | **Backend (FastAPI)** | 薄い REST 層 ＋ 台帳を所有する SQLAlchemy service 層。 |
-| **PostgreSQL** | 台帳本体: Actor / TaskAssignment / Draft（版付き）/ Approval / ExternalLink。Platform thread state の射影。 |
+| **PostgreSQL** | 台帳（Actor / TaskAssignment / Draft（版付き）/ Approval / ExternalLink — Platform thread state の射影）**と** 調整ボード（Workspace / Session / Claim / Relay）。 |
+| **調整ボード** | 在席状況・助言的な territory claim・エージェント間の永続メッセージ（[`app/coordination.py`](backend/app/coordination.py)）。pull 型で、誰の作業も中断しない。 |
 | **LangGraph Platform** | エージェントランタイム・checkpoint・observability。graph は [`axonrelay-graph/`](axonrelay-graph/)。（現在は *LangSmith Deployment* に改称。Aegra 等で self-host も可。） |
 
 backend は **読み取り中心**の設計: 書き込み（作成・承認・差戻し）は MCP 経由が一次経路で、
@@ -81,19 +89,45 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
             └─► NEEDS_REVISION ◄─┘ ─► DRAFT / CANCELLED
 ```
 
+台帳は並行書き込みに対して安全。`record_approval` は chain の先端を読む前に task 行の
+ロックを取るため、2 つのエージェントが同一 task を承認しても hash chain は分岐しない。
+
+---
+
+## データモデル — 調整ボード
+
+| モデル | 役割 |
+|-------|------|
+| `Workspace` | 1 台のマシン上の、1 リポジトリの、1 clone。同一性は `(host, repo, clone_path)`。同じ repo の 2 つの clone は別の Workspace。 |
+| `Session` | ある Actor が、ある Workspace で作業している期間。claim を持ち relay を受け取る単位。再登録で同じセッションを再開するので、エージェントが落ちても失われない。 |
+| `Claim` | repo 内のパスに対する**助言的で期限付き**のリース。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
+| `Relay` | 「観客」宛の永続メッセージ — 特定 Actor / 特定 clone / 特定 repo / 全体。pull で配信。 |
+| `RelayReceipt` | 受信者ごとの既読・ack 状態。1 人が ack してもブロードキャストが他の全員から消えない。 |
+
+設計・意味論・エージェントがターンごとに従うプロトコル:
+**[docs/coordination-spec.md](docs/coordination-spec.md)**。
+
 ---
 
 ## インターフェース
 
 ### MCP サーバ（一次）
 
-14 tools（`list_tasks`, `create_task`, `get_task`, `run_task`,
+**台帳系 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
 `list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
 （MCP elicitation による対話的承認）, `verify_task_ledger`, `get_drafts`,
-`list_agents`, `create_agent`, `update_agent`, `get_self_actor`）と 2 resources
-（`axonrelay://tasks/{id}`, `axonrelay://tasks/{id}/drafts/{version}`）。
+`list_agents`, `create_agent`, `update_agent`, `get_self_actor`。
+
+**調整系 10 tools**: `register_session`, `heartbeat_session`, `end_session`,
+`get_board`, `check_conflicts`, `claim_territory`, `release_territory`,
+`send_relay`, `read_inbox`, `ack_relay`。
+
+**3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
+`axonrelay://tasks/{id}/drafts/{version}`。
 
 tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-server.md)**。
+
+`mcp>=2.1,<3` が必要 — 2.0 で `FastMCP` が `MCPServer` に改称されたため、依存はピン止めしている。
 
 ### REST API（読み取り中心・ダッシュボード用）
 
@@ -109,6 +143,9 @@ tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-s
 | `GET` | `/tasks/{id}/drafts` | ドラフト履歴 |
 | `GET` | `/tasks/{id}/ledger/verify` | 承認 hash chain の改ざん検証 |
 | `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | タスク割り当て |
+| `GET` | `/coordination/board` | 稼働セッション / 有効な claim / 未 ack の relay |
+| `GET` | `/coordination/sessions` `/coordination/claims` | 誰がどこで作業中か / 何が claim されているか |
+| `GET` | `/coordination/sessions/{id}/inbox` | セッションの relay 受信箱 |
 
 書き込み系は MCP 側からも公開され、IDE からはそちらが一次経路。
 
@@ -122,13 +159,19 @@ docker compose up -d postgres # Postgres のみ。runtime は Platform 側
 
 # backend（venv 推奨）
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # migration 003 適用・"self" Actor を seed
+cd backend && alembic upgrade head   # migration 006 まで適用・"self" Actor を seed
 
-# IDE 用に MCP サーバ（stdio）を起動
-python -m app.mcp.server
+# IDE 用に MCP サーバを起動
+python -m app.mcp.server                      # stdio — 1 台構成
+python -m app.mcp.server --http --port 8765   # Streamable HTTP — 複数デバイス構成
 ```
 
 その後 Claude Code を接続する — [docs/mcp-server.md](docs/mcp-server.md) を参照。
+
+調整ボードが意味を持つには、**複数デバイスが 1 つのインスタンスを共有している**必要がある。
+`--http` で起動し、Tailscale か Cloudflare Tunnel 経由で到達させる。このトランスポートには
+呼び出し元認証がないため、private network に留めること
+（[deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md)）。
 
 Platform にデプロイする前にローカルで graph を動かす:
 
@@ -158,21 +201,24 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ## 現状
 
-ピボットは **一部完了** — backend は完了、frontend/インフラの掃除が未着手:
+ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（14 tools / 2 resources）、LangGraph Platform クライアント、migration 005 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）。台帳は単一書き込み者（オペレータ）前提で、同一 task への並行承認は PoC では対象外（[delta-mvp-spec §11.6](docs/delta-mvp-spec.md) 参照）。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（24 tools / 3 resources）、LangGraph Platform クライアント、migration 006 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
 - 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋[deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。
-- 🚧 **Tests**: 台帳の不変条件と run-state 投影の idempotency を pytest で整備（`backend/tests/`・CI の py3.12 で実行）。より広いカバレッジは今後。
+- 🚧 **Tests**: SQLite 107 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳を競合させる Postgres スキーマ整合 16 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
 
-ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。
+ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。調整レイヤーの設計: [docs/coordination-spec.md](docs/coordination-spec.md)。
 
 ---
 
 ## ドキュメント
 
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — ピボット仕様（Actor モデル / スコープ / dogfood シナリオ）
+- [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: 在席・territory claim・relay
+- [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — 調整レイヤーにメッセージブローカーを入れない理由
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ
