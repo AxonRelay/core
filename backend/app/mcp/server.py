@@ -6,32 +6,40 @@ HTTP API but operate at the service / SQLAlchemy layer directly to avoid an
 internal HTTP hop.
 
 Run with:
-    python -m app.mcp.server         # stdio transport (default for IDE clients)
+    python -m app.mcp.server                     # stdio, for a local IDE client
+    python -m app.mcp.server --http --port 8765  # Streamable HTTP, for remote clients
 
-Phase 2.4 will additionally mount a Streamable HTTP transport behind the
-Cloudflare Tunnel so remote MCP clients can connect.
+Streamable HTTP is what lets several machines share one AxonRelay: point every
+device's MCP client at the same instance (over Tailscale or a Cloudflare Tunnel
+- see deploy/DEPLOYMENT.md) and they share one ledger and one coordination board.
+Exposing it publicly is not supported: there is no per-caller authentication, so
+the transport must stay on a private network.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 from contextlib import contextmanager
 from typing import Any
 
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.session import ServerSession
+from mcp.server.mcpserver import Context, MCPServer
 from pydantic import BaseModel, Field
 
-from app import crud, langgraph_client, models, service
+from app import coordination, crud, langgraph_client, models, service, territory
 from app.database import SessionLocal
 from app.mcp.serializers import (
     actor_to_dict,
     agent_definition_to_dict,
     approval_to_dict,
+    claim_to_dict,
     draft_to_dict,
+    relay_to_dict,
+    session_to_dict,
     task_to_dict,
 )
 
-mcp = FastMCP("axonrelay")
+mcp = MCPServer("axonrelay")
 
 
 @contextmanager
@@ -266,7 +274,7 @@ class _ApprovalDecision(BaseModel):
 
 
 @mcp.tool()
-async def review_pending_task(task_id: int, ctx: Context[ServerSession, None]) -> dict:
+async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
     """Interactively review a WAITING_APPROVAL task.
 
     Shows the current draft and reviewer feedback, then asks for your decision
@@ -397,6 +405,233 @@ def get_self_actor() -> dict:
         return actor_to_dict(actor)
 
 
+# ========== Coordination Tools (Phase 3) ==========
+#
+# These let several agents - across machines, repos and clones of one repo -
+# see each other, avoid editing the same files at once, and leave each other
+# durable messages. Everything here is pull-based: nothing interrupts a peer.
+
+
+@mcp.tool()
+def register_session(
+    actor_name: str,
+    host: str,
+    repo: str,
+    clone_path: str,
+    branch: str | None = None,
+    focus: str | None = None,
+    actor_type: str = "ai",
+) -> dict:
+    """Join the coordination board. Call this once at the start of a work session.
+
+    Returns a session_id that every other coordination tool needs, so record it
+    for the rest of the session. Safe to call again: re-registering the same
+    actor in the same clone resumes the existing session (keeping its claims and
+    unread relays) rather than creating a duplicate.
+
+    `repo` must be the canonical remote identity (e.g. "AxonRelay/core") so that
+    sibling clones of the same repository recognise each other; `clone_path` is
+    the absolute path of *this* checkout, which is what distinguishes them.
+    """
+    resolved_type = models.ActorTypeEnum(actor_type)
+    with _session() as db:
+        session = coordination.register_session(
+            db,
+            actor_name=actor_name,
+            actor_type=resolved_type,
+            host=host,
+            repo=repo,
+            clone_path=clone_path,
+            branch=branch,
+            focus=focus,
+        )
+        return session_to_dict(session)
+
+
+@mcp.tool()
+def heartbeat_session(session_id: int, focus: str | None = None, branch: str | None = None) -> dict:
+    """Report that you are still working, and update what you are working on.
+
+    `focus` is the one line other agents see on the board - keep it current
+    ("refactoring app/crud.py", "waiting on review of #44"). A session that goes
+    quiet for 30 minutes is shown as stale to everyone else.
+    """
+    with _session() as db:
+        session = coordination.heartbeat_session(db, session_id, focus=focus, branch=branch)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        return session_to_dict(session)
+
+
+@mcp.tool()
+def end_session(session_id: int) -> dict:
+    """Leave the board and release every territory claim this session holds.
+
+    Call this when you finish, so peers are not waiting on leases you no longer
+    need. Claims expire on their own if you never do.
+    """
+    with _session() as db:
+        session = coordination.end_session(db, session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        released = [c.id for c in session.claims if c.status == models.ClaimStatusEnum.RELEASED]
+        return {**session_to_dict(session), "released_claim_ids": released}
+
+
+@mcp.tool()
+def get_board(repo: str | None = None) -> dict:
+    """One read that answers "what is going on right now" across the fleet.
+
+    Active sessions (who, which machine, which clone, which branch, what focus),
+    live territory claims, and unacknowledged relays. Start a turn with this to
+    orient yourself before deciding what to touch.
+    """
+    with _session() as db:
+        return coordination.board(db, repo=repo)
+
+
+@mcp.tool()
+def check_conflicts(repo: str, paths: list[str], session_id: int | None = None, mode: str = "exclusive") -> dict:
+    """Ask whether anyone else holds a claim overlapping `paths` - without claiming.
+
+    Use this before planning an edit; use claim_territory when you commit to it.
+    Path patterns are repo-relative, with fnmatch wildcards allowed; a pattern
+    without a wildcard covers everything beneath it ("backend/app" covers
+    "backend/app/crud.py").
+    """
+    resolved_mode = models.ClaimModeEnum(mode)
+    with _session() as db:
+        conflicts = coordination.find_conflicts(
+            db,
+            repo=repo,
+            paths=[territory.normalize_path(p) for p in paths],
+            mode=resolved_mode,
+            exclude_session_id=session_id,
+        )
+        return {"repo": repo, "paths": paths, "clear": not conflicts, "conflicts": conflicts}
+
+
+@mcp.tool()
+def claim_territory(
+    session_id: int,
+    paths: list[str],
+    reason: str | None = None,
+    mode: str = "exclusive",
+    ttl_minutes: int = 60,
+    repo: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Take an advisory lease on the paths you are about to edit.
+
+    **Refused if it overlaps someone else's live claim** - the response then
+    carries `granted: false` and the conflicting claims, including who holds
+    them and where, so you can message them (send_relay) or work elsewhere.
+    Pass force=true to claim anyway; the override is recorded on the claim.
+
+    mode="exclusive" (default) collides with any overlapping claim;
+    mode="shared" only collides with exclusive ones, so several readers coexist.
+    The lease expires after ttl_minutes (default 60) so a crashed agent cannot
+    hold territory forever. Release it with release_territory when you are done.
+    """
+    resolved_mode = models.ClaimModeEnum(mode)
+    with _session() as db:
+        result = coordination.claim_territory(
+            db,
+            session_id=session_id,
+            paths=paths,
+            repo=repo,
+            mode=resolved_mode,
+            reason=reason,
+            ttl_minutes=ttl_minutes,
+            force=force,
+        )
+        return {
+            "granted": result["granted"],
+            "claim": claim_to_dict(result["claim"]) if result["claim"] else None,
+            "conflicts": result["conflicts"],
+        }
+
+
+@mcp.tool()
+def release_territory(claim_id: int | None = None, session_id: int | None = None) -> dict:
+    """Give back a claim (by claim_id) or all of a session's claims (by session_id)."""
+    if claim_id is None and session_id is None:
+        raise ValueError("Pass either claim_id or session_id")
+    with _session() as db:
+        if claim_id is not None:
+            claim = coordination.release_claim(db, claim_id)
+            if not claim:
+                raise ValueError(f"Claim {claim_id} not found")
+            return {"released": 1, "claim": claim_to_dict(claim)}
+        return {"released": coordination.release_session_claims(db, session_id)}
+
+
+@mcp.tool()
+def send_relay(
+    from_session_id: int,
+    subject: str,
+    body: str | None = None,
+    kind: str = "note",
+    to_actor_id: int | None = None,
+    to_workspace_id: int | None = None,
+    to_repo: str | None = None,
+    in_reply_to_id: int | None = None,
+) -> dict:
+    """Leave a durable message for other sessions. They read it on their own turn.
+
+    Addressing, narrowest to widest: to_actor_id (that agent, wherever it runs),
+    to_workspace_id (that clone), to_repo (everyone on that repository), or none
+    of them (broadcast). The message waits for recipients that are offline, so
+    this works across machines and across restarts.
+
+    kind is one of note / question / answer / handoff / warning. Use "warning"
+    when you are about to do something others should know about ("rewriting the
+    migration chain"), and "handoff" when you are passing work on.
+    """
+    resolved_kind = models.RelayKindEnum(kind)
+    with _session() as db:
+        relay = coordination.send_relay(
+            db,
+            subject=subject,
+            body=body,
+            from_session_id=from_session_id,
+            to_actor_id=to_actor_id,
+            to_workspace_id=to_workspace_id,
+            to_repo=to_repo,
+            kind=resolved_kind,
+            in_reply_to_id=in_reply_to_id,
+        )
+        return relay_to_dict(relay)
+
+
+@mcp.tool()
+def read_inbox(session_id: int, include_acked: bool = False, limit: int = 50) -> list[dict]:
+    """Read relays addressed to this session, oldest first. Marks them as read.
+
+    Check this at the start of a turn, alongside get_board. Messages stay in the
+    inbox until you ack_relay them, so nothing is lost if you do not act now.
+    """
+    with _session() as db:
+        return coordination.read_inbox(db, session_id, include_acked=include_acked, limit=limit)
+
+
+@mcp.tool()
+def ack_relay(relay_id: int, session_id: int, note: str | None = None) -> dict:
+    """Acknowledge a relay so it leaves your inbox, optionally with a reply note.
+
+    Acking is per recipient: it does not hide a broadcast from anyone else, and
+    the receipt records that you saw it.
+    """
+    with _session() as db:
+        receipt = coordination.ack_relay(db, relay_id=relay_id, session_id=session_id, note=note)
+        return {
+            "relay_id": receipt.relay_id,
+            "session_id": receipt.session_id,
+            "acked_at": receipt.acked_at.isoformat() if receipt.acked_at else None,
+            "ack_note": receipt.ack_note,
+        }
+
+
 # ========== Resources (read-only context for the LLM) ==========
 
 
@@ -448,12 +683,42 @@ def draft_resource(task_id: int, version: int) -> str:
         raise ValueError(f"Task {task_id} has no draft v{version}")
 
 
+@mcp.resource("axonrelay://board")
+def board_resource() -> str:
+    """The live coordination board: active sessions, claims, and open relays.
+
+    Exposed as a resource as well as a tool so a client can pin it as ambient
+    context and keep the fleet's state in view without spending a tool call.
+    """
+    with _session() as db:
+        return json.dumps(coordination.board(db), indent=2, ensure_ascii=False)
+
+
 # ========== Entry point ==========
 
 
 def main() -> None:
-    """stdio entry point — used by Claude Code etc."""
-    mcp.run()
+    """Run the server over stdio (default) or Streamable HTTP (``--http``)."""
+    parser = argparse.ArgumentParser(prog="app.mcp.server", description="AxonRelay MCP server")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve Streamable HTTP instead of stdio, so remote clients can share this instance.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address for --http (default: loopback only).")
+    parser.add_argument("--port", type=int, default=8765, help="Port for --http (default: 8765).")
+    args = parser.parse_args()
+
+    if not args.http:
+        mcp.run()
+        return
+
+    # Bound to loopback by default: this transport has no per-caller auth, so
+    # reaching it from another device should go through Tailscale or a
+    # Cloudflare Tunnel rather than a public bind. See deploy/DEPLOYMENT.md.
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":

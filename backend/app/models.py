@@ -3,7 +3,19 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -190,3 +202,194 @@ class ExternalLink(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     task = relationship("Task", back_populates="external_links")
+
+
+# =============================================================================
+# Coordination layer (Phase 3) - Workspace / Session / Claim / Relay
+# =============================================================================
+#
+# The ledger above answers "who approved what". These tables answer the
+# question that arises once several agents work at once across several
+# machines: "who is working where, on what, right now - and are we about to
+# collide?" See docs/coordination-spec.md.
+
+
+class SessionStatusEnum(enum.StrEnum):
+    """Lifecycle of an agent's working session."""
+
+    ACTIVE = "active"
+    ENDED = "ended"
+
+
+class ClaimModeEnum(enum.StrEnum):
+    """Territory claim strength, with reader/writer semantics.
+
+    EXCLUSIVE conflicts with any overlapping claim; SHARED conflicts only with
+    an overlapping EXCLUSIVE one (several readers coexist).
+    """
+
+    EXCLUSIVE = "exclusive"
+    SHARED = "shared"
+
+
+class ClaimStatusEnum(enum.StrEnum):
+    """Territory claim state. Rows are never deleted, only transitioned.
+
+    Expiry is not a stored state: a claim is live only while it is HELD *and*
+    ``expires_at`` is in the future, evaluated at query time. That keeps a dead
+    agent's claims from lingering without needing a reaper process.
+    """
+
+    HELD = "held"
+    RELEASED = "released"
+
+
+class RelayKindEnum(enum.StrEnum):
+    """What a relay message is for - drives how urgently a peer should read it."""
+
+    NOTE = "note"
+    QUESTION = "question"
+    ANSWER = "answer"
+    HANDOFF = "handoff"
+    WARNING = "warning"
+
+
+class Workspace(Base):
+    """One checkout of one repository on one machine.
+
+    Stable across sessions: the same clone re-registering after a restart maps
+    back to the same Workspace row, so its claim and relay history is continuous.
+    ``repo`` should be the canonical remote identity (e.g. ``AxonRelay/core``) so
+    that sibling clones of the same repository agree on it.
+    """
+
+    __tablename__ = "workspaces"
+    __table_args__ = (UniqueConstraint("host", "repo", "clone_path", name="uq_workspace_identity"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    host = Column(String(255), nullable=False, index=True)
+    repo = Column(String(255), nullable=False, index=True)
+    clone_path = Column(String(1000), nullable=False)
+    label = Column(String(255))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    sessions = relationship("Session", back_populates="workspace", cascade="all, delete-orphan")
+
+
+class Session(Base):
+    """An Actor working inside a Workspace over a stretch of time.
+
+    This is the unit that holds claims and receives relays. One active session
+    per (actor, workspace) - re-registering the same pair resumes it rather than
+    creating a parallel one.
+    """
+
+    __tablename__ = "sessions"
+    __table_args__ = (Index("ix_sessions_workspace_status", "workspace_id", "status"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="CASCADE"), nullable=False, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    branch = Column(String(255))
+    focus = Column(Text)
+    status = Column(Enum(SessionStatusEnum), nullable=False, default=SessionStatusEnum.ACTIVE, index=True)
+
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_heartbeat_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    ended_at = Column(DateTime)
+
+    actor = relationship("Actor")
+    workspace = relationship("Workspace", back_populates="sessions")
+    claims = relationship("Claim", back_populates="session", cascade="all, delete-orphan")
+
+
+class Claim(Base):
+    """An advisory, expiring lease on part of a repository.
+
+    Advisory: holding one does not stop anyone writing. It makes the collision
+    *visible* before it happens, which is what a fleet of semi-autonomous agents
+    can actually act on. ``expires_at`` bounds the damage from an agent that dies
+    holding a claim.
+    """
+
+    __tablename__ = "claims"
+    __table_args__ = (Index("ix_claims_repo_status", "repo", "status"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    repo = Column(String(255), nullable=False, index=True)
+    paths = Column(JSON, nullable=False)
+    mode = Column(Enum(ClaimModeEnum), nullable=False, default=ClaimModeEnum.EXCLUSIVE)
+    reason = Column(Text)
+    status = Column(Enum(ClaimStatusEnum), nullable=False, default=ClaimStatusEnum.HELD, index=True)
+
+    # Set when the claim was granted over a live conflict via force=True. The
+    # override is part of the record, not a silent success.
+    forced_over = Column(JSON)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    released_at = Column(DateTime)
+
+    session = relationship("Session", back_populates="claims")
+
+
+class Relay(Base):
+    """A durable, addressed message between sessions - the semi-synchronous channel.
+
+    Delivery is pull-based: a peer reads its inbox when it next takes a turn,
+    rather than being interrupted. Addressing is by audience, not by connection,
+    so a message survives the recipient restarting or moving machines:
+
+    - ``to_actor_id``     - every session of that actor
+    - ``to_workspace_id`` - every session in that clone
+    - ``to_repo``         - every session working on that repository
+    - all three NULL      - broadcast to the fleet
+    """
+
+    __tablename__ = "relays"
+    __table_args__ = (Index("ix_relays_created", "created_at"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_session_id = Column(Integer, ForeignKey("sessions.id", ondelete="SET NULL"), index=True)
+    from_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), index=True)
+
+    to_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="CASCADE"), index=True)
+    to_workspace_id = Column(Integer, ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    to_repo = Column(String(255), index=True)
+
+    kind = Column(Enum(RelayKindEnum), nullable=False, default=RelayKindEnum.NOTE, index=True)
+    subject = Column(String(500), nullable=False)
+    body = Column(Text)
+    in_reply_to_id = Column(Integer, ForeignKey("relays.id", ondelete="SET NULL"))
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    from_session = relationship("Session", foreign_keys=[from_session_id])
+    from_actor = relationship("Actor", foreign_keys=[from_actor_id])
+    receipts = relationship("RelayReceipt", back_populates="relay", cascade="all, delete-orphan")
+
+
+class RelayReceipt(Base):
+    """Per-recipient acknowledgement of a Relay.
+
+    Read/ack state lives here rather than on the Relay because one broadcast has
+    many recipients: one peer acking must not hide the message from the others,
+    and "who has actually seen this" is the auditable part.
+    """
+
+    __tablename__ = "relay_receipts"
+    __table_args__ = (UniqueConstraint("relay_id", "session_id", name="uq_receipt_relay_session"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    relay_id = Column(Integer, ForeignKey("relays.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    read_at = Column(DateTime)
+    acked_at = Column(DateTime)
+    ack_note = Column(Text)
+
+    relay = relationship("Relay", back_populates="receipts")
+    session = relationship("Session")

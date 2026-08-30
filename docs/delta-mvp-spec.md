@@ -228,11 +228,27 @@ MCP に `elicitation`（サーバが人間に構造化入力を accept/decline/c
 LangGraph Platform は **LangSmith Deployment** に改称。OSS の drop-in 代替 **Aegra** が登場。
 - **調整:** [step2-plan.md](./step2-plan.md) のリスク表「Platform 料金が過剰」の退避策に **Aegra（self-host drop-in）** を追加（既存の self-hosted LangGraph Server 案に加えて）。
 
-### 11.6 既知の制約 — 承認台帳は「単一書き込み者」前提
+### 11.6 既知の制約 — 承認台帳は「単一書き込み者」前提 〔2026-08 解消〕
+
+> **更新 (2026-08-30):** 本項が Phase 3+ 候補として先送りしていた「複数アクター / リモート同時利用への拡張」は実施済み。並行承認の問題は解消した。経緯は [coordination-spec.md §9](./coordination-spec.md) を参照。以下は当時の記述を履歴として残す。
 
 承認台帳の hash chain と承認フローは **単一オペレータが直列に承認する前提**で設計している（§2 の self = 人間1人固定に整合）。以下は **個人 PoC では発生しない**として意図的に対象外:
 
 - **同一 task への並行承認**: `record_approval` は「直前行読取 → prev_hash 計算 → INSERT」をロックなしで行うため、同一 task を**同時に**承認/差戻しすると hash chain が分岐し `verify_approval_chain` が後発行を誤検知し得る。複数書き込み者を導入する際は承認追記を task 単位で直列化（行ロック / 楽観ロック）する必要がある。
+  → **解消済み**: `record_approval` は chain 先端を読む前に task 行のロックを取る（Postgres では `SELECT ... FOR UPDATE`）。書き込みは task 単位で直列化される。
 - **`review_pending_task` の TOCTOU**: elicitation 応答待ちの間に task が変化した場合、表示時の draft と一致しなければ `stale_decision` を返して**記録しない**ガードを実装済み（見ていない内容を承認しない）。最終 append との極小窓のみ単一ユーザ前提で許容。
+  → ガードは有効のまま。複数書き込み者の下ではより重要になる。
 
-複数アクター / リモート同時利用に拡張する際はここを設計し直す（Phase 3+ 候補）。
+---
+
+## 12. 2026-08 アップデート — Phase 3 調整レイヤー
+
+§2 は Actor を「self + 2〜3 AI」で足りるとしていた。実際の dogfood はその想定を超えた: **複数デバイス・複数リポジトリ・同一リポジトリの複数 clone で、Claude と Codex が並行して**動いている。台帳が答えない問い（いま誰がどこで何を触っているか、これから編集する場所は空いているか、別 clone に前提をどう伝えるか）が恒常的に発生する。
+
+これを AxonRelay の機能として引き取ったのが **Phase 3 調整レイヤー**である。Workspace / Session / Claim / Relay の4概念を追加し、MCP から駆動する。設計と運用プロトコルは [coordination-spec.md](./coordination-spec.md)。
+
+方針の位置づけ:
+
+- **ピボットの核（ガバナンス台帳）は変えない。** 調整レイヤーは台帳の前段であり、置き換えではない。「誰が承認したか」に「誰がいま何を握っているか」が加わる
+- **自前ランタイムを取り戻すものではない。** 実行は LangGraph Platform のまま。調整レイヤーはメッセージブローカーを持たず、Postgres 1テーブルと pull 配信で足りる（[ADR-006](./adr-006-no-message-broker.md)）
+- **§8 の out of scope は維持。** マルチテナント / 複数ユーザー / 勤務先データは引き続き対象外。増えたのは「1人のオペレータが動かす複数のエージェントとデバイス」であって、他人ではない

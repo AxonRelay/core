@@ -357,8 +357,24 @@ def record_approval(
 
     created_at is set explicitly here (not via the column default) so the value
     that is hashed is exactly the value persisted.
+
+    **Concurrency**: read-prev-then-append is a read-modify-write on the task's
+    hash chain, so two approvals racing on one task would otherwise both chain
+    off the same `prev_hash` and fork the chain (`verify_approval_chain` would
+    then flag the later one as tampering). We take a row lock on the task first,
+    which serializes writers per task for the rest of the transaction. This is
+    what makes the ledger safe for the multi-actor / multi-device use the
+    coordination layer enables; it lifts the single-writer limitation recorded
+    in docs/delta-mvp-spec.md §11.6.
+
+    `with_for_update` is a no-op on SQLite (the test backend), which serializes
+    writers at the database level anyway. On Postgres it is a real `SELECT ...
+    FOR UPDATE`.
     """
     now = datetime.utcnow()
+    # Lock the task row *before* reading the chain head, so a concurrent
+    # approval on the same task waits here rather than racing us to the tail.
+    db.query(models.Task).filter(models.Task.id == task_id).with_for_update().first()
     last = (
         db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
     )
