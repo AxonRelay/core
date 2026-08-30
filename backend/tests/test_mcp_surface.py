@@ -8,6 +8,8 @@ the next SDK move fails here instead of at an operator's IDE.
 """
 
 import asyncio
+import inspect
+import sys
 
 import pytest
 
@@ -92,3 +94,54 @@ def test_stdio_and_http_transports_are_both_reachable(server):
     """`--http` is what lets several devices share one instance."""
     assert callable(server.main)
     assert hasattr(server.mcp, "streamable_http_app")
+
+
+def test_default_invocation_runs_stdio(server, monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(sys, "argv", ["app.mcp.server"])
+
+    server.main()
+
+    assert calls == [((), {})]
+
+
+def test_http_flag_passes_host_port_and_path_to_the_transport(server, monkeypatch):
+    """Regression: main() used to set `mcp.settings.host`, which mcp 2.x rejects.
+
+    `Settings` has no host/port fields — the server crashed on startup with
+    `ValueError: "Settings" object has no field "host"`, so --http never served
+    anything. host/port/path are transport kwargs of `run()`, not settings.
+    """
+    calls = []
+    monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(sys, "argv", ["app.mcp.server", "--http", "--host", "0.0.0.0", "--port", "9999"])
+
+    server.main()
+
+    assert calls == [
+        ((), {"transport": "streamable-http", "host": "0.0.0.0", "port": 9999, "streamable_http_path": "/mcp"})
+    ]
+
+
+def test_http_binds_loopback_by_default(server, monkeypatch):
+    """The transport has no per-caller auth, so it must not default to a public bind."""
+    calls = []
+    monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(sys, "argv", ["app.mcp.server", "--http"])
+
+    server.main()
+
+    assert calls[0][1]["host"] == "127.0.0.1"
+
+
+def test_the_http_kwargs_match_the_sdk_signature(server):
+    """Bind the kwargs against the real SDK method, so an SDK rename fails here."""
+    signature = inspect.signature(server.mcp.run_streamable_http_async)
+    signature.bind(host="127.0.0.1", port=8765, streamable_http_path="/mcp")
+
+
+def test_the_streamable_http_app_mounts_the_mcp_endpoint(server):
+    app = server.mcp.streamable_http_app()
+    paths = {getattr(r, "path", None) for r in app.routes}
+    assert "/mcp" in paths

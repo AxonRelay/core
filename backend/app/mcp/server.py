@@ -707,6 +707,7 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address for --http (default: loopback only).")
     parser.add_argument("--port", type=int, default=8765, help="Port for --http (default: 8765).")
+    parser.add_argument("--path", default="/mcp", help="URL path for --http (default: /mcp).")
     args = parser.parse_args()
 
     if not args.http:
@@ -716,9 +717,7 @@ def main() -> None:
     # Bound to loopback by default: this transport has no per-caller auth, so
     # reaching it from another device should go through Tailscale or a
     # Cloudflare Tunnel rather than a public bind. See deploy/DEPLOYMENT.md.
-    mcp.settings.host = args.host
-    mcp.settings.port = args.port
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host=args.host, port=args.port, streamable_http_path=args.path)
 
 
 if __name__ == "__main__":
