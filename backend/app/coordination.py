@@ -196,11 +196,15 @@ def heartbeat_session(
     return session
 
 
-def end_session(db: DBSession, session_id: int) -> models.Session | None:
+def end_session(db: DBSession, session_id: int) -> tuple[models.Session, list[int]] | None:
     """Close a session and release every claim it still holds.
 
     Releasing on exit is what keeps the board honest when an agent finishes
     cleanly; ``expires_at`` is the fallback for the ones that do not.
+
+    Returns the session and the ids of the claims *this call* released - not
+    every claim the session ever released, which would overstate what the exit
+    freed.
     """
     session = db.query(models.Session).filter(models.Session.id == session_id).first()
     if not session:
@@ -212,6 +216,7 @@ def end_session(db: DBSession, session_id: int) -> models.Session | None:
         .filter(models.Claim.session_id == session_id, models.Claim.status == models.ClaimStatusEnum.HELD)
         .all()
     )
+    released_ids = [claim.id for claim in held]
     for claim in held:
         claim.status = models.ClaimStatusEnum.RELEASED
         claim.released_at = now
@@ -220,7 +225,7 @@ def end_session(db: DBSession, session_id: int) -> models.Session | None:
     session.ended_at = now
     db.commit()
     db.refresh(session)
-    return session
+    return session, released_ids
 
 
 def is_stale(session: models.Session, now: datetime | None = None) -> bool:
@@ -587,10 +592,15 @@ def board(db: DBSession, *, repo: str | None = None) -> dict[str, Any]:
     sessions = list_sessions(db, repo=repo)
     claims = live_claims(db, repo=repo, now=now)
 
+    # A relay is still open while any addressee has not acked it - including one
+    # nobody has read yet (no receipt row at all), hence the outer join.
+    # `distinct` is explicit: several unacked receipts on one broadcast would
+    # otherwise yield the same relay once per receipt.
     unacked = (
         db.query(models.Relay)
         .outerjoin(models.RelayReceipt, models.RelayReceipt.relay_id == models.Relay.id)
         .filter(models.RelayReceipt.acked_at.is_(None))
+        .distinct()
         .order_by(models.Relay.created_at.desc())
         .limit(20)
         .all()

@@ -471,11 +471,11 @@ def end_session(session_id: int) -> dict:
     need. Claims expire on their own if you never do.
     """
     with _session() as db:
-        session = coordination.end_session(db, session_id)
-        if not session:
+        result = coordination.end_session(db, session_id)
+        if not result:
             raise ValueError(f"Session {session_id} not found")
-        released = [c.id for c in session.claims if c.status == models.ClaimStatusEnum.RELEASED]
-        return {**session_to_dict(session), "released_claim_ids": released}
+        session, released_claim_ids = result
+        return {**session_to_dict(session), "released_claim_ids": released_claim_ids}
 
 
 @mcp.tool()

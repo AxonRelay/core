@@ -100,12 +100,22 @@ class TestPresence:
         assert len(coordination.list_sessions(db)) == 3
 
     def test_ending_a_session_hides_it_and_frees_its_claims(self, db, alice):
-        coordination.claim_territory(db, session_id=alice.id, paths=["backend/app"])
-        ended = coordination.end_session(db, alice.id)
+        claim = coordination.claim_territory(db, session_id=alice.id, paths=["backend/app"])["claim"]
+        ended, released_ids = coordination.end_session(db, alice.id)
 
         assert ended.status == models.SessionStatusEnum.ENDED
+        assert released_ids == [claim.id]
         assert coordination.list_sessions(db) == []
         assert coordination.live_claims(db) == []
+
+    def test_ending_reports_only_the_claims_that_call_released(self, db, alice):
+        """An already-released claim must not be counted as freed by the exit."""
+        earlier = coordination.claim_territory(db, session_id=alice.id, paths=["docs"])["claim"]
+        still_held = coordination.claim_territory(db, session_id=alice.id, paths=["backend/app"])["claim"]
+        coordination.release_claim(db, earlier.id)
+
+        _, released_ids = coordination.end_session(db, alice.id)
+        assert released_ids == [still_held.id]
 
     def test_ending_an_unknown_session_returns_none(self, db):
         assert coordination.end_session(db, 999) is None
@@ -384,6 +394,31 @@ class TestBoard:
     def test_acked_relays_leave_the_board(self, db, alice, bob):
         relay = coordination.send_relay(db, from_session_id=alice.id, subject="handled")
         coordination.ack_relay(db, relay_id=relay.id, session_id=bob.id)
+        assert coordination.board(db)["open_relays"] == []
+
+    def test_a_broadcast_read_by_several_peers_is_listed_once(self, db, alice, bob):
+        """Several unacked receipts on one relay must not multiply it on the board."""
+        third = coordination.register_session(
+            db, actor_name="gemini", host="mbp16", repo="AxonRelay/core", clone_path="/tmp/c3"
+        )
+        coordination.send_relay(db, from_session_id=alice.id, subject="broadcast")
+        coordination.read_inbox(db, bob.id)
+        coordination.read_inbox(db, third.id)
+
+        assert [r["subject"] for r in coordination.board(db)["open_relays"]] == ["broadcast"]
+
+    def test_a_broadcast_stays_open_until_every_reader_acks(self, db, alice, bob):
+        third = coordination.register_session(
+            db, actor_name="gemini", host="mbp16", repo="AxonRelay/core", clone_path="/tmp/c3"
+        )
+        relay = coordination.send_relay(db, from_session_id=alice.id, subject="broadcast")
+        coordination.read_inbox(db, bob.id)
+        coordination.read_inbox(db, third.id)
+
+        coordination.ack_relay(db, relay_id=relay.id, session_id=bob.id)
+        assert len(coordination.board(db)["open_relays"]) == 1
+
+        coordination.ack_relay(db, relay_id=relay.id, session_id=third.id)
         assert coordination.board(db)["open_relays"] == []
 
     def test_an_empty_board_is_still_well_formed(self, db):
