@@ -171,7 +171,7 @@ python -m app.mcp.server --http --port 8765   # Streamable HTTP — 複数デバ
 調整ボードが意味を持つには、**複数デバイスが 1 つのインスタンスを共有している**必要がある。
 `--http` で起動し、Tailscale か Cloudflare Tunnel 経由で到達させる。このトランスポートには
 呼び出し元認証がないため、private network に留めること
-（[deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md)）。
+（手順は **[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)**）。
 
 Platform にデプロイする前にローカルで graph を動かす:
 
@@ -207,7 +207,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
-- 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋[deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。
+- 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋**[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)** に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。**調整ボードを実際に使うには同ドキュメント §3（Tailscale + 共有 MCP エンドポイント）が必要** — コードは入っているが、まだどこでも稼働していない。
 - 🚧 **Tests**: SQLite 107 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳を競合させる Postgres スキーマ整合 16 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
 
 ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。調整レイヤーの設計: [docs/coordination-spec.md](docs/coordination-spec.md)。
@@ -222,5 +222,5 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ
-- [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) — Phase 2.4 ホスティング切替（Cloudflare Tunnel / Tailscale / Vercel）
+- [deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md) — **デプロイ手順（日本語）**。ホスティング切替と、調整ボードに必要な共有 MCP エンドポイントの立て方（[English](deploy/DEPLOYMENT.md)）
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL セットアップ & マイグレーション

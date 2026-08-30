@@ -180,7 +180,7 @@ python -m app.mcp.server                      # stdio — ローカル IDE 用
 python -m app.mcp.server --http --port 8765   # Streamable HTTP — リモート用
 ```
 
-既定のバインドは loopback。**このトランスポートには呼び出し元認証がない**ので、他デバイスからの到達は Tailscale か Cloudflare Tunnel を経由させる。公開バインドは想定外。手順は [deploy/DEPLOYMENT.md](../deploy/DEPLOYMENT.md)。
+既定のバインドは loopback。**このトランスポートには呼び出し元認証がない**ので、他デバイスからの到達は Tailscale か Cloudflare Tunnel を経由させる。公開バインドは想定外。手順は **[deploy/DEPLOYMENT.ja.md](../deploy/DEPLOYMENT.ja.md)**（[English](../deploy/DEPLOYMENT.md)）。
 
 ---
 

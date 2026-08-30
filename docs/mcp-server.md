@@ -20,7 +20,7 @@ cd backend
 python -m app.mcp.server --http --port 8765
 ```
 
-調整レイヤーは **全員が同じインスタンスを見ていること**が前提なので、デバイスが複数あるならこちらを使う。既定のバインドは loopback。**呼び出し元認証はない**ので、他デバイスからの到達は Tailscale か Cloudflare Tunnel 経由にする（[deploy/DEPLOYMENT.md](../deploy/DEPLOYMENT.md)）。公開バインドは想定外。
+調整レイヤーは **全員が同じインスタンスを見ていること**が前提なので、デバイスが複数あるならこちらを使う。既定のバインドは loopback。**呼び出し元認証はない**ので、他デバイスからの到達は Tailscale か Cloudflare Tunnel 経由にする（**[deploy/DEPLOYMENT.ja.md](../deploy/DEPLOYMENT.ja.md)** に手順）。公開バインドは想定外。
 
 クライアント側の設定例：
 
