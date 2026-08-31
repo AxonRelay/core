@@ -24,6 +24,7 @@ The URL's database is dropped and recreated, so point it at a scratch database.
 """
 
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -54,6 +55,13 @@ MODEL_ENUMS = [
 ]
 
 COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts"}
+
+
+def _expected_head() -> str:
+    """The highest revision id present in the migrations directory."""
+    versions = pathlib.Path(__file__).resolve().parent.parent / "alembic" / "versions"
+    revisions = sorted(f.name.split("_", 1)[0] for f in versions.glob("[0-9]*.py"))
+    return revisions[-1]
 
 
 def _recreate_database(url: str) -> None:
@@ -126,10 +134,15 @@ def _db_enum_labels(engine) -> dict[str, set[str]]:
 
 class TestMigrationChain:
     def test_the_whole_chain_applies_to_an_empty_database(self, migrated_engine):
-        """Regression: migration 002 used to emit CREATE TYPE twice and abort here."""
+        """Regression: migration 002 used to emit CREATE TYPE twice and abort here.
+
+        The expected head is derived from the migration directory rather than
+        hardcoded, so adding a migration does not require editing this test —
+        and a migration that fails to apply still fails it.
+        """
         with migrated_engine.connect() as conn:
             revision = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert revision == "007"
+        assert revision == _expected_head()
 
     def test_the_coordination_tables_exist(self, migrated_engine):
         with migrated_engine.connect() as conn:

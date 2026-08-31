@@ -89,6 +89,7 @@ def workspace_to_dict(workspace: models.Workspace | None) -> dict | None:
         "host": workspace.host,
         "repo": workspace.repo,
         "clone_path": workspace.clone_path,
+        "git_dir": workspace.git_dir,
         "label": workspace.label,
     }
 
@@ -114,6 +115,7 @@ def claim_to_dict(claim: models.Claim) -> dict:
         "session_id": claim.session_id,
         "repo": claim.repo,
         "paths": list(claim.paths or []),
+        "resource": str(claim.resource) if claim.resource else None,
         "mode": str(claim.mode),
         "reason": claim.reason,
         "status": str(claim.status),

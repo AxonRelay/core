@@ -100,7 +100,7 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 |-------|------|
 | `Workspace` | 1 台のマシン上の、1 リポジトリの、1 clone。同一性は `(host, repo, clone_path)`。同じ repo の 2 つの clone は別の Workspace。 |
 | `Session` | ある Actor が、ある Workspace で作業している期間。claim を持ち relay を受け取る単位。再登録で同じセッションを再開するので、エージェントが落ちても失われない。 |
-| `Claim` | repo 内のパスに対する**助言的で期限付き**のリース。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
+| `Claim` | **助言的で期限付き**のリース。repo 内のパス、またはパスで表現できない共有 git 資源（`worktree` / `stash` / `refs`）に対して取る。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
 | `Relay` | 「観客」宛の永続メッセージ — 特定 Actor / 特定 clone / 特定 repo / 全体。pull で配信。 |
 | `RelayReceipt` | 受信者ごとの既読・ack 状態。1 人が ack してもブロードキャストが他の全員から消えない。 |
 
@@ -118,9 +118,15 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 （MCP elicitation による対話的承認）, `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`。
 
-**調整系 10 tools**: `register_session`, `heartbeat_session`, `end_session`,
+**調整系 12 tools**: `register_session`, `heartbeat_session`, `end_session`,
 `get_board`, `check_conflicts`, `claim_territory`, `release_territory`,
-`send_relay`, `read_inbox`, `ack_relay`。
+`claim_git_resource`, `check_git_resource`, `send_relay`, `read_inbox`, `ack_relay`。
+
+`refs/stash` はリポジトリ単位の ref なので、**兄弟 worktree が1つの stash スタックを共有する** —
+片方の `git stash pop` が、もう片方が退避した作業を奪える。守るべきパスが存在しない。
+[`tools/gitsafe`](tools/gitsafe) が機械的に止める: stash に所有セッションのタグを刻み
+（オフラインでも機能）、破壊的 git の前にボードへ照会する。詳細は
+[coordination-spec.md §4.3–4.4](docs/coordination-spec.md)。
 
 **3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
 `axonrelay://tasks/{id}/drafts/{version}`。

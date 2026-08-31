@@ -106,7 +106,7 @@ its hash chain.
 |-------|---------|
 | `Workspace` | One checkout of one repo on one machine, identified by `(host, repo, clone_path)`. Two clones of the same repo are two workspaces. |
 | `Session` | An Actor working inside a Workspace over a stretch of time. Holds claims, receives relays. Re-registering resumes it, so an agent restart loses nothing. |
-| `Claim` | An **advisory, expiring** lease on paths within a repo. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
+| `Claim` | An **advisory, expiring** lease — on paths within a repo, or on a shared git resource (`worktree` / `stash` / `refs`) that no path pattern can describe. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
 | `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. |
 | `RelayReceipt` | Per-recipient read/ack state, so one peer acking a broadcast does not hide it from the others. |
 
@@ -124,9 +124,16 @@ Design, semantics, and the per-turn protocol agents follow:
 (interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
 
-**Coordination — 10 tools**: `register_session`, `heartbeat_session`,
+**Coordination — 12 tools**: `register_session`, `heartbeat_session`,
 `end_session`, `get_board`, `check_conflicts`, `claim_territory`,
-`release_territory`, `send_relay`, `read_inbox`, `ack_relay`.
+`release_territory`, `claim_git_resource`, `check_git_resource`, `send_relay`,
+`read_inbox`, `ack_relay`.
+
+`refs/stash` is a per-repository ref, so sibling git worktrees share one stash
+stack and `git stash pop` in one can consume work parked in another — with no
+path to guard. [`tools/gitsafe`](tools/gitsafe) enforces the guard mechanically:
+it tags stashes with their owning session (which works offline) and consults the
+board before destructive git.
 
 **3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
 `axonrelay://tasks/{id}/drafts/{version}`.

@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# gitsafe — a fail-closed wrapper around the destructive half of git, for
+# clones that more than one agent shares.
+#
+# The problem it exists for: `refs/stash` is a per-repository ref. Every git
+# worktree of a clone shares one stash stack, so `git stash pop` in one place
+# can apply — and consume — work parked somewhere else. The stash stack has no
+# owner field, and `git stash pop` names no path, so nothing in git and nothing
+# in a path-based lock can tell those apart.
+#
+# Two layers, deliberately in this order:
+#
+#   1. Stash ownership tags. `gitsafe git stash push` records the session in the
+#      stash message; pop/apply/drop refuse an entry belonging to someone else.
+#      This needs no network and no server — the tag travels inside the stash —
+#      so it keeps working when AxonRelay is down. It is what actually stops the
+#      incident.
+#   2. AxonRelay resource claims. For worktree- and ref-level damage
+#      (`reset --hard`, `clean -fd`, `branch -D`, force-push) it asks the board
+#      whether another session holds the resource. Advisory data, enforced here.
+#
+# Read-only git is never blocked. Subagents legitimately need status/diff/log,
+# and a guard that got in the way of those would be switched off.
+#
+# Usage:
+#   gitsafe git <args...>      explicit
+#   git() { gitsafe git "$@"; }   as a shell function, so plain `git` is guarded
+#
+# Environment:
+#   AXONRELAY_URL         backend base URL (e.g. http://host.tailnet.ts.net:8000)
+#   AXONRELAY_SESSION_ID  this session's id from register_session, if registered
+#   GITSAFE_ALLOW_UNSAFE  set to 1 for one command to bypass (recorded on stderr)
+
+set -euo pipefail
+
+AXONRELAY_URL="${AXONRELAY_URL:-}"
+SESSION_ID="${AXONRELAY_SESSION_ID:-}"
+TAG_PREFIX="[axonrelay:"
+
+die() { printf 'gitsafe: %s\n' "$*" >&2; exit 1; }
+note() { printf 'gitsafe: %s\n' "$*" >&2; }
+
+real_git() { command git "$@"; }
+
+# --- identity ---------------------------------------------------------------
+
+git_common_dir() { real_git rev-parse --git-common-dir 2>/dev/null | xargs -I{} readlink -f {} 2>/dev/null || true; }
+clone_path()     { real_git rev-parse --show-toplevel 2>/dev/null || pwd; }
+
+# The tag written into a stash message. Falls back to a host+clone identity when
+# the caller never registered, so an unregistered subagent still cannot silently
+# adopt someone else's stash.
+owner_tag() {
+  if [ -n "$SESSION_ID" ]; then
+    printf '%ss%s]' "$TAG_PREFIX" "$SESSION_ID"
+  else
+    printf '%sunregistered@%s:%s]' "$TAG_PREFIX" "$(hostname -s)" "$(clone_path)"
+  fi
+}
+
+# --- AxonRelay (advisory; absence is not fatal) ------------------------------
+
+guard_resource() { # $1 = worktree|stash|refs   returns 0 = allowed
+  [ -n "$AXONRELAY_URL" ] || { note "AXONRELAY_URL unset — claim check skipped (stash tags still enforced)"; return 0; }
+
+  local url resp
+  if [ -n "$SESSION_ID" ]; then
+    url="$AXONRELAY_URL/coordination/git/guard?resource=$1&session_id=$SESSION_ID"
+  else
+    url="$AXONRELAY_URL/coordination/git/guard?resource=$1&host=$(hostname -s)&clone_path=$(clone_path)"
+  fi
+
+  resp=$(curl -fsS --max-time 5 --get --data-urlencode "" "$url" 2>/dev/null) || {
+    note "AxonRelay unreachable — claim check skipped (stash tags still enforced)"
+    return 0
+  }
+
+  case "$resp" in
+    *'"allowed":true'*|*'"allowed": true'*) return 0 ;;
+  esac
+
+  note "refused: another session holds the '$1' claim on this clone."
+  printf '%s\n' "$resp" | tr ',' '\n' | grep -E '"(actor|host|clone_path|branch|focus|reason)"' >&2 || true
+  note "ask them via send_relay, or override once with GITSAFE_ALLOW_UNSAFE=1."
+  return 1
+}
+
+# --- stash ownership ---------------------------------------------------------
+
+stash_ref_message() { # $1 = stash ref like stash@{0}
+  real_git log -1 --format=%s "$1" 2>/dev/null || true
+}
+
+assert_stash_is_ours() { # $1 = stash ref
+  local msg mine
+  msg=$(stash_ref_message "$1")
+  mine=$(owner_tag)
+
+  case "$msg" in
+    *"$mine"*) return 0 ;;
+  esac
+
+  case "$msg" in
+    *"$TAG_PREFIX"*)
+      local theirs
+      theirs=$(printf '%s' "$msg" | sed -n "s/.*\\[axonrelay:\\([^]]*\\)\\].*/\\1/p")
+      die "$1 belongs to another session ($theirs).
+  Popping it would take work that session parked and is still expecting.
+  Its message: $msg
+  If you are certain, re-run with GITSAFE_ALLOW_UNSAFE=1."
+      ;;
+    *)
+      die "$1 has no ownership tag, so it cannot be attributed to you.
+  It predates gitsafe, or was created by a bare git.
+  Its message: $msg
+  Inspect it with 'git stash show -p $1' before deciding, then
+  re-run with GITSAFE_ALLOW_UNSAFE=1 if it is yours."
+      ;;
+  esac
+}
+
+resolve_stash_ref() { # first stash-looking arg, else stash@{0}
+  local a
+  for a in "$@"; do
+    case "$a" in stash@*) printf '%s' "$a"; return ;; esac
+  done
+  printf 'stash@{0}'
+}
+
+# --- command classification --------------------------------------------------
+
+main() {
+  [ "${1:-}" = "git" ] || die "usage: gitsafe git <args...>"
+  shift
+  [ $# -gt 0 ] || { real_git; return; }
+
+  if [ "${GITSAFE_ALLOW_UNSAFE:-}" = "1" ]; then
+    note "BYPASS: GITSAFE_ALLOW_UNSAFE=1 — running unguarded: git $*"
+    real_git "$@"
+    return
+  fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    stash)
+      # Consume the stash subcommand so "$@" holds only its arguments. A bare
+      # `git stash` (or `git stash -m msg`) means push, with nothing to consume.
+      local op="push"
+      case "${1:-}" in
+        pop|apply|drop|clear|push|save|list|show|branch|create|store)
+          op="$1"; shift ;;
+      esac
+      case "$op" in
+        pop|apply|drop)
+          local ref; ref=$(resolve_stash_ref "$@")
+          assert_stash_is_ours "$ref"
+          guard_resource stash || exit 1
+          real_git stash "$op" "$@"
+          ;;
+        clear)
+          die "'git stash clear' discards every entry in the clone, including
+  other sessions'. It is never safe here. Drop your own with
+  'gitsafe git stash drop stash@{n}'."
+          ;;
+        push|save)
+          guard_resource stash || exit 1
+          # Stamp the message so the entry can be attributed later. `save` is
+          # deprecated in git and takes its message positionally; normalise both
+          # onto `push -m`.
+          local msg="" rest=() saw_m=0
+          for a in "$@"; do
+            if [ $saw_m -eq 1 ]; then msg="$a"; saw_m=0; continue; fi
+            case "$a" in
+              -m|--message) saw_m=1 ;;
+              *) rest+=("$a") ;;
+            esac
+          done
+          real_git stash push -m "$(owner_tag) ${msg:-wip}" ${rest[@]+"${rest[@]}"}
+          ;;
+        list|show)
+          real_git stash "$op" "$@"
+          ;;
+        *)
+          guard_resource stash || exit 1
+          real_git stash "$op" "$@"
+          ;;
+      esac
+      ;;
+
+    reset)
+      case "$*" in
+        *--hard*) guard_resource worktree || exit 1 ;;
+      esac
+      real_git reset "$@"
+      ;;
+
+    clean)
+      case "$*" in
+        *-f*|*--force*) guard_resource worktree || exit 1 ;;
+      esac
+      real_git clean "$@"
+      ;;
+
+    checkout|switch)
+      # Only guarded when it would carry or clobber uncommitted work.
+      if [ -n "$(real_git status --porcelain 2>/dev/null)" ]; then
+        guard_resource worktree || exit 1
+      fi
+      real_git "$sub" "$@"
+      ;;
+
+    rebase|merge|cherry-pick|revert)
+      guard_resource worktree || exit 1
+      real_git "$sub" "$@"
+      ;;
+
+    branch)
+      case "$*" in
+        *-D*|*-d*|*--delete*|*-M*|*--move*) guard_resource refs || exit 1 ;;
+      esac
+      real_git branch "$@"
+      ;;
+
+    push)
+      case "$*" in
+        *--force*|*-f*|*--delete*) guard_resource refs || exit 1 ;;
+      esac
+      real_git push "$@"
+      ;;
+
+    *)
+      real_git "$sub" "$@"
+      ;;
+  esac
+}
+
+main "$@"

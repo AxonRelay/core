@@ -120,6 +120,31 @@ macOS, or a systemd unit on Linux. Nothing in this repo installs one.
 The stdio transport still works for a single machine and needs no network:
 `python -m app.mcp.server`.
 
+## 3.6 Guarding a shared clone (gitsafe)
+
+If more than one agent works in one clone — or in sibling worktrees of it — put
+[`tools/gitsafe`](../tools/gitsafe) on PATH.
+
+**Why:** `refs/stash` is a per-repository ref, so `git worktree add` does *not*
+give you a second stash stack. A `git stash pop` in one worktree consumes work
+parked in another, and since `git stash pop` names no path, no path claim can
+guard it.
+
+```bash
+export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"
+export AXONRELAY_SESSION_ID="<id from register_session>"
+git() { /path/to/core/tools/gitsafe git "$@"; }
+```
+
+Read-only git always passes. `stash push` stamps `[axonrelay:s<id>]` into the
+message; `pop`/`apply`/`drop` refuse an entry tagged for someone else; `stash
+clear` is always refused. `reset --hard`, `clean -f`, a dirty `checkout`,
+`rebase`, `branch -D` and `push --force` consult the board.
+
+The stash tag check works with no network — the tag lives in the stash message —
+so it still protects you when AxonRelay is unreachable. Bypass once with
+`GITSAFE_ALLOW_UNSAFE=1`, which is recorded on stderr.
+
 ## 4. Dashboard  →  app.axonrelay.com
 
 **[you]** Deploy `frontend/` to Vercel or Cloudflare Pages:

@@ -543,6 +543,40 @@ async def coordination_claims_endpoint(request: Request, repo: str | None = None
     ]
 
 
+@app.get("/coordination/git/guard")
+@limiter.limit("120/minute")
+async def coordination_git_guard_endpoint(
+    request: Request,
+    resource: str,
+    session_id: int | None = None,
+    host: str | None = None,
+    clone_path: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """Whether a git resource is free — the endpoint `tools/gitsafe` polls.
+
+    REST rather than MCP because the caller is a shell wrapper sitting in front
+    of `git`; speaking JSON-RPC over SSE from a shell script is not reasonable.
+    It stays read-only, so the "writes go through MCP" rule is intact.
+
+    A caller with no `session_id` is an *unregistered* actor in the clone — a
+    subagent that spawned inside someone's working directory, typically. It is
+    identified by (host, clone_path) instead, and is refused whenever anyone
+    holds the resource, since it cannot have been the one to claim it.
+    """
+    try:
+        resolved = models.ClaimResourceEnum(resource)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Unknown resource '{resource}'") from e
+
+    if session_id is not None:
+        return coordination.guard_git_operation(db, session_id=session_id, resource=resolved)
+
+    if not (host and clone_path):
+        raise HTTPException(status_code=400, detail="Pass session_id, or both host and clone_path")
+    return coordination.guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resolved)
+
+
 @app.get("/coordination/sessions/{session_id}/inbox")
 @limiter.limit("60/minute")
 async def coordination_inbox_endpoint(

@@ -93,6 +93,83 @@ Actor ──┬── Session ──── Workspace          (誰が / どこ�
 
 ---
 
+### 4.3 Git 資源 — パスで表現できない共有物
+
+パス claim は「誰がどのファイルを編集するか」に答える。しかし checkout が**ちょうど1つずつ持つ可変の共有物**は、どんなパターンでも表現できない:
+
+```
+git stash pop   ← パスを1つも指名しない
+```
+
+実測で確認した事実（2026-08-31）:
+
+```
+A が clone-a で git stash push      → stash@{0}: agent-A wip
+B が 別 worktree で git stash pop   → 成功。A の作業が B のツリーへ
+A から見た stash                    → 空
+A の作業ツリー                      → 元に戻った（作業が消えた）
+```
+
+**`refs/stash` はリポジトリ単位の ref なので、同じ clone の全 worktree が1つの stash スタックを共有する。** 「共有 clone をやめて worktree にする」という定石はこの事故を防がない。
+
+#### 資源と、その衝突範囲
+
+| 資源 | 実体 | 衝突する範囲 | 同一性 |
+|---|---|---|---|
+| `worktree` | 作業ツリー / index / HEAD | その checkout のみ | `workspace` |
+| `stash` | stash スタック | **同じ `.git` の全 worktree** | `(host, git_dir)` |
+| `refs` | branch / tag | 同上 | `(host, git_dir)` |
+
+`repo` では広すぎ（別 clone は独立）、`workspace` では狭すぎる（兄弟 worktree を見逃す）。
+**`git rev-parse --git-common-dir` が stash の正しい同一性**であり、`Workspace.git_dir` に記録する。
+
+`git_dir` が不明な場合は `(host, repo)` にフォールバックして**過剰報告**する — パス判定と同じく、見逃すより多めに報告する側に倒す。
+
+MCP tool: `claim_git_resource(session_id, resource, ...)` / `check_git_resource(session_id, resource)`。
+
+---
+
+### 4.4 強制層 — `tools/gitsafe`
+
+**claim は助言的であり、ハルシネーションしているエージェントは助言を読まない。** 「事故を無視できる程度まで」という要求に対しては、判断に依存しない機械的な層が要る。
+
+[`tools/gitsafe`](../tools/gitsafe) は git の破壊的操作の手前に立つ fail-closed なラッパで、2層構成:
+
+**① stash 所有者タグ（AxonRelay 不要）**
+
+```
+gitsafe git stash push -m "wip"
+  → stash@{0}: On main: [axonrelay:s12] wip
+```
+
+`pop` / `apply` / `drop` は、タグが自分のものでなければ拒否する。タグは stash メッセージの中にあるので、**AxonRelay が落ちていてもネットワークが無くても機能する。** 今回の事故はこの層だけでほぼ消える。
+
+`stash clear` は clone 内の全 entry を消すため、常に拒否する。
+
+**② AxonRelay の資源 claim**
+
+`reset --hard` / `clean -f` / dirty な `checkout` / `rebase` / `branch -D` / `push --force` は、`GET /coordination/git/guard` に照会し、他セッションが握っていれば拒否する。AxonRelay に到達できない場合は①のみに縮退し、その旨を stderr に出す。
+
+**読み取り系（`status` `diff` `log` `show` `stash list`）は常に素通し。**
+
+#### サブエージェントをどう扱うか
+
+サブエージェントは親と同じ作業ディレクトリで動くので、AxonRelay に登録されていない git 実行者が clone の中に湧く。
+
+**禁止ではなく制御を採る。** 理由:
+
+1. 禁止は粒度が粗い。`status` / `diff` / `log` は安全で、むしろ読ませたい
+2. 禁止は迂回される。`command git` でも絶対パスでも抜けられる以上、「禁止したから安全」は幻想になり、かえって危険
+3. **禁止しても事故は防げない。** 原因は stash に所有者が刻まれていないことであって、実行者が誰かではない
+
+`session_id` を持たない呼び出し元は `(host, clone_path)` で識別し、**誰かがその資源を握っていれば拒否する**（`guard_unregistered_caller`）。親が worktree を claim したのは、まさに他の何かに邪魔されないためなので、これが正しい既定である。
+
+既知の制約: サブエージェントは親の環境変数を継承するため、`AXONRELAY_SESSION_ID` をそのまま引き継ぐと親と区別できない。実害は軽い（親セッションとして振る舞うことになり、*別 clone* からの奪取は依然防げる）が、厳密に分けたい場合はサブセッションにも `register_session` させる。
+
+さらなる限界: ラッパは `command git` や絶対パス指定で迂回できる。「PATH 上の `git` がラッパである」ことが前提で、`ghsafe` と同じ性質の制約。
+
+---
+
 ## 5. Relay — 宛先付き永続メッセージ
 
 宛先は狭い順に:
@@ -139,6 +216,7 @@ MCP resource `axonrelay://board` は同じボードを ambient context として
 | `GET` | `/coordination/sessions` |
 | `GET` | `/coordination/claims` |
 | `GET` | `/coordination/sessions/{id}/inbox` |
+| `GET` | `/coordination/git/guard` | `gitsafe` 用の可否照会（読み取り専用） |
 
 ---
 
@@ -205,6 +283,8 @@ python -m app.mcp.server --http --port 8765   # Streamable HTTP — リモート
 | claim の自動取得（ファイル書き込みをフックして claim） | エージェントが「これから何をするか」を宣言することに価値がある。事後の自動記録では衝突を予防できない |
 | coordination イベントの hash chain | 改ざん耐性が必要なのは承認記録。claim / relay は追記のみで十分 |
 | MCP transport の呼び出し元認証 | 個人 PoC。ネットワーク層（Tailscale / Tunnel）で境界を引く |
+| `gitsafe` の迂回不能化 | `command git` / 絶対パスで抜けられる。PATH 上の git がラッパである前提を敷く以上のことはしない（`ghsafe` と同じ立場） |
+| git 以外の破壊的操作 | エージェントがファイルを直接上書きする類は本レイヤーの範囲外 |
 | A2A プロトコルでの Relay 表現 | [§11.3](./delta-mvp-spec.md) で採用候補に格上げ済みだが、まず内部モデルを dogfood してから |
 
 ---
