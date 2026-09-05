@@ -169,7 +169,7 @@ gitsafe git stash push -m "wip"
 
 `reset --hard` / `clean`（dry-run 以外）/ dirty な `checkout` / `rebase` / `branch -D`（`refs`）/ `push --force`・`+refspec`・`--delete`（`remote`）は、`GET /coordination/git/guard` に照会し、他セッションが握っていれば拒否する。判定は `$*` のグロブではなく引数ごとに行い、git が受け付ける長オプションの省略形（`reset --har`）も前方一致で拾う（`--follow-tags` を `-f` と誤認しない、`+main:main` を見逃さない、曖昧な省略形はガード側に倒す）。
 
-`remote` の照会には origin URL から導いた `repo`（`owner/name`）を添える。未登録の呼び出し元が `remote` を触るときは、この `repo` の `remote` claim があれば拒否し、`repo` が導けなければ全ての `remote` claim と衝突するものとして保守的に拒否する。
+`remote` の照会には**push の着地先**から導いた `repo`（`owner/name`）を添える。着地先は位置引数のリモート名または URL、`--repo=`、いずれも無ければ git 自身が選ぶ既定（`branch.<b>.pushRemote` → `remote.pushDefault` → `branch.<b>.remote` → `origin`）で、`origin` を固定で見ることはしない（`git push upstream --force` の claim を取り逃すため）。サーバは session が登録した repo と着地先が異なれば、着地先 repo の `remote` claim に対して**その session を他人として**判定する。未登録の呼び出し元は、この `repo` の `remote` claim があれば拒否、`repo` が導けなければ（ローカルパスのリモート等）全ての `remote` claim と衝突するものとして保守的に拒否する。
 
 到達性とエラーは区別する。**接続できない**場合は①のみに縮退して stderr に告げる（claim は助言的）。**到達できたがエラー応答**（4xx/5xx）の場合は拒否する — エラーを許可として扱うと、あらゆるバグが迂回路になるため。
 

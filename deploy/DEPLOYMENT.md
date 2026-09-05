@@ -150,7 +150,8 @@ Read-only git always passes. `stash push` stamps `[axonrelay:s<id>]` into the
 message; `pop`/`apply`/`drop` refuse an entry tagged for someone else; `stash
 clear` is always refused. `reset --hard`, `clean -f`, a dirty `checkout`,
 `rebase`, `branch -D` (the per-clone `refs` resource) and `push --force` /
-`+refspec` / `push --delete` (the repo-wide `remote` resource) consult the board.
+`+refspec` / `push --delete` (the repo-wide `remote` resource, judged by the push's
+actual destination, not by `origin`) consult the board.
 
 The stash tag check works with no network — the tag lives in the stash message —
 so it still protects you when AxonRelay is unreachable. An unreachable server

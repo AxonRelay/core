@@ -654,6 +654,23 @@ def guard_git_operation(
             result["caller"]["session_workspace_mismatch"] = True
             return result
 
+    # A push can land on a repo other than the one this session registered for
+    # (`git push upstream --force`, a URL, `--repo=`). The remote's identity is
+    # the *destination*, so when the wrapper names one that is not the
+    # session's repo, judge the push against claims on that repo - where this
+    # session, whatever it holds here, is a stranger.
+    if resource == models.ClaimResourceEnum.REMOTE and repo and session.workspace and repo != session.workspace.repo:
+        result = guard_unregistered_caller(
+            db,
+            host=host or session.workspace.host,
+            clone_path=clone_path or session.workspace.clone_path,
+            resource=resource,
+            repo=repo,
+        )
+        result["session_id"] = session_id
+        result["caller"]["destination_repo_mismatch"] = True
+        return result
+
     conflicts = find_resource_conflicts(db, session_id=session_id, resource=resource)
     return {
         "allowed": not conflicts,
@@ -710,16 +727,19 @@ def guard_unregistered_caller(
     conflicts = []
     for claim in held:
         other = claim.session.workspace if claim.session else None
-        if workspace is None:
-            if resource == models.ClaimResourceEnum.REMOTE:
-                # The remote is shared by every clone; only the repo matters,
-                # and an unnamed repo cannot be proven to be a different one.
-                if other is None or (repo and other.repo != repo):
-                    continue
+        if resource == models.ClaimResourceEnum.REMOTE:
+            # The remote is shared by every clone; only the destination repo
+            # matters. Prefer the repo the wrapper named (the push target),
+            # then the caller's own registered repo; with neither, no claim
+            # can be proven to be about a different remote.
+            target = repo or (workspace.repo if workspace else None)
+            if other is None or (target and other.repo != target):
+                continue
+        elif workspace is None:
             # An unknown workspace (this clone has never registered) still
             # contends with a same-host claim: we cannot prove it is a
             # different checkout.
-            elif other is None or other.host != host:
+            if other is None or other.host != host:
                 continue
         elif not _resource_domains_overlap(resource, workspace, other):
             continue

@@ -117,6 +117,38 @@ class TestRemoteDomain:
             is True
         )
 
+    def test_a_push_to_another_repo_is_judged_against_that_repo(self, db, primary):
+        # A session on AxonRelay/core force-pushes to Other/fork while a session
+        # registered on Other/fork holds its remote.
+        fork = _session(db, "codex", "laptop", "/home/dev/fork", "/home/dev/fork/.git", repo="Other/fork")
+        coordination.claim_resource(db, session_id=fork.id, resource=models.ClaimResourceEnum.REMOTE)
+        # Holding core's remote does not help: the destination is what counts.
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+
+        result = coordination.guard_git_operation(
+            db,
+            session_id=primary.id,
+            resource=models.ClaimResourceEnum.REMOTE,
+            host="mbp16",
+            clone_path="/Users/dev/work/core",
+            repo="Other/fork",
+        )
+        assert result["allowed"] is False
+        assert result["caller"]["destination_repo_mismatch"] is True
+        assert result["conflicts"][0]["holder"]["actor"] == "codex"
+
+    def test_a_push_to_the_sessions_own_repo_is_judged_as_the_session(self, db, primary, separate_clone):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        result = coordination.guard_git_operation(
+            db,
+            session_id=primary.id,
+            resource=models.ClaimResourceEnum.REMOTE,
+            host="mbp16",
+            clone_path="/Users/dev/work/core",
+            repo="AxonRelay/core",
+        )
+        assert result["allowed"] is True
+
     def test_an_unregistered_pusher_naming_the_repo_is_refused(self, db, primary):
         coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
         result = coordination.guard_unregistered_caller(

@@ -59,19 +59,49 @@ real_git() { command git ${GLOBAL_OPTS[@]+"${GLOBAL_OPTS[@]}"} "$@"; }
 
 clone_path() { real_git rev-parse --show-toplevel 2>/dev/null || pwd; }
 
-# "owner/name" from the origin URL, for the remote guard: every clone of a repo
+# "owner/name" from a remote URL, for the remote guard: every clone of a repo
 # pushes to the same remote refs, so the *repo* is the identity there, not the
-# checkout. Empty when there is no origin or it cannot be parsed - the server
-# then treats an unregistered caller conservatively.
-repo_identity() {
-  local url
-  url=$(real_git remote get-url origin 2>/dev/null) || return 0
+# checkout. Empty when the URL cannot be parsed - the server then treats an
+# unregistered caller conservatively.
+repo_from_url() { # $1 = url
+  local url="$1"
   url="${url%/}"; url="${url%.git}"
   case "$url" in
     *://*) url="${url#*://}"; url="${url#*@}"; url="${url#*/}" ;;   # https://host/owner/name
     *:*)   url="${url#*:}" ;;                                       # git@host:owner/name
+    /*|.*) return 0 ;;                                              # a local path: no shared identity
   esac
   case "$url" in */*) printf '%s' "${url%/*}/${url##*/}" ;; esac
+}
+
+# Where `git push <args>` will actually land. The destination is the first
+# positional argument (a remote name or a URL), or `--repo=<x>`, or - when
+# nothing is named - the remote git itself would pick (branch.<b>.pushRemote,
+# remote.pushDefault, branch.<b>.remote, then origin). Guarding `origin` when
+# the push goes to `upstream` or to a URL would miss the claim on the
+# destination. Prints owner/name, or nothing when it cannot be determined.
+push_destination_repo() {
+  local a dest="" expect=0 branch
+  for a in "$@"; do
+    if [ $expect -eq 1 ]; then dest="$a"; break; fi
+    case "$a" in
+      --) ;;
+      --repo=*) dest="${a#--repo=}"; break ;;
+      -*) if long_opt_in "$a" --repo && [ "${a%%=*}" = "$a" ]; then expect=1; fi
+          case "$a" in --rep*=*) dest="${a#*=}"; break ;; esac ;;
+      *) dest="$a"; break ;;
+    esac
+  done
+  if [ -z "$dest" ]; then
+    branch=$(real_git symbolic-ref -q --short HEAD 2>/dev/null || true)
+    dest=$(real_git config --get "branch.$branch.pushRemote" 2>/dev/null \
+        || real_git config --get remote.pushDefault 2>/dev/null \
+        || real_git config --get "branch.$branch.remote" 2>/dev/null \
+        || printf 'origin')
+  fi
+  local url
+  url=$(real_git remote get-url --push "$dest" 2>/dev/null) || url="$dest"   # not a remote name: a URL
+  repo_from_url "$url"
 }
 
 # The tag written into a stash message. Falls back to a host+clone identity when
@@ -87,16 +117,16 @@ owner_tag() {
 
 # --- AxonRelay (advisory; absence is not fatal, an error is) -----------------
 
-guard_resource() { # $1 = worktree|stash|refs|remote   returns 0 = allowed
+guard_resource() { # $1 = worktree|stash|refs|remote  [$2 = owner/name for remote]   returns 0 = allowed
   [ -n "$AXONRELAY_URL" ] || { note "AXONRELAY_URL unset — claim check skipped (stash tags still enforced)"; return 0; }
 
   # Who is asking (session_id) and *where the command actually runs* (host,
   # clone_path). Both always go: a session registered in clone B running
   # `git -C clone-A reset --hard` must be judged against A's claims, and the
   # server does that by noticing the checkout is not the session's own.
-  local body status repo args=(--get --data-urlencode "resource=$1")
+  local body status args=(--get --data-urlencode "resource=$1")
   args+=(--data-urlencode "host=$(hostname -s)" --data-urlencode "clone_path=$(clone_path)")
-  repo=$(repo_identity); [ -z "$repo" ] || args+=(--data-urlencode "repo=$repo")
+  [ -z "${2:-}" ] || args+=(--data-urlencode "repo=$2")
   if [ -n "$SESSION_ID" ]; then
     args+=(--data-urlencode "session_id=$SESSION_ID")
   fi
@@ -498,7 +528,10 @@ main() {
     push)
       # The remote is shared by every clone of the repo on every host, so this
       # is the `remote` resource, not the per-clone `refs`.
-      if push_is_destructive "$@"; then guard_resource remote || exit 1; fi
+      if push_is_destructive "$@"; then
+        local dest_repo; dest_repo=$(push_destination_repo "$@")
+        guard_resource remote "$dest_repo" || exit 1
+      fi
       real_git push "$@"
       ;;
 
