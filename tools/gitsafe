@@ -81,14 +81,23 @@ repo_from_url() { # $1 = url
 # the push goes to `upstream` or to a URL would miss the claim on the
 # destination. Prints owner/name, or nothing when it cannot be determined.
 push_destination_repo() {
-  local a dest="" expect=0 branch
+  local a dest="" expect=0 skip=0 branch
   for a in "$@"; do
     if [ $expect -eq 1 ]; then dest="$a"; break; fi
+    if [ $skip -eq 1 ]; then skip=0; continue; fi
     case "$a" in
       --) ;;
-      --repo=*) dest="${a#--repo=}"; break ;;
-      -*) if long_opt_in "$a" --repo && [ "${a%%=*}" = "$a" ]; then expect=1; fi
-          case "$a" in --rep*=*) dest="${a#*=}"; break ;; esac ;;
+      --rep*=*) dest="${a#*=}"; break ;;
+      -*)
+        # Options that take their value as the NEXT argument must be consumed,
+        # or `push -o ci.skip upstream main` would take `ci.skip` for the
+        # destination. `--x=value` forms carry their value and need nothing.
+        if [ "${a%%=*}" = "$a" ]; then
+          if long_opt_in "$a" --repo; then expect=1
+          elif long_opt_in "$a" --push-option --receive-pack --exec; then skip=1
+          fi
+          case "$a" in -o|-[!-]*o) skip=1 ;; esac   # -o <opt>, also as the tail of a cluster (-fo)
+        fi ;;
       *) dest="$a"; break ;;
     esac
   done
@@ -100,7 +109,16 @@ push_destination_repo() {
         || printf 'origin')
   fi
   local url
-  url=$(real_git remote get-url --push "$dest" 2>/dev/null) || url="$dest"   # not a remote name: a URL
+  if ! url=$(real_git remote get-url --push "$dest" 2>/dev/null); then
+    # Not a configured remote. git would accept a URL here; anything else is a
+    # sign we mis-parsed the command line, and guessing the destination is
+    # exactly the mistake the guard must not make. Refuse.
+    case "$dest" in
+      *://*|*:*|*/*) url="$dest" ;;
+      *) die "cannot tell where 'git push $*' will land ('$dest' is neither a remote nor a URL).
+  Name the remote explicitly, e.g. 'git push origin ...', or GITSAFE_ALLOW_UNSAFE=1." ;;
+    esac
+  fi
   repo_from_url "$url"
 }
 
@@ -529,7 +547,8 @@ main() {
       # The remote is shared by every clone of the repo on every host, so this
       # is the `remote` resource, not the per-clone `refs`.
       if push_is_destructive "$@"; then
-        local dest_repo; dest_repo=$(push_destination_repo "$@")
+        local dest_repo
+        dest_repo=$(push_destination_repo "$@") || exit 1
         guard_resource remote "$dest_repo" || exit 1
       fi
       real_git push "$@"
