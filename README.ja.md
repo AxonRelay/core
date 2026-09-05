@@ -49,7 +49,7 @@ AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（inte
         MCP（ローカルは stdio / Tailscale・Tunnel 経由の Streamable HTTP）
                               ▼
               AxonRelay Backend（FastAPI + MCP サーバ同居）
-                 │   - MCP : 24 tools + 3 resources（メインインターフェース）
+                 │   - MCP : 26 tools + 3 resources（メインインターフェース）
                  │   - REST: /tasks /agents /coordination（読み取り中心）
                  │   - Postgres: 台帳 ＋ 調整ボード
                  │
@@ -165,7 +165,7 @@ docker compose up -d postgres # Postgres のみ。runtime は Platform 側
 
 # backend（venv 推奨）
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # migration 006 まで適用・"self" Actor を seed
+cd backend && alembic upgrade head   # migration 008 まで適用・"self" Actor を seed
 
 # IDE 用に MCP サーバを起動
 python -m app.mcp.server                      # stdio — 1 台構成
@@ -209,7 +209,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（24 tools / 3 resources）、LangGraph Platform クライアント、migration 006 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（26 tools / 3 resources）、LangGraph Platform クライアント、migration 008 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）

@@ -54,7 +54,7 @@ preserves and dogfoods.
            MCP (stdio locally · Streamable HTTP over Tailscale/Tunnel)
                               ▼
               AxonRelay Backend (FastAPI + MCP server, co-located)
-                 │   - MCP: 24 tools + 3 resources  (primary interface)
+                 │   - MCP: 26 tools + 3 resources  (primary interface)
                  │   - REST: /tasks /agents /coordination  (read-heavy)
                  │   - Postgres: the ledger + the coordination board
                  │
@@ -173,7 +173,7 @@ docker compose up -d postgres # Postgres only; runtime is on Platform
 
 # backend (venv recommended)
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # applies migrations through 006; seeds the "self" Actor
+cd backend && alembic upgrade head   # applies migrations through 008; seeds the "self" Actor
 
 # run the MCP server for the IDE
 python -m app.mcp.server                      # stdio — one machine
@@ -217,7 +217,7 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (24 tools / 3 resources), LangGraph Platform client, migrations through 006. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (26 tools / 3 resources), LangGraph Platform client, migrations through 008. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
