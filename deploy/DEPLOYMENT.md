@@ -1,5 +1,7 @@
 # Deployment — Phase 2.4 hosting cutover
 
+**[日本語](DEPLOYMENT.ja.md)** | English
+
 Target topology (zero fixed monthly cost, no public IP on the host):
 
 ```
@@ -22,10 +24,10 @@ On the home PC or a small VPS:
 ```bash
 cp .env.example .env          # fill DATABASE_URL, LANGGRAPH_*, ANTHROPIC_API_KEY
 docker compose up -d postgres backend
-docker compose exec backend alembic upgrade head   # applies 001..007
+docker compose exec backend alembic upgrade head   # applies 001..008
 ```
 
-`alembic upgrade head` must reach `007`. Migrations 002 and 007 fix a chain that
+`alembic upgrade head` must reach `008`. Migrations 002 and 007 fix a chain that
 could not apply to a fresh Postgres and an enum-label mismatch that made every
 Actor insert fail — an install stopping short of 007 cannot register a session.
 
@@ -64,8 +66,15 @@ On the host, run the MCP server on the tailnet interface:
 
 ```bash
 cd backend
-python -m app.mcp.server --http --host 0.0.0.0 --port 8765
+DATABASE_URL="postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay" \
+  python -m app.mcp.server --http --host 0.0.0.0 --port 8765
 ```
+
+> **The `DATABASE_URL` differs from the one inside compose.** The containerised
+> backend uses `@postgres:5432`, a hostname that only resolves on the Docker
+> network. Running the MCP server directly on the host means pointing at the
+> published port, `@localhost:5432`, or startup fails with
+> `could not translate host name "postgres"`.
 
 > **`--host 0.0.0.0` is only safe behind Tailscale.** This transport has **no
 > per-caller authentication**: anyone who can reach the port can read the ledger
