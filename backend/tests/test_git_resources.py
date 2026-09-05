@@ -79,6 +79,74 @@ class TestStashDomain:
         assert result["granted"] is True
 
 
+class TestRemoteDomain:
+    """The remote is one thing for the whole repo: clones and hosts all contend."""
+
+    def test_a_separate_clone_contends_for_the_remote(self, db, primary, separate_clone):
+        held = coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        assert held["granted"] is True
+        other = coordination.claim_resource(db, session_id=separate_clone.id, resource=models.ClaimResourceEnum.REMOTE)
+        assert other["granted"] is False
+
+    def test_another_host_contends_for_the_remote(self, db, primary):
+        laptop = _session(db, "codex", "laptop", "/home/dev/core", "/home/dev/core/.git")
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        assert (
+            coordination.claim_resource(db, session_id=laptop.id, resource=models.ClaimResourceEnum.REMOTE)["granted"]
+            is False
+        )
+
+    def test_a_different_repo_does_not_contend_for_the_remote(self, db, primary):
+        elsewhere = _session(
+            db, "codex", "mbp16", "/Users/dev/work/site", "/Users/dev/work/site/.git", repo="AxonRelay/site"
+        )
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        assert (
+            coordination.claim_resource(db, session_id=elsewhere.id, resource=models.ClaimResourceEnum.REMOTE)[
+                "granted"
+            ]
+            is True
+        )
+
+    def test_refs_stays_per_clone_while_remote_is_per_repo(self, db, primary, separate_clone):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REFS)
+        assert (
+            coordination.claim_resource(db, session_id=separate_clone.id, resource=models.ClaimResourceEnum.REFS)[
+                "granted"
+            ]
+            is True
+        )
+
+    def test_an_unregistered_pusher_naming_the_repo_is_refused(self, db, primary):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        result = coordination.guard_unregistered_caller(
+            db,
+            host="ci-runner",
+            clone_path="/tmp/build",
+            resource=models.ClaimResourceEnum.REMOTE,
+            repo="AxonRelay/core",
+        )
+        assert result["allowed"] is False
+
+    def test_an_unregistered_pusher_of_another_repo_is_allowed(self, db, primary):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        result = coordination.guard_unregistered_caller(
+            db,
+            host="ci-runner",
+            clone_path="/tmp/build",
+            resource=models.ClaimResourceEnum.REMOTE,
+            repo="AxonRelay/site",
+        )
+        assert result["allowed"] is True
+
+    def test_an_unregistered_pusher_with_no_repo_is_refused_conservatively(self, db, primary):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.REMOTE)
+        result = coordination.guard_unregistered_caller(
+            db, host="ci-runner", clone_path="/tmp/build", resource=models.ClaimResourceEnum.REMOTE
+        )
+        assert result["allowed"] is False
+
+
 class TestWorktreeDomain:
     """The working tree, index and HEAD belong to one checkout only."""
 

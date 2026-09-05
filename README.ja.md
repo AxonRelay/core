@@ -100,7 +100,7 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 |-------|------|
 | `Workspace` | 1 台のマシン上の、1 リポジトリの、1 clone。同一性は `(host, repo, clone_path)`。同じ repo の 2 つの clone は別の Workspace。 |
 | `Session` | ある Actor が、ある Workspace で作業している期間。claim を持ち relay を受け取る単位。再登録で同じセッションを再開するので、エージェントが落ちても失われない。 |
-| `Claim` | **助言的で期限付き**のリース。repo 内のパス、またはパスで表現できない共有 git 資源（`worktree` / `stash` / `refs`）に対して取る。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
+| `Claim` | **助言的で期限付き**のリース。repo 内のパス、またはパスで表現できない共有 git 資源（`worktree` / `stash` / `refs` / `remote`）に対して取る。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
 | `Relay` | 「観客」宛の永続メッセージ — 特定 Actor / 特定 clone / 特定 repo / 全体。pull で配信。 |
 | `RelayReceipt` | 受信者ごとの既読・ack 状態。1 人が ack してもブロードキャストが他の全員から消えない。 |
 

@@ -106,7 +106,7 @@ its hash chain.
 |-------|---------|
 | `Workspace` | One checkout of one repo on one machine, identified by `(host, repo, clone_path)`. Two clones of the same repo are two workspaces. |
 | `Session` | An Actor working inside a Workspace over a stretch of time. Holds claims, receives relays. Re-registering resumes it, so an agent restart loses nothing. |
-| `Claim` | An **advisory, expiring** lease — on paths within a repo, or on a shared git resource (`worktree` / `stash` / `refs`) that no path pattern can describe. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
+| `Claim` | An **advisory, expiring** lease — on paths within a repo, or on a shared git resource (`worktree` / `stash` / `refs` / `remote`) that no path pattern can describe. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
 | `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. |
 | `RelayReceipt` | Per-recipient read/ack state, so one peer acking a broadcast does not hide it from the others. |
 

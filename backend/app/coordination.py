@@ -512,10 +512,15 @@ def _resource_domains_overlap(
     """Whether two workspaces contend for `resource`.
 
     WORKTREE is per checkout; STASH and REFS are per clone and therefore reach
-    across sibling worktrees.
+    across sibling worktrees; REMOTE is per repo, because every clone on every
+    host pushes to the same remote refs.
     """
+    if a is None or b is None:
+        return False
     if resource == models.ClaimResourceEnum.WORKTREE:
-        return a is not None and b is not None and a.id == b.id
+        return a.id == b.id
+    if resource == models.ClaimResourceEnum.REMOTE:
+        return a.repo == b.repo
     return _shares_git_dir(a, b)
 
 
@@ -621,6 +626,7 @@ def guard_git_operation(
     resource: models.ClaimResourceEnum,
     host: str | None = None,
     clone_path: str | None = None,
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Answer "may this session touch `resource` right now?" for the git wrapper.
 
@@ -643,7 +649,7 @@ def guard_git_operation(
     if host and clone_path:
         workspace = session.workspace
         if workspace is None or workspace.host != host or workspace.clone_path != clone_path:
-            result = guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resource)
+            result = guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resource, repo=repo)
             result["session_id"] = session_id
             result["caller"]["session_workspace_mismatch"] = True
             return result
@@ -663,6 +669,7 @@ def guard_unregistered_caller(
     host: str,
     clone_path: str,
     resource: models.ClaimResourceEnum,
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Whether an *unregistered* caller may touch `resource` in this checkout.
 
@@ -676,6 +683,11 @@ def guard_unregistered_caller(
 
     When nobody holds the resource it is allowed through. Claims are advisory,
     and a guard that blocked all uncoordinated work would simply be turned off.
+
+    For REMOTE the checkout does not matter - the remote is shared by every
+    clone of the repo - so an unknown workspace contends with every REMOTE claim
+    on ``repo`` when the wrapper could name it, and with every REMOTE claim at
+    all when it could not.
     """
     now = datetime.utcnow()
     workspace = (
@@ -698,10 +710,16 @@ def guard_unregistered_caller(
     conflicts = []
     for claim in held:
         other = claim.session.workspace if claim.session else None
-        # An unknown workspace (this clone has never registered) still contends
-        # with a same-host claim: we cannot prove it is a different checkout.
         if workspace is None:
-            if other is None or other.host != host:
+            if resource == models.ClaimResourceEnum.REMOTE:
+                # The remote is shared by every clone; only the repo matters,
+                # and an unnamed repo cannot be proven to be a different one.
+                if other is None or (repo and other.repo != repo):
+                    continue
+            # An unknown workspace (this clone has never registered) still
+            # contends with a same-host claim: we cannot prove it is a
+            # different checkout.
+            elif other is None or other.host != host:
                 continue
         elif not _resource_domains_overlap(resource, workspace, other):
             continue
@@ -719,7 +737,7 @@ def guard_unregistered_caller(
     return {
         "allowed": not conflicts,
         "resource": str(resource),
-        "caller": {"host": host, "clone_path": clone_path, "registered": workspace is not None},
+        "caller": {"host": host, "clone_path": clone_path, "repo": repo, "registered": workspace is not None},
         "conflicts": conflicts,
     }
 

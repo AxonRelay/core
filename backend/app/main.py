@@ -551,6 +551,7 @@ async def coordination_git_guard_endpoint(
     session_id: int | None = None,
     host: str | None = None,
     clone_path: str | None = None,
+    repo: str | None = None,
     db: Session = Depends(get_db),
 ):
     """Whether a git resource is free — the endpoint `tools/gitsafe` polls.
@@ -576,14 +577,14 @@ async def coordination_git_guard_endpoint(
     if session_id is not None:
         try:
             return coordination.guard_git_operation(
-                db, session_id=session_id, resource=resolved, host=host, clone_path=clone_path
+                db, session_id=session_id, resource=resolved, host=host, clone_path=clone_path, repo=repo
             )
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
     if not (host and clone_path):
         raise HTTPException(status_code=400, detail="Pass session_id, or both host and clone_path")
-    return coordination.guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resolved)
+    return coordination.guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resolved, repo=repo)
 
 
 @app.get("/coordination/sessions/{session_id}/inbox")

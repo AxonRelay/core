@@ -245,13 +245,18 @@ class ClaimResourceEnum(enum.StrEnum):
               shared by **every git worktree of the same clone** - checking out
               a second worktree does not give you a second stash. This is what
               lets one session pop another session's parked work.
-    REFS      branches and tags. Also per-repository, so a branch deletion or a
-              force-push is visible to every worktree of that clone.
+    REFS      local branches and tags. Also per-repository, so a branch deletion
+              or a branch move is visible to every worktree of that clone.
+    REMOTE    the refs on the shared remote. A force-push, `+refspec` or
+              `push --delete` lands on the *same* remote from every clone on
+              every host, so this contends across the whole repo - the one
+              resource whose boundary is neither the checkout nor the clone.
     """
 
     WORKTREE = "worktree"
     STASH = "stash"
     REFS = "refs"
+    REMOTE = "remote"
 
 
 class ClaimStatusEnum(enum.StrEnum):

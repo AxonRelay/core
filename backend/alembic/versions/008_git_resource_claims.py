@@ -11,8 +11,9 @@ session ends up applying another session's parked work.
 
 Two additions:
 
-  claims.resource     WORKTREE / STASH / REFS - a claim on a shared git
-                      singleton rather than on paths.
+  claims.resource     WORKTREE / STASH / REFS / REMOTE - a claim on a shared
+                      git singleton rather than on paths. REMOTE is the shared
+                      remote's refs, contended across every clone of the repo.
   workspaces.git_dir  `git rev-parse --git-common-dir`. `refs/stash` is a
                       per-repository ref, so sibling *worktrees* of one clone
                       share a stash stack while having different clone_paths.
@@ -35,7 +36,7 @@ down_revision: str | None = "007"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-claim_resource = sa.Enum("WORKTREE", "STASH", "REFS", name="claimresourceenum")
+claim_resource = sa.Enum("WORKTREE", "STASH", "REFS", "REMOTE", name="claimresourceenum")
 
 
 def upgrade() -> None:

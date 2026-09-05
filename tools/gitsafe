@@ -15,7 +15,7 @@
 #      else. This needs no network and no server — the tag travels inside the
 #      stash — so it keeps working when AxonRelay is down. It is what actually
 #      stops the incident.
-#   2. AxonRelay resource claims. For worktree- and ref-level damage
+#   2. AxonRelay resource claims. For worktree-, ref- and remote-level damage
 #      (`reset --hard`, `clean -f`, `branch -D`, force-push) it asks the board
 #      whether another session holds the resource. Advisory data, enforced here.
 #
@@ -59,6 +59,21 @@ real_git() { command git ${GLOBAL_OPTS[@]+"${GLOBAL_OPTS[@]}"} "$@"; }
 
 clone_path() { real_git rev-parse --show-toplevel 2>/dev/null || pwd; }
 
+# "owner/name" from the origin URL, for the remote guard: every clone of a repo
+# pushes to the same remote refs, so the *repo* is the identity there, not the
+# checkout. Empty when there is no origin or it cannot be parsed - the server
+# then treats an unregistered caller conservatively.
+repo_identity() {
+  local url
+  url=$(real_git remote get-url origin 2>/dev/null) || return 0
+  url="${url%/}"; url="${url%.git}"
+  case "$url" in
+    *://*) url="${url#*://}"; url="${url#*@}"; url="${url#*/}" ;;   # https://host/owner/name
+    *:*)   url="${url#*:}" ;;                                       # git@host:owner/name
+  esac
+  case "$url" in */*) printf '%s' "${url%/*}/${url##*/}" ;; esac
+}
+
 # The tag written into a stash message. Falls back to a host+clone identity when
 # the caller never registered, so an unregistered subagent still cannot silently
 # adopt someone else's stash.
@@ -72,15 +87,16 @@ owner_tag() {
 
 # --- AxonRelay (advisory; absence is not fatal, an error is) -----------------
 
-guard_resource() { # $1 = worktree|stash|refs   returns 0 = allowed
+guard_resource() { # $1 = worktree|stash|refs|remote   returns 0 = allowed
   [ -n "$AXONRELAY_URL" ] || { note "AXONRELAY_URL unset — claim check skipped (stash tags still enforced)"; return 0; }
 
   # Who is asking (session_id) and *where the command actually runs* (host,
   # clone_path). Both always go: a session registered in clone B running
   # `git -C clone-A reset --hard` must be judged against A's claims, and the
   # server does that by noticing the checkout is not the session's own.
-  local body status args=(--get --data-urlencode "resource=$1")
+  local body status repo args=(--get --data-urlencode "resource=$1")
   args+=(--data-urlencode "host=$(hostname -s)" --data-urlencode "clone_path=$(clone_path)")
+  repo=$(repo_identity); [ -z "$repo" ] || args+=(--data-urlencode "repo=$repo")
   if [ -n "$SESSION_ID" ]; then
     args+=(--data-urlencode "session_id=$SESSION_ID")
   fi
@@ -262,6 +278,20 @@ take_global_options() { # sets GLOBAL_OPTS and GLOBAL_CONSUMED (not a subshell: 
 # Per-argument matching. `$*` globbing would let `--follow-tags` match `*-f*`
 # by accident and, worse, miss `+refspec`, which is git's other force syntax.
 
+# git accepts any unambiguous prefix of a long option (`reset --har`), so an
+# exact match would let `--har` through unguarded. $1 = arg; rest = the full
+# long options that count. A `=value` suffix is ignored. Anything from `--x`
+# upward that is a prefix of one of them counts - an ambiguous prefix git would
+# reject is also counted, which errs on the guarded side.
+long_opt_in() {
+  local arg="${1%%=*}" cand; shift
+  case "$arg" in --?*) ;; *) return 1 ;; esac
+  for cand in "$@"; do
+    case "$cand" in "$arg"*) return 0 ;; esac
+  done
+  return 1
+}
+
 short_flag_in() { # $1 = arg, $2 = letters   true when $1 is a short-option cluster containing one of them
   case "$1" in
     -[!-]*) case "${1#-}" in *[$2]*) return 0 ;; esac ;;
@@ -272,10 +302,8 @@ short_flag_in() { # $1 = arg, $2 = letters   true when $1 is a short-option clus
 push_is_destructive() {
   local a
   for a in "$@"; do
-    case "$a" in
-      --force|--force-with-lease|--force-with-lease=*|--force-if-includes|--delete|--mirror|--prune) return 0 ;;
-      +*) return 0 ;;            # +main:main
-    esac
+    case "$a" in +*) return 0 ;; esac   # +main:main
+    long_opt_in "$a" --force --force-with-lease --force-if-includes --delete --mirror --prune && return 0
     short_flag_in "$a" fd && return 0   # -f, -d, -fu ...
   done
   return 1
@@ -284,9 +312,7 @@ push_is_destructive() {
 branch_is_destructive() {
   local a
   for a in "$@"; do
-    case "$a" in
-      --delete|--move|--force|--copy) return 0 ;;
-    esac
+    long_opt_in "$a" --delete --move --force --copy && return 0
     short_flag_in "$a" DdMmfC && return 0   # -D -d -M -m -f -C (copy over an existing branch)
   done
   return 1
@@ -295,7 +321,7 @@ branch_is_destructive() {
 tag_is_destructive() {
   local a
   for a in "$@"; do
-    case "$a" in --delete|--force) return 0 ;; esac
+    long_opt_in "$a" --delete --force && return 0
     short_flag_in "$a" df && return 0   # -d, -f, -fa, -am ... clusters included
   done
   return 1
@@ -304,7 +330,7 @@ tag_is_destructive() {
 reset_is_destructive() {
   local a
   for a in "$@"; do
-    case "$a" in --hard|--merge|--keep) return 0 ;; esac
+    long_opt_in "$a" --hard --merge --keep && return 0
   done
   return 1
 }
@@ -312,7 +338,7 @@ reset_is_destructive() {
 clean_is_dry_run() {
   local a
   for a in "$@"; do
-    case "$a" in --dry-run) return 0 ;; esac
+    long_opt_in "$a" --dry-run && return 0
     short_flag_in "$a" n && return 0
   done
   return 1
@@ -470,7 +496,9 @@ main() {
       ;;
 
     push)
-      if push_is_destructive "$@"; then guard_resource refs || exit 1; fi
+      # The remote is shared by every clone of the repo on every host, so this
+      # is the `remote` resource, not the per-clone `refs`.
+      if push_is_destructive "$@"; then guard_resource remote || exit 1; fi
       real_git push "$@"
       ;;
 

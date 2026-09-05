@@ -118,9 +118,10 @@ A の作業ツリー                      → 元に戻った（作業が消え�
 |---|---|---|---|
 | `worktree` | 作業ツリー / index / HEAD | その checkout のみ | `workspace` |
 | `stash` | stash スタック | **同じ `.git` の全 worktree** | `(host, git_dir)` |
-| `refs` | branch / tag | 同上 | `(host, git_dir)` |
+| `refs` | ローカルの branch / tag | 同上 | `(host, git_dir)` |
+| `remote` | リモートの refs（force push / `+refspec` / `push --delete` の着地点） | **その repo の全 clone・全 host** | `repo` |
 
-`repo` では広すぎ（別 clone は独立）、`workspace` では狭すぎる（兄弟 worktree を見逃す）。
+stash と refs については `repo` では広すぎ（別 clone は独立）、`workspace` では狭すぎる（兄弟 worktree を見逃す）。`remote` だけは逆で、どの clone からでも同じリモート refs に着地するため `repo` が正しい境界になる。
 **`git rev-parse --git-common-dir` が stash の正しい同一性**であり、`Workspace.git_dir` に記録する。
 
 `git_dir` が不明な場合は `(host, repo)` にフォールバックして**過剰報告**する — パス判定と同じく、見逃すより多めに報告する側に倒す。
@@ -166,7 +167,9 @@ gitsafe git stash push -m "wip"
 
 **② AxonRelay の資源 claim**
 
-`reset --hard` / `clean`（dry-run 以外）/ dirty な `checkout` / `rebase` / `branch -D` / `push --force`・`+refspec`・`--delete` は、`GET /coordination/git/guard` に照会し、他セッションが握っていれば拒否する。判定は `$*` のグロブではなく引数ごとに行う（`--follow-tags` を `-f` と誤認しない、`+main:main` を見逃さない）。
+`reset --hard` / `clean`（dry-run 以外）/ dirty な `checkout` / `rebase` / `branch -D`（`refs`）/ `push --force`・`+refspec`・`--delete`（`remote`）は、`GET /coordination/git/guard` に照会し、他セッションが握っていれば拒否する。判定は `$*` のグロブではなく引数ごとに行い、git が受け付ける長オプションの省略形（`reset --har`）も前方一致で拾う（`--follow-tags` を `-f` と誤認しない、`+main:main` を見逃さない、曖昧な省略形はガード側に倒す）。
+
+`remote` の照会には origin URL から導いた `repo`（`owner/name`）を添える。未登録の呼び出し元が `remote` を触るときは、この `repo` の `remote` claim があれば拒否し、`repo` が導けなければ全ての `remote` claim と衝突するものとして保守的に拒否する。
 
 到達性とエラーは区別する。**接続できない**場合は①のみに縮退して stderr に告げる（claim は助言的）。**到達できたがエラー応答**（4xx/5xx）の場合は拒否する — エラーを許可として扱うと、あらゆるバグが迂回路になるため。
 

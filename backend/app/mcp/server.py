@@ -709,7 +709,10 @@ def claim_git_resource(
                    worktrees of the same clone**, because `refs/stash` is a
                    per-repository ref: a second worktree does not give you a
                    second stash stack.
-      "refs"     — deleting or force-moving branches and tags. Also per-clone.
+      "refs"     — deleting or moving local branches and tags. Also per-clone.
+      "remote"   — force-push, `+refspec`, `push --delete`. **Contends across
+                   every clone of the repo on every host**: they all push to
+                   the same remote refs.
 
     Always exclusive, refused on conflict unless force=true, and expiring like a
     path claim.
