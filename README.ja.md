@@ -214,7 +214,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
 - 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋[deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。
-- 🚧 **Tests**: SQLite 107 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳を競合させる Postgres スキーマ整合 16 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
+- 🚧 **Tests**: SQLite 147 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・git 資源 claim・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳と資源 claim を競合させる Postgres スキーマ整合 18 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
 
 ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。調整レイヤーの設計: [docs/coordination-spec.md](docs/coordination-spec.md)。
 
