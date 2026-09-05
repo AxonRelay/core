@@ -28,13 +28,14 @@ import pathlib
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 from sqlalchemy import Enum, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
-from app import crud, models
+from app import coordination, crud, models
 
 TEST_URL = os.environ.get("AXONRELAY_TEST_POSTGRES_URL")
 
@@ -50,6 +51,7 @@ MODEL_ENUMS = [
     models.TaskStatusEnum,
     models.SessionStatusEnum,
     models.ClaimModeEnum,
+    models.ClaimResourceEnum,
     models.ClaimStatusEnum,
     models.RelayKindEnum,
 ]
@@ -263,3 +265,76 @@ class TestConcurrentApprovals:
             assert crud.verify_approval_chain(check, task_id)["valid"] is True
         finally:
             check.close()
+
+
+class TestConcurrentResourceClaims:
+    """The row lock in claim_resource, exercised with real concurrent connections.
+
+    Without it, N sessions in sibling worktrees can all read "stash is free"
+    and all be granted an exclusive lease on the one stash stack they share -
+    which is precisely the incident the resource claims exist to prevent.
+    """
+
+    CLAIMANTS = 8
+
+    def test_only_one_racing_stash_claim_is_granted(self, migrated_engine, monkeypatch):
+        factory = sessionmaker(bind=migrated_engine, autoflush=False)
+
+        # Hold every writer inside the check-then-insert window for a moment so
+        # the race is reproducible rather than timing-dependent. With the row
+        # lock the sleep happens while the lock is held, so the others queue
+        # behind it and see the committed claim; without the lock they all
+        # read "free" together. (Verified: this test fails when the lock in
+        # claim_resource is removed.)
+        real_find = coordination.find_resource_conflicts
+
+        def slow_find(*args, **kwargs):
+            found = real_find(*args, **kwargs)
+            time.sleep(0.3)
+            return found
+
+        monkeypatch.setattr(coordination, "find_resource_conflicts", slow_find)
+
+        setup = factory()
+        session_ids = []
+        for index in range(self.CLAIMANTS):
+            session = coordination.register_session(
+                setup,
+                actor_name=f"claimant-{index}",
+                host="parity-host",
+                repo="AxonRelay/parity",
+                clone_path=f"/parity/core-wt{index}",
+                git_dir="/parity/core/.git",
+            )
+            session_ids.append(session.id)
+        setup.close()
+
+        barrier = threading.Barrier(self.CLAIMANTS)
+        outcomes: list[bool] = []
+        failures: list[str] = []
+        lock = threading.Lock()
+
+        def claim(session_id: int) -> None:
+            session = factory()
+            try:
+                barrier.wait(timeout=30)
+                result = coordination.claim_resource(
+                    session, session_id=session_id, resource=models.ClaimResourceEnum.STASH
+                )
+                with lock:
+                    outcomes.append(result["granted"])
+            except Exception as exc:  # noqa: BLE001 - reported as a test failure
+                with lock:
+                    failures.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=claim, args=(sid,)) for sid in session_ids]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert failures == []
+        assert len(outcomes) == self.CLAIMANTS
+        assert outcomes.count(True) == 1, outcomes

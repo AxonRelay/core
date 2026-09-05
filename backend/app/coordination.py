@@ -22,6 +22,7 @@ re-registers into the same session and picks its state back up.
 
 from __future__ import annotations
 
+import posixpath
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -80,6 +81,51 @@ def get_or_create_actor(db: DBSession, name: str, actor_type: models.ActorTypeEn
     return actor
 
 
+def normalize_git_dir(git_dir: str | None, clone_path: str) -> str | None:
+    """Canonicalise a `git rev-parse --git-common-dir` value for comparison.
+
+    STASH and REFS conflicts are scoped by (host, git_dir), so two spellings of
+    one directory must compare equal or sibling worktrees stop contending. Git
+    itself is inconsistent here: in the main worktree `--git-common-dir` prints
+    the *relative* `.git`, in a linked worktree an absolute path. A relative
+    value is therefore resolved against `clone_path`, and both are normalised
+    (`..`, `//`, trailing slash). Symlinks cannot be resolved server-side - the
+    client should pass the result of `--path-format=absolute` through
+    `realpath` when a checkout lives behind one.
+    """
+    if not git_dir:
+        return None
+    value = git_dir.strip()
+    if not value:
+        return None
+    if not posixpath.isabs(value):
+        value = posixpath.join(clone_path, value)
+    value = posixpath.normpath(value)
+    return value or None
+
+
+def _lock_repo_workspaces(db: DBSession, repo: str) -> None:
+    """Serialise claim writers for one repo with a row lock on its workspaces.
+
+    Granting a claim is a check-then-insert: read the live claims, insert if
+    nothing contends. Two transactions can both read "free" and both insert,
+    and then two sessions each believe they hold an exclusive lease. The
+    approval ledger has the same shape and locks the task row (`crud.record_
+    approval`); here the unit of contention is the repo, so we lock every
+    workspace row of the repo, in id order so two lockers cannot deadlock on
+    each other. A workspace registered concurrently is not in our lock set,
+    but its own claim locks every pre-existing row - including ours - so the
+    two writers still serialise on a common row.
+
+    `FOR UPDATE` is a no-op on SQLite, which serialises writers globally anyway.
+    Under Postgres READ COMMITTED the conflict query that follows the lock sees
+    the rows the previous holder committed.
+    """
+    db.query(models.Workspace).filter(models.Workspace.repo == repo).order_by(
+        models.Workspace.id
+    ).with_for_update().all()
+
+
 def get_or_create_workspace(
     db: DBSession,
     host: str,
@@ -94,6 +140,7 @@ def get_or_create_workspace(
     same machine are distinct workspaces, and the same clone seen again after a
     restart is the same workspace.
     """
+    git_dir = normalize_git_dir(git_dir, clone_path)
     workspace = (
         db.query(models.Workspace)
         .filter(
@@ -372,6 +419,7 @@ def claim_territory(
 
     ttl = max(1, min(int(ttl_minutes), MAX_CLAIM_TTL_MINUTES))
     now = datetime.utcnow()
+    _lock_repo_workspaces(db, repo)
     conflicts = find_conflicts(db, repo=repo, paths=normalized, mode=mode, exclude_session_id=session_id, now=now)
 
     if conflicts and not force:
@@ -507,6 +555,8 @@ def claim_resource(
 
     Always exclusive: there is no useful "shared read" of a stash stack you are
     about to mutate. Refused on conflict unless ``force``, like a path claim.
+    Writers for one repo are serialised by a row lock (`_lock_repo_workspaces`)
+    so two sessions cannot both be granted the same singleton.
     """
     session = db.query(models.Session).filter(models.Session.id == session_id).first()
     if not session:
@@ -516,6 +566,8 @@ def claim_resource(
 
     ttl = max(1, min(int(ttl_minutes), MAX_CLAIM_TTL_MINUTES))
     now = datetime.utcnow()
+    if session.workspace:
+        _lock_repo_workspaces(db, session.workspace.repo)
     conflicts = find_resource_conflicts(db, session_id=session_id, resource=resource, now=now)
 
     if conflicts and not force:

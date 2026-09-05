@@ -225,3 +225,82 @@ class TestUnregisteredCaller:
             db, host="mbp16", clone_path="/Users/dev/work/core", resource=models.ClaimResourceEnum.WORKTREE
         )
         assert verdict["allowed"] is True
+
+
+class TestGitDirIdentity:
+    """Two spellings of one `.git` must contend, or sibling worktrees slip through.
+
+    `git rev-parse --git-common-dir` prints a *relative* `.git` from the main
+    worktree and an absolute path from a linked one, so the server resolves a
+    relative value against clone_path and normalises both.
+    """
+
+    def test_a_relative_git_dir_is_resolved_against_the_clone_path(self, db, primary):
+        # The main worktree registers with git's own relative spelling.
+        main = _session(db, "codex", "mbp16", "/Users/dev/work/core", ".git")
+        assert main.workspace.git_dir == GIT_DIR_A
+        assert main.workspace.id == primary.workspace.id
+
+    def test_normalised_spellings_of_one_git_dir_contend(self, db, primary):
+        sibling = _session(db, "codex", "mbp16", "/Users/dev/work/core-wt", "/Users/dev/work//core/./.git/")
+        assert sibling.workspace.git_dir == GIT_DIR_A
+
+        held = coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.STASH)
+        assert held["granted"] is True
+        contended = coordination.claim_resource(db, session_id=sibling.id, resource=models.ClaimResourceEnum.STASH)
+        assert contended["granted"] is False
+
+    def test_a_linked_worktree_relative_gitdir_is_resolved_too(self, db, primary):
+        # A linked worktree's own `.git` is a file; `--git-common-dir` from inside
+        # it is usually absolute, but a relative form still resolves sensibly.
+        sibling = _session(db, "codex", "mbp16", "/Users/dev/work/core-wt", "../core/.git")
+        assert sibling.workspace.git_dir == GIT_DIR_A
+
+    @pytest.mark.parametrize("value", ["", "   ", None])
+    def test_blank_git_dir_stays_unknown(self, db, value):
+        session = _session(db, "codex", "mbp16", "/Users/dev/elsewhere/core", value)
+        assert session.workspace.git_dir is None
+
+
+class TestClaimWritersAreSerialised:
+    """SQLite has no row locks, so here we only assert the lock is *requested*.
+
+    The Postgres parity suite (tests/test_postgres_schema.py) races real
+    connections and checks that exactly one of N racing STASH claims is granted.
+    """
+
+    def test_claiming_a_resource_locks_the_repo_workspaces(self, db, primary):
+        from sqlalchemy import event
+
+        statements: list[str] = []
+        bind = db.get_bind()
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(bind, "before_cursor_execute", capture)
+        try:
+            coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.STASH)
+        finally:
+            event.remove(bind, "before_cursor_execute", capture)
+
+        locking = [s for s in statements if "FROM workspaces" in s and "ORDER BY workspaces.id" in s]
+        assert locking, "claim_resource should read the repo's workspaces with a row lock before checking conflicts"
+
+    def test_claiming_paths_locks_the_repo_workspaces(self, db, primary):
+        from sqlalchemy import event
+
+        statements: list[str] = []
+        bind = db.get_bind()
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(bind, "before_cursor_execute", capture)
+        try:
+            coordination.claim_territory(db, session_id=primary.id, paths=["backend/app/"])
+        finally:
+            event.remove(bind, "before_cursor_execute", capture)
+
+        locking = [s for s in statements if "FROM workspaces" in s and "ORDER BY workspaces.id" in s]
+        assert locking

@@ -136,13 +136,25 @@ export AXONRELAY_SESSION_ID="<id from register_session>"
 git() { /path/to/core/tools/gitsafe git "$@"; }
 ```
 
+When registering the session, pass the clone's git dir so sibling worktrees are
+recognised as sharing one stash stack:
+
+```bash
+git rev-parse --path-format=absolute --git-common-dir    # -> register_session(git_dir=...)
+```
+
+The server resolves a relative `.git` against `clone_path` and normalises the
+path; if the checkout sits behind a symlink, run the value through `realpath`.
+
 Read-only git always passes. `stash push` stamps `[axonrelay:s<id>]` into the
 message; `pop`/`apply`/`drop` refuse an entry tagged for someone else; `stash
 clear` is always refused. `reset --hard`, `clean -f`, a dirty `checkout`,
 `rebase`, `branch -D` and `push --force` consult the board.
 
 The stash tag check works with no network — the tag lives in the stash message —
-so it still protects you when AxonRelay is unreachable. Bypass once with
+so it still protects you when AxonRelay is unreachable. An unreachable server
+degrades to that layer; a reachable server that answers with an error refuses,
+since an error must not read as permission. Bypass once with
 `GITSAFE_ALLOW_UNSAFE=1`, which is recorded on stderr.
 
 ## 4. Dashboard  →  app.axonrelay.com

@@ -125,6 +125,20 @@ A の作業ツリー                      → 元に戻った（作業が消え�
 
 `git_dir` が不明な場合は `(host, repo)` にフォールバックして**過剰報告**する — パス判定と同じく、見逃すより多めに報告する側に倒す。
 
+#### `git_dir` の取り方と正規化
+
+`register_session` には次の値を渡す:
+
+```bash
+git rev-parse --path-format=absolute --git-common-dir   # git 2.31+
+```
+
+git 自身の出力は一貫していない — main worktree では相対の `.git`、linked worktree では絶対パスを返す。サーバ側は相対値を `clone_path` 基準で解決し、`..` / `//` / 末尾スラッシュを正規化してから比較する（`normalize_git_dir`）。symlink はサーバでは解決できないので、checkout が symlink 配下にある場合はクライアントが `realpath` を通す。
+
+#### 同時 claim の直列化
+
+claim の付与は「生きている claim を読む → 衝突がなければ insert」の2段階で、2つのトランザクションが同時に「空いている」と読めば**両方に排他 claim が付与されてしまう**。パス claim と資源 claim の両方で、同じ repo の `workspaces` 行を id 順に `SELECT ... FOR UPDATE` してから衝突判定する（`_lock_repo_workspaces`）。承認台帳が task 行をロックするのと同じ形。Postgres parity テストが 8 セッション同時の `stash` claim で granted が1つだけになることを検証する（ロックを外すと 8 つ granted になる）。
+
 MCP tool: `claim_git_resource(session_id, resource, ...)` / `check_git_resource(session_id, resource)`。
 
 ---
@@ -148,9 +162,15 @@ gitsafe git stash push -m "wip"
 
 **② AxonRelay の資源 claim**
 
-`reset --hard` / `clean -f` / dirty な `checkout` / `rebase` / `branch -D` / `push --force` は、`GET /coordination/git/guard` に照会し、他セッションが握っていれば拒否する。AxonRelay に到達できない場合は①のみに縮退し、その旨を stderr に出す。
+`reset --hard` / `clean`（dry-run 以外）/ dirty な `checkout` / `rebase` / `branch -D` / `push --force`・`+refspec`・`--delete` は、`GET /coordination/git/guard` に照会し、他セッションが握っていれば拒否する。判定は `$*` のグロブではなく引数ごとに行う（`--follow-tags` を `-f` と誤認しない、`+main:main` を見逃さない）。
+
+到達性とエラーは区別する。**接続できない**場合は①のみに縮退して stderr に告げる（claim は助言的）。**到達できたがエラー応答**（4xx/5xx）の場合は拒否する — エラーを許可として扱うと、あらゆるバグが迂回路になるため。
+
+`git -C <dir> stash pop` のような git グローバルオプションはサブコマンドの前で消費し、内部の git 呼び出し全てに引き継ぐ。未知のグローバルオプションはどれがサブコマンドか推測せず拒否する（値を取るオプションを知らずに飛ばすと、本物のサブコマンドが無防備で通る）。
 
 **読み取り系（`status` `diff` `log` `show` `stash list`）は常に素通し。**
+
+**原子性の限界。** 所有者チェックと git の変更は2ステップで、その間に gitsafe を通さない裸の `git stash push` が割り込めばスタックはずれる。`pop` / `apply` / `drop` は index（`stash@{0}`）ではなく commit id で操作し、`drop` は直前に id を再確認することで窓を git が許す限界まで狭めている。残る窓は、gitsafe を使う書き手は claim で排除されていること、誤って drop しても commit はオブジェクトストアに残ることをもって受容する。`stash branch` だけは git が reflog 参照しか受けないため commit に固定できず、直前の再確認のみ。
 
 #### サブエージェントをどう扱うか
 

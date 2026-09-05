@@ -11,16 +11,24 @@
 # Two layers, deliberately in this order:
 #
 #   1. Stash ownership tags. `gitsafe git stash push` records the session in the
-#      stash message; pop/apply/drop refuse an entry belonging to someone else.
-#      This needs no network and no server — the tag travels inside the stash —
-#      so it keeps working when AxonRelay is down. It is what actually stops the
-#      incident.
+#      stash message; pop/apply/drop/branch refuse an entry belonging to someone
+#      else. This needs no network and no server — the tag travels inside the
+#      stash — so it keeps working when AxonRelay is down. It is what actually
+#      stops the incident.
 #   2. AxonRelay resource claims. For worktree- and ref-level damage
-#      (`reset --hard`, `clean -fd`, `branch -D`, force-push) it asks the board
+#      (`reset --hard`, `clean -f`, `branch -D`, force-push) it asks the board
 #      whether another session holds the resource. Advisory data, enforced here.
 #
 # Read-only git is never blocked. Subagents legitimately need status/diff/log,
 # and a guard that got in the way of those would be switched off.
+#
+# What it does not do: it cannot make git atomic. The ownership check and the
+# mutation are two steps, so a *bare* `git stash push` from a writer that
+# bypasses gitsafe, landing in the microseconds between them, can still shift
+# the stack under us. We narrow that as far as git allows — apply by commit id,
+# drop only after re-verifying the entry's id — and accept the residue: writers
+# that use gitsafe are excluded by the claim, and the object is recoverable
+# from the object store even if the wrong reflog entry is dropped.
 #
 # Usage:
 #   gitsafe git <args...>      explicit
@@ -37,15 +45,19 @@ AXONRELAY_URL="${AXONRELAY_URL:-}"
 SESSION_ID="${AXONRELAY_SESSION_ID:-}"
 TAG_PREFIX="[axonrelay:"
 
+# git's own global options (`git -C dir stash pop`, `git --git-dir=x reset`)
+# come *before* the subcommand. They are collected here and replayed on every
+# internal git call, so identity and the guarded command see the same repo.
+GLOBAL_OPTS=()
+
 die() { printf 'gitsafe: %s\n' "$*" >&2; exit 1; }
 note() { printf 'gitsafe: %s\n' "$*" >&2; }
 
-real_git() { command git "$@"; }
+real_git() { command git ${GLOBAL_OPTS[@]+"${GLOBAL_OPTS[@]}"} "$@"; }
 
 # --- identity ---------------------------------------------------------------
 
-git_common_dir() { real_git rev-parse --git-common-dir 2>/dev/null | xargs -I{} readlink -f {} 2>/dev/null || true; }
-clone_path()     { real_git rev-parse --show-toplevel 2>/dev/null || pwd; }
+clone_path() { real_git rev-parse --show-toplevel 2>/dev/null || pwd; }
 
 # The tag written into a stash message. Falls back to a host+clone identity when
 # the caller never registered, so an unregistered subagent still cannot silently
@@ -58,42 +70,58 @@ owner_tag() {
   fi
 }
 
-# --- AxonRelay (advisory; absence is not fatal) ------------------------------
+# --- AxonRelay (advisory; absence is not fatal, an error is) -----------------
 
 guard_resource() { # $1 = worktree|stash|refs   returns 0 = allowed
   [ -n "$AXONRELAY_URL" ] || { note "AXONRELAY_URL unset — claim check skipped (stash tags still enforced)"; return 0; }
 
-  local url resp
+  local body status args=(--get --data-urlencode "resource=$1")
   if [ -n "$SESSION_ID" ]; then
-    url="$AXONRELAY_URL/coordination/git/guard?resource=$1&session_id=$SESSION_ID"
+    args+=(--data-urlencode "session_id=$SESSION_ID")
   else
-    url="$AXONRELAY_URL/coordination/git/guard?resource=$1&host=$(hostname -s)&clone_path=$(clone_path)"
+    args+=(--data-urlencode "host=$(hostname -s)" --data-urlencode "clone_path=$(clone_path)")
   fi
 
-  resp=$(curl -fsS --max-time 5 --get --data-urlencode "" "$url" 2>/dev/null) || {
+  # Two failure modes, treated differently. No connection at all: the board is
+  # advisory, so degrade to the stash tags and say so. A reachable server that
+  # answers with an error: something is wrong with *this* request (bad id, bad
+  # encoding, server fault), and letting a destructive command through on an
+  # error response would turn every bug into a bypass. Refuse.
+  body=$(curl -sS --max-time 5 -w '\n%{http_code}' "${args[@]}" "$AXONRELAY_URL/coordination/git/guard" 2>/dev/null) || {
     note "AxonRelay unreachable — claim check skipped (stash tags still enforced)"
     return 0
   }
+  status="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  case "$status" in
+    2*) ;;
+    *)
+      note "refused: the guard endpoint answered HTTP $status for '$1' — not treating an error as permission."
+      printf '%s\n' "$body" | head -c 400 >&2; printf '\n' >&2
+      note "fix the cause, or override once with GITSAFE_ALLOW_UNSAFE=1."
+      return 1
+      ;;
+  esac
 
-  case "$resp" in
+  case "$body" in
     *'"allowed":true'*|*'"allowed": true'*) return 0 ;;
   esac
 
   note "refused: another session holds the '$1' claim on this clone."
-  printf '%s\n' "$resp" | tr ',' '\n' | grep -E '"(actor|host|clone_path|branch|focus|reason)"' >&2 || true
+  printf '%s\n' "$body" | tr ',' '\n' | grep -E '"(actor|host|clone_path|branch|focus|reason)"' >&2 || true
   note "ask them via send_relay, or override once with GITSAFE_ALLOW_UNSAFE=1."
   return 1
 }
 
 # --- stash ownership ---------------------------------------------------------
 
-stash_ref_message() { # $1 = stash ref like stash@{0}
+stash_message() { # $1 = stash ref or commit id
   real_git log -1 --format=%s "$1" 2>/dev/null || true
 }
 
-assert_stash_is_ours() { # $1 = stash ref
+assert_stash_is_ours() { # $1 = stash ref (for messages)  $2 = its commit id
   local msg mine
-  msg=$(stash_ref_message "$1")
+  msg=$(stash_message "$2")
   mine=$(owner_tag)
 
   case "$msg" in
@@ -119,15 +147,148 @@ assert_stash_is_ours() { # $1 = stash ref
   esac
 }
 
+is_stash_ref() { case "$1" in stash@*|refs/stash*) return 0 ;; *) return 1 ;; esac; }
+
 resolve_stash_ref() { # first stash-looking arg, else stash@{0}
   local a
   for a in "$@"; do
-    case "$a" in stash@*) printf '%s' "$a"; return ;; esac
+    if is_stash_ref "$a"; then printf '%s' "$a"; return; fi
   done
   printf 'stash@{0}'
 }
 
+stash_commit() { # $1 = stash ref -> commit id, or die
+  real_git rev-parse -q --verify "$1^{commit}" 2>/dev/null || die "$1 is not a stash entry."
+}
+
+# Drop the reflog entry whose commit is $1, re-verifying the index right before
+# the drop so a stack that shifted underneath us is noticed instead of dropping
+# a neighbour. Returns 1 if the entry is no longer on the stack.
+drop_stash_by_commit() {
+  local i=0 id
+  while id=$(real_git rev-parse -q --verify "stash@{$i}^{commit}" 2>/dev/null); do
+    if [ "$id" = "$1" ]; then
+      [ "$(real_git rev-parse -q --verify "stash@{$i}^{commit}" 2>/dev/null)" = "$1" ] || return 1
+      real_git stash drop -q "stash@{$i}" >/dev/null
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Replace the stash ref in an argument list with a commit id, appending the id
+# when no ref was given. Everything else (--index, -q) passes through.
+args_with_commit() { # $1 = commit; rest = original args
+  local commit="$1" a seen=0; shift
+  for a in "$@"; do
+    if is_stash_ref "$a"; then printf '%s\n' "$commit"; seen=1; else printf '%s\n' "$a"; fi
+  done
+  [ $seen -eq 1 ] || printf '%s\n' "$commit"
+}
+
+# Split `stash push` / `stash save` arguments into (message, other args). Handles
+# `-m msg`, `-mmsg`, `--message msg`, `--message=msg`; for `save`, whose message
+# is positional, every non-option word is message text.
+STASH_MSG=""
+STASH_REST=()
+split_stash_message() { # $1 = push|save; rest = args
+  local op="$1" a expect=0 words=(); shift
+  STASH_MSG=""; STASH_REST=()
+  for a in "$@"; do
+    if [ $expect -eq 1 ]; then STASH_MSG="$a"; expect=0; continue; fi
+    case "$a" in
+      -m|--message) expect=1 ;;
+      --message=*) STASH_MSG="${a#--message=}" ;;
+      -m?*) STASH_MSG="${a#-m}" ;;
+      --) STASH_REST+=("$a") ;;
+      -*) STASH_REST+=("$a") ;;
+      *) if [ "$op" = save ]; then words+=("$a"); else STASH_REST+=("$a"); fi ;;
+    esac
+  done
+  [ $expect -eq 0 ] || die "'-m' given without a message"
+  if [ "$op" = save ] && [ ${#words[@]} -gt 0 ] && [ -z "$STASH_MSG" ]; then
+    STASH_MSG="${words[*]}"
+  fi
+}
+
 # --- command classification --------------------------------------------------
+
+# Consume git's global options ahead of the subcommand. Unknown dash-options are
+# refused rather than skipped: an option that takes a value we do not know about
+# would leave its value in the subcommand slot and the real subcommand unguarded.
+GLOBAL_CONSUMED=0
+take_global_options() { # sets GLOBAL_OPTS and GLOBAL_CONSUMED (not a subshell: the array must survive)
+  local n=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env|--exec-path|--attr-source)
+        [ $# -ge 2 ] || die "global option '$1' needs a value"
+        GLOBAL_OPTS+=("$1" "$2"); shift 2; n=$((n + 2)) ;;
+      --git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--exec-path=*|--attr-source=*|--list-cmds=*)
+        GLOBAL_OPTS+=("$1"); shift; n=$((n + 1)) ;;
+      -p|--paginate|-P|--no-pager|--bare|--no-replace-objects|--no-lazy-fetch|--no-optional-locks|--no-advice \
+      |--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs \
+      |--html-path|--man-path|--info-path|--version|--help|-h)
+        GLOBAL_OPTS+=("$1"); shift; n=$((n + 1)) ;;
+      -*) die "unrecognised global git option '$1' before the subcommand. gitsafe refuses rather than guess
+  which argument is the subcommand. Run it as 'git <subcommand> ...' or, if you must,
+  GITSAFE_ALLOW_UNSAFE=1." ;;
+      *) break ;;
+    esac
+  done
+  GLOBAL_CONSUMED=$n
+}
+
+# Per-argument matching. `$*` globbing would let `--follow-tags` match `*-f*`
+# by accident and, worse, miss `+refspec`, which is git's other force syntax.
+
+short_flag_in() { # $1 = arg, $2 = letters   true when $1 is a short-option cluster containing one of them
+  case "$1" in
+    -[!-]*) case "${1#-}" in *[$2]*) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+push_is_destructive() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --force|--force-with-lease|--force-with-lease=*|--force-if-includes|--delete|--mirror|--prune) return 0 ;;
+      +*) return 0 ;;            # +main:main
+    esac
+    short_flag_in "$a" fd && return 0   # -f, -d, -fu ...
+  done
+  return 1
+}
+
+branch_is_destructive() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --delete|--move|--force|--copy) return 0 ;;
+    esac
+    short_flag_in "$a" DdMmfC && return 0   # -D -d -M -m -f -C (copy over an existing branch)
+  done
+  return 1
+}
+
+reset_is_destructive() {
+  local a
+  for a in "$@"; do
+    case "$a" in --hard|--merge|--keep) return 0 ;; esac
+  done
+  return 1
+}
+
+clean_is_dry_run() {
+  local a
+  for a in "$@"; do
+    case "$a" in --dry-run) return 0 ;; esac
+    short_flag_in "$a" n && return 0
+  done
+  return 1
+}
 
 main() {
   [ "${1:-}" = "git" ] || die "usage: gitsafe git <args...>"
@@ -136,9 +297,13 @@ main() {
 
   if [ "${GITSAFE_ALLOW_UNSAFE:-}" = "1" ]; then
     note "BYPASS: GITSAFE_ALLOW_UNSAFE=1 — running unguarded: git $*"
-    real_git "$@"
+    command git "$@"
     return
   fi
+
+  take_global_options "$@"
+  shift "$GLOBAL_CONSUMED"
+  [ $# -gt 0 ] || { real_git; return; }
 
   local sub="$1"; shift
   case "$sub" in
@@ -147,15 +312,40 @@ main() {
       # `git stash` (or `git stash -m msg`) means push, with nothing to consume.
       local op="push"
       case "${1:-}" in
-        pop|apply|drop|clear|push|save|list|show|branch|create|store)
+        pop|apply|drop|clear|push|save|list|show|branch|create|store|export|import)
           op="$1"; shift ;;
       esac
       case "$op" in
         pop|apply|drop)
-          local ref; ref=$(resolve_stash_ref "$@")
-          assert_stash_is_ours "$ref"
+          local ref commit
+          ref=$(resolve_stash_ref "$@")
+          commit=$(stash_commit "$ref")
+          assert_stash_is_ours "$ref" "$commit"
           guard_resource stash || exit 1
-          real_git stash "$op" "$@"
+          # Work on the commit id, not the index: `stash@{0}` can mean a
+          # different entry by the time git runs if a bare writer pushed.
+          local -a rewritten=()
+          while IFS= read -r a; do rewritten+=("$a"); done < <(args_with_commit "$commit" "$@")
+          case "$op" in
+            apply) real_git stash apply "${rewritten[@]}" ;;
+            drop)  drop_stash_by_commit "$commit" || die "$ref ($commit) is no longer on the stash stack; nothing dropped."
+                   note "dropped $ref ($commit)" ;;
+            pop)   real_git stash apply "${rewritten[@]}"
+                   drop_stash_by_commit "$commit" \
+                     || note "applied $ref but the entry ($commit) had already left the stack — nothing dropped." ;;
+          esac
+          ;;
+        branch)
+          # `stash branch <name> [<stash>]` applies and then drops the entry,
+          # so it is a pop in disguise. git only accepts a reflog ref here, so
+          # this one cannot be pinned to a commit id; re-check right before.
+          local ref commit
+          ref=$(resolve_stash_ref "$@")
+          commit=$(stash_commit "$ref")
+          assert_stash_is_ours "$ref" "$commit"
+          guard_resource stash || exit 1
+          [ "$(stash_commit "$ref")" = "$commit" ] || die "$ref changed underneath us; re-run."
+          real_git stash branch "$@"
           ;;
         clear)
           die "'git stash clear' discards every entry in the clone, including
@@ -167,17 +357,10 @@ main() {
           # Stamp the message so the entry can be attributed later. `save` is
           # deprecated in git and takes its message positionally; normalise both
           # onto `push -m`.
-          local msg="" rest=() saw_m=0
-          for a in "$@"; do
-            if [ $saw_m -eq 1 ]; then msg="$a"; saw_m=0; continue; fi
-            case "$a" in
-              -m|--message) saw_m=1 ;;
-              *) rest+=("$a") ;;
-            esac
-          done
-          real_git stash push -m "$(owner_tag) ${msg:-wip}" ${rest[@]+"${rest[@]}"}
+          split_stash_message "$op" "$@"
+          real_git stash push -m "$(owner_tag) ${STASH_MSG:-wip}" ${STASH_REST[@]+"${STASH_REST[@]}"}
           ;;
-        list|show)
+        list|show|export)
           real_git stash "$op" "$@"
           ;;
         *)
@@ -188,20 +371,18 @@ main() {
       ;;
 
     reset)
-      case "$*" in
-        *--hard*) guard_resource worktree || exit 1 ;;
-      esac
+      if reset_is_destructive "$@"; then guard_resource worktree || exit 1; fi
       real_git reset "$@"
       ;;
 
     clean)
-      case "$*" in
-        *-f*|*--force*) guard_resource worktree || exit 1 ;;
-      esac
+      # Anything but a dry run can delete untracked work (and clean.requireForce
+      # may be off), so the flag list is not what decides.
+      if ! clean_is_dry_run "$@"; then guard_resource worktree || exit 1; fi
       real_git clean "$@"
       ;;
 
-    checkout|switch)
+    checkout|switch|restore)
       # Only guarded when it would carry or clobber uncommitted work.
       if [ -n "$(real_git status --porcelain 2>/dev/null)" ]; then
         guard_resource worktree || exit 1
@@ -209,23 +390,31 @@ main() {
       real_git "$sub" "$@"
       ;;
 
-    rebase|merge|cherry-pick|revert)
+    rebase|merge|cherry-pick|revert|am)
       guard_resource worktree || exit 1
       real_git "$sub" "$@"
       ;;
 
     branch)
-      case "$*" in
-        *-D*|*-d*|*--delete*|*-M*|*--move*) guard_resource refs || exit 1 ;;
-      esac
+      if branch_is_destructive "$@"; then guard_resource refs || exit 1; fi
       real_git branch "$@"
       ;;
 
-    push)
-      case "$*" in
-        *--force*|*-f*|*--delete*) guard_resource refs || exit 1 ;;
+    tag)
+      case " $* " in
+        *" -d "*|*" --delete "*|*" -f "*|*" --force "*) guard_resource refs || exit 1 ;;
       esac
+      real_git tag "$@"
+      ;;
+
+    push)
+      if push_is_destructive "$@"; then guard_resource refs || exit 1; fi
       real_git push "$@"
+      ;;
+
+    update-ref|symbolic-ref|reflog)
+      guard_resource refs || exit 1
+      real_git "$sub" "$@"
       ;;
 
     *)
