@@ -125,6 +125,10 @@ A の作業ツリー                      → 元に戻った（作業が消え�
 
 `git_dir` が不明な場合は `(host, repo)` にフォールバックして**過剰報告**する — パス判定と同じく、見逃すより多めに報告する側に倒す。
 
+#### `force` の意味
+
+`force=true` は「いまから自分が保持者である」という宣言なので、押し退けた claim は `RELEASED` に遷移させる（削除はしない）。放置して `HELD` のままにすると、押し退けた側が guard に拒否され続け、ボードには排他 claim の保持者が2人並ぶ。誰を押し退けたかは新 claim の `forced_over` に残り、押し退けられた側からも見える。パス claim と資源 claim で共通。
+
 #### `git_dir` の取り方と正規化
 
 `register_session` には次の値を渡す:
@@ -167,6 +171,12 @@ gitsafe git stash push -m "wip"
 到達性とエラーは区別する。**接続できない**場合は①のみに縮退して stderr に告げる（claim は助言的）。**到達できたがエラー応答**（4xx/5xx）の場合は拒否する — エラーを許可として扱うと、あらゆるバグが迂回路になるため。
 
 `git -C <dir> stash pop` のような git グローバルオプションはサブコマンドの前で消費し、内部の git 呼び出し全てに引き継ぐ。未知のグローバルオプションはどれがサブコマンドか推測せず拒否する（値を取るオプションを知らずに飛ばすと、本物のサブコマンドが無防備で通る）。
+
+git alias は**展開結果で分類する**（`git -c alias.steal='stash pop' steal` や `~/.gitconfig` の alias が既定分岐に落ちないように）。`!` で始まるシェル alias は何を実行するか見えないので拒否する。
+
+guard への照会には `session_id` に加えて**コマンドが実際に走る場所**（`host`, `clone_path`）を常に送る。session_id は「誰が」を示すだけで「どこで」は示さない — clone B に登録した session が `git -C clone-A reset --hard` を打った場合、サーバは checkout が session の workspace と一致しないことを検出し、その clone における**未登録の呼び出し元**として判定する（誰かが握っていれば拒否）。
+
+stash の対象は `stash@{n}` という綴りではなく**位置引数**で決める。`git stash apply <commit id>` や `git stash branch <name> <commit id>` も git は受け付けるので、綴りで判定すると先頭 entry を検査して別 entry を適用してしまう。
 
 **読み取り系（`status` `diff` `log` `show` `stash list`）は常に素通し。**
 

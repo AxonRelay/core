@@ -75,11 +75,14 @@ owner_tag() {
 guard_resource() { # $1 = worktree|stash|refs   returns 0 = allowed
   [ -n "$AXONRELAY_URL" ] || { note "AXONRELAY_URL unset — claim check skipped (stash tags still enforced)"; return 0; }
 
+  # Who is asking (session_id) and *where the command actually runs* (host,
+  # clone_path). Both always go: a session registered in clone B running
+  # `git -C clone-A reset --hard` must be judged against A's claims, and the
+  # server does that by noticing the checkout is not the session's own.
   local body status args=(--get --data-urlencode "resource=$1")
+  args+=(--data-urlencode "host=$(hostname -s)" --data-urlencode "clone_path=$(clone_path)")
   if [ -n "$SESSION_ID" ]; then
     args+=(--data-urlencode "session_id=$SESSION_ID")
-  else
-    args+=(--data-urlencode "host=$(hostname -s)" --data-urlencode "clone_path=$(clone_path)")
   fi
 
   # Two failure modes, treated differently. No connection at all: the board is
@@ -147,18 +150,34 @@ assert_stash_is_ours() { # $1 = stash ref (for messages)  $2 = its commit id
   esac
 }
 
-is_stash_ref() { case "$1" in stash@*|refs/stash*) return 0 ;; *) return 1 ;; esac; }
-
-resolve_stash_ref() { # first stash-looking arg, else stash@{0}
-  local a
+# The stash operand is whatever positional argument git would take as one -
+# `stash@{n}`, a bare `n`, or any revision such as a commit id from `stash list
+# --format=%H`. Matching on the `stash@` spelling alone would let a commit id
+# slip past the ownership check while the top entry is what gets inspected.
+# $1 = which positional (1-based) holds the stash; rest = args.
+resolve_stash_ref() {
+  local want="$1" a n=0; shift
   for a in "$@"; do
-    if is_stash_ref "$a"; then printf '%s' "$a"; return; fi
+    case "$a" in
+      --) ;;
+      -*) ;;
+      *) n=$((n + 1)); if [ "$n" -eq "$want" ]; then printf '%s' "$a"; return; fi ;;
+    esac
   done
   printf 'stash@{0}'
 }
 
-stash_commit() { # $1 = stash ref -> commit id, or die
-  real_git rev-parse -q --verify "$1^{commit}" 2>/dev/null || die "$1 is not a stash entry."
+is_stash_operand() { # $1 = arg, $2 = the resolved operand
+  [ "$1" = "$2" ]
+}
+
+stash_commit() { # $1 = stash operand -> commit id, or die
+  local ref="$1"
+  case "$ref" in
+    ''|*[!0-9]*) ;;
+    *) ref="stash@{$ref}" ;;   # git accepts a bare index: `git stash pop 2`
+  esac
+  real_git rev-parse -q --verify "$ref^{commit}" 2>/dev/null || die "$1 is not a stash entry."
 }
 
 # Drop the reflog entry whose commit is $1, re-verifying the index right before
@@ -179,10 +198,10 @@ drop_stash_by_commit() {
 
 # Replace the stash ref in an argument list with a commit id, appending the id
 # when no ref was given. Everything else (--index, -q) passes through.
-args_with_commit() { # $1 = commit; rest = original args
-  local commit="$1" a seen=0; shift
+args_with_commit() { # $1 = commit; $2 = the operand as given; rest = original args
+  local commit="$1" operand="$2" a seen=0; shift 2
   for a in "$@"; do
-    if is_stash_ref "$a"; then printf '%s\n' "$commit"; seen=1; else printf '%s\n' "$a"; fi
+    if [ $seen -eq 0 ] && is_stash_operand "$a" "$operand"; then printf '%s\n' "$commit"; seen=1; else printf '%s\n' "$a"; fi
   done
   [ $seen -eq 1 ] || printf '%s\n' "$commit"
 }
@@ -273,6 +292,15 @@ branch_is_destructive() {
   return 1
 }
 
+tag_is_destructive() {
+  local a
+  for a in "$@"; do
+    case "$a" in --delete|--force) return 0 ;; esac
+    short_flag_in "$a" df && return 0   # -d, -f, -fa, -am ... clusters included
+  done
+  return 1
+}
+
 reset_is_destructive() {
   local a
   for a in "$@"; do
@@ -305,7 +333,27 @@ main() {
   shift "$GLOBAL_CONSUMED"
   [ $# -gt 0 ] || { real_git; return; }
 
-  local sub="$1"; shift
+  # Aliases are classified by what they expand to, not what they are called:
+  # `git -c alias.steal='stash pop' steal` or a ~/.gitconfig alias would
+  # otherwise land in the default branch unguarded. Shell aliases (`!cmd`)
+  # can run anything, so they are refused rather than guessed at.
+  local sub="$1" expansion depth=0; shift
+  while expansion=$(real_git config --get "alias.$sub" 2>/dev/null) && [ -n "$expansion" ]; do
+    case "$expansion" in
+      '!'*) die "'$sub' is a shell alias ($expansion); gitsafe cannot see what it runs.
+  Run the underlying git command directly, or GITSAFE_ALLOW_UNSAFE=1." ;;
+    esac
+    depth=$((depth + 1)); [ $depth -le 8 ] || die "alias '$sub' expands too deeply"
+    case "$expansion" in
+      *'$'*|*'`'*) die "alias '$sub' contains shell expansion characters ($expansion); refusing to interpret it." ;;
+    esac
+    local -a words=()
+    eval "words=($expansion)"   # git splits alias values with shell quoting rules too
+    [ ${#words[@]} -gt 0 ] || die "alias '$sub' is empty"
+    note "alias: $sub -> $expansion"
+    sub="${words[0]}"
+    set -- "${words[@]:1}" "$@"
+  done
   case "$sub" in
     stash)
       # Consume the stash subcommand so "$@" holds only its arguments. A bare
@@ -318,14 +366,14 @@ main() {
       case "$op" in
         pop|apply|drop)
           local ref commit
-          ref=$(resolve_stash_ref "$@")
+          ref=$(resolve_stash_ref 1 "$@")
           commit=$(stash_commit "$ref")
           assert_stash_is_ours "$ref" "$commit"
           guard_resource stash || exit 1
           # Work on the commit id, not the index: `stash@{0}` can mean a
           # different entry by the time git runs if a bare writer pushed.
           local -a rewritten=()
-          while IFS= read -r a; do rewritten+=("$a"); done < <(args_with_commit "$commit" "$@")
+          while IFS= read -r a; do rewritten+=("$a"); done < <(args_with_commit "$commit" "$ref" "$@")
           case "$op" in
             apply) real_git stash apply "${rewritten[@]}" ;;
             drop)  drop_stash_by_commit "$commit" || die "$ref ($commit) is no longer on the stash stack; nothing dropped."
@@ -340,7 +388,7 @@ main() {
           # so it is a pop in disguise. git only accepts a reflog ref here, so
           # this one cannot be pinned to a commit id; re-check right before.
           local ref commit
-          ref=$(resolve_stash_ref "$@")
+          ref=$(resolve_stash_ref 2 "$@")   # stash branch <name> [<stash>]
           commit=$(stash_commit "$ref")
           assert_stash_is_ours "$ref" "$commit"
           guard_resource stash || exit 1
@@ -401,9 +449,7 @@ main() {
       ;;
 
     tag)
-      case " $* " in
-        *" -d "*|*" --delete "*|*" -f "*|*" --force "*) guard_resource refs || exit 1 ;;
-      esac
+      if tag_is_destructive "$@"; then guard_resource refs || exit 1; fi
       real_git tag "$@"
       ;;
 

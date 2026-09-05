@@ -563,6 +563,10 @@ async def coordination_git_guard_endpoint(
     subagent that spawned inside someone's working directory, typically. It is
     identified by (host, clone_path) instead, and is refused whenever anyone
     holds the resource, since it cannot have been the one to claim it.
+
+    A caller *with* a `session_id` should still send `host` and `clone_path`:
+    they are where the git command actually runs, and if that is not the
+    session's own checkout the caller is judged as unregistered there.
     """
     try:
         resolved = models.ClaimResourceEnum(resource)
@@ -570,7 +574,12 @@ async def coordination_git_guard_endpoint(
         raise HTTPException(status_code=400, detail=f"Unknown resource '{resource}'") from e
 
     if session_id is not None:
-        return coordination.guard_git_operation(db, session_id=session_id, resource=resolved)
+        try:
+            return coordination.guard_git_operation(
+                db, session_id=session_id, resource=resolved, host=host, clone_path=clone_path
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
 
     if not (host and clone_path):
         raise HTTPException(status_code=400, detail="Pass session_id, or both host and clone_path")

@@ -131,6 +131,31 @@ class TestResourceClaimBehaviour:
         assert forced["granted"] is True
         assert forced["claim"].forced_over == [first["claim"].id]
 
+    def test_force_retires_the_displaced_claim_so_the_new_holder_is_allowed(self, db, primary, sibling_worktree):
+        first = coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.STASH)
+        coordination.claim_resource(
+            db, session_id=sibling_worktree.id, resource=models.ClaimResourceEnum.STASH, force=True
+        )
+
+        db.refresh(first["claim"])
+        assert first["claim"].status == models.ClaimStatusEnum.RELEASED
+        assert first["claim"].released_at is not None
+
+        # The forcing session is the holder now: the guard lets it through and
+        # the displaced session is the one that is refused.
+        assert (
+            coordination.guard_git_operation(
+                db, session_id=sibling_worktree.id, resource=models.ClaimResourceEnum.STASH
+            )["allowed"]
+            is True
+        )
+        assert (
+            coordination.guard_git_operation(db, session_id=primary.id, resource=models.ClaimResourceEnum.STASH)[
+                "allowed"
+            ]
+            is False
+        )
+
     def test_an_expired_resource_claim_stops_blocking(self, db, primary, sibling_worktree):
         from datetime import datetime, timedelta
 
@@ -179,6 +204,58 @@ class TestGuard:
             db, session_id=sibling_worktree.id, resource=models.ClaimResourceEnum.STASH
         )
         assert verdict["allowed"] is True
+
+
+class TestGuardChecksWhereTheCommandRuns:
+    """A session id says who asks, not where; `git -C other-clone` must not borrow it."""
+
+    def test_a_session_operating_in_its_own_checkout_is_judged_as_itself(self, db, primary):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.WORKTREE)
+        result = coordination.guard_git_operation(
+            db,
+            session_id=primary.id,
+            resource=models.ClaimResourceEnum.WORKTREE,
+            host="mbp16",
+            clone_path="/Users/dev/work/core",
+        )
+        assert result["allowed"] is True
+
+    def test_a_session_operating_in_another_claimed_checkout_is_refused(self, db, primary, separate_clone):
+        # separate_clone's session holds its own worktree...
+        coordination.claim_resource(db, session_id=separate_clone.id, resource=models.ClaimResourceEnum.WORKTREE)
+        # ...and primary's session runs `git -C /Users/dev/other/core reset --hard`.
+        result = coordination.guard_git_operation(
+            db,
+            session_id=primary.id,
+            resource=models.ClaimResourceEnum.WORKTREE,
+            host="mbp16",
+            clone_path="/Users/dev/other/core",
+        )
+        assert result["allowed"] is False
+        assert result["caller"]["session_workspace_mismatch"] is True
+        assert result["conflicts"][0]["holder"]["actor"] == "codex"
+
+    def test_a_mismatched_checkout_nobody_claimed_is_allowed(self, db, primary, separate_clone):
+        result = coordination.guard_git_operation(
+            db,
+            session_id=primary.id,
+            resource=models.ClaimResourceEnum.WORKTREE,
+            host="mbp16",
+            clone_path="/Users/dev/other/core",
+        )
+        assert result["allowed"] is True
+
+    def test_holding_your_own_claim_does_not_authorise_another_checkout(self, db, primary, separate_clone):
+        coordination.claim_resource(db, session_id=primary.id, resource=models.ClaimResourceEnum.STASH)
+        coordination.claim_resource(db, session_id=separate_clone.id, resource=models.ClaimResourceEnum.STASH)
+        result = coordination.guard_git_operation(
+            db,
+            session_id=primary.id,
+            resource=models.ClaimResourceEnum.STASH,
+            host="mbp16",
+            clone_path="/Users/dev/other/core",
+        )
+        assert result["allowed"] is False
 
 
 class TestUnregisteredCaller:

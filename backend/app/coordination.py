@@ -424,6 +424,8 @@ def claim_territory(
 
     if conflicts and not force:
         return {"granted": False, "claim": None, "conflicts": conflicts}
+    if conflicts:
+        _release_overridden(db, conflicts, now)
 
     claim = models.Claim(
         session_id=session_id,
@@ -440,6 +442,25 @@ def claim_territory(
     db.commit()
     db.refresh(claim)
     return {"granted": True, "claim": claim, "conflicts": conflicts}
+
+
+def _release_overridden(db: DBSession, conflicts: list[dict[str, Any]], now: datetime) -> None:
+    """Retire the claims a forced claim displaces.
+
+    A force is a statement that the new holder owns the resource *now*. Leaving
+    the displaced claims HELD would contradict that: the guard would keep
+    refusing the very session that just forced its way in, and the board would
+    show two exclusive holders. The displaced claims are transitioned to
+    RELEASED (never deleted) and the new claim's ``forced_over`` records which
+    ones, so the override stays visible to the session it displaced.
+    """
+    ids = [c["claim_id"] for c in conflicts]
+    if not ids:
+        return
+    for claim in db.query(models.Claim).filter(models.Claim.id.in_(ids)).all():
+        if claim.status == models.ClaimStatusEnum.HELD:
+            claim.status = models.ClaimStatusEnum.RELEASED
+            claim.released_at = now
 
 
 def _normalize_paths(paths: list[str]) -> list[str]:
@@ -572,6 +593,8 @@ def claim_resource(
 
     if conflicts and not force:
         return {"granted": False, "claim": None, "conflicts": conflicts}
+    if conflicts:
+        _release_overridden(db, conflicts, now)
 
     claim = models.Claim(
         session_id=session_id,
@@ -596,6 +619,8 @@ def guard_git_operation(
     *,
     session_id: int,
     resource: models.ClaimResourceEnum,
+    host: str | None = None,
+    clone_path: str | None = None,
 ) -> dict[str, Any]:
     """Answer "may this session touch `resource` right now?" for the git wrapper.
 
@@ -603,7 +628,26 @@ def guard_git_operation(
     (`tools/gitsafe`) decides. A session that holds the claim itself is allowed;
     so is one where nobody holds it, because claiming is advisory and we do not
     want the guard to block work that was never coordinated.
+
+    A session id says who is asking, not where. `git -C other-clone reset
+    --hard` run with a session registered elsewhere would otherwise be judged
+    against the wrong workspace's claims. When the wrapper reports where the
+    command actually runs (``host``, ``clone_path``) and that is not the
+    session's own checkout, the caller is treated as an *unregistered* actor in
+    that checkout - refused whenever anyone holds the resource there.
     """
+    session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if not session:
+        raise ValueError(f"Session {session_id} not found")
+
+    if host and clone_path:
+        workspace = session.workspace
+        if workspace is None or workspace.host != host or workspace.clone_path != clone_path:
+            result = guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resource)
+            result["session_id"] = session_id
+            result["caller"]["session_workspace_mismatch"] = True
+            return result
+
     conflicts = find_resource_conflicts(db, session_id=session_id, resource=resource)
     return {
         "allowed": not conflicts,
