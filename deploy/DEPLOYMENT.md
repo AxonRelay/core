@@ -24,10 +24,10 @@ On the home PC or a small VPS:
 ```bash
 cp .env.example .env          # fill DATABASE_URL, LANGGRAPH_*, ANTHROPIC_API_KEY
 docker compose up -d postgres backend
-docker compose exec backend alembic upgrade head   # applies 001..007
+docker compose exec backend alembic upgrade head   # applies 001..008
 ```
 
-`alembic upgrade head` must reach `007`. Migrations 002 and 007 fix a chain that
+`alembic upgrade head` must reach `008`. Migrations 002 and 007 fix a chain that
 could not apply to a fresh Postgres and an enum-label mismatch that made every
 Actor insert fail — an install stopping short of 007 cannot register a session.
 
@@ -128,6 +128,45 @@ macOS, or a systemd unit on Linux. Nothing in this repo installs one.
 
 The stdio transport still works for a single machine and needs no network:
 `python -m app.mcp.server`.
+
+## 3.6 Guarding a shared clone (gitsafe)
+
+If more than one agent works in one clone — or in sibling worktrees of it — put
+[`tools/gitsafe`](../tools/gitsafe) on PATH.
+
+**Why:** `refs/stash` is a per-repository ref, so `git worktree add` does *not*
+give you a second stash stack. A `git stash pop` in one worktree consumes work
+parked in another, and since `git stash pop` names no path, no path claim can
+guard it.
+
+```bash
+export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"
+export AXONRELAY_SESSION_ID="<id from register_session>"
+git() { /path/to/core/tools/gitsafe git "$@"; }
+```
+
+When registering the session, pass the clone's git dir so sibling worktrees are
+recognised as sharing one stash stack:
+
+```bash
+git rev-parse --path-format=absolute --git-common-dir    # -> register_session(git_dir=...)
+```
+
+The server resolves a relative `.git` against `clone_path` and normalises the
+path; if the checkout sits behind a symlink, run the value through `realpath`.
+
+Read-only git always passes. `stash push` stamps `[axonrelay:s<id>]` into the
+message; `pop`/`apply`/`drop` refuse an entry tagged for someone else; `stash
+clear` is always refused. `reset --hard`, `clean -f`, a dirty `checkout`,
+`rebase`, `branch -D` (the per-clone `refs` resource) and `push --force` /
+`+refspec` / `push --delete` (the repo-wide `remote` resource, judged by the push's
+actual destination, not by `origin`) consult the board.
+
+The stash tag check works with no network — the tag lives in the stash message —
+so it still protects you when AxonRelay is unreachable. An unreachable server
+degrades to that layer; a reachable server that answers with an error refuses,
+since an error must not read as permission. Bypass once with
+`GITSAFE_ALLOW_UNSAFE=1`, which is recorded on stderr.
 
 ## 4. Dashboard  →  app.axonrelay.com
 

@@ -1,0 +1,568 @@
+#!/usr/bin/env bash
+# gitsafe — a fail-closed wrapper around the destructive half of git, for
+# clones that more than one agent shares.
+#
+# The problem it exists for: `refs/stash` is a per-repository ref. Every git
+# worktree of a clone shares one stash stack, so `git stash pop` in one place
+# can apply — and consume — work parked somewhere else. The stash stack has no
+# owner field, and `git stash pop` names no path, so nothing in git and nothing
+# in a path-based lock can tell those apart.
+#
+# Two layers, deliberately in this order:
+#
+#   1. Stash ownership tags. `gitsafe git stash push` records the session in the
+#      stash message; pop/apply/drop/branch refuse an entry belonging to someone
+#      else. This needs no network and no server — the tag travels inside the
+#      stash — so it keeps working when AxonRelay is down. It is what actually
+#      stops the incident.
+#   2. AxonRelay resource claims. For worktree-, ref- and remote-level damage
+#      (`reset --hard`, `clean -f`, `branch -D`, force-push) it asks the board
+#      whether another session holds the resource. Advisory data, enforced here.
+#
+# Read-only git is never blocked. Subagents legitimately need status/diff/log,
+# and a guard that got in the way of those would be switched off.
+#
+# What it does not do: it cannot make git atomic. The ownership check and the
+# mutation are two steps, so a *bare* `git stash push` from a writer that
+# bypasses gitsafe, landing in the microseconds between them, can still shift
+# the stack under us. We narrow that as far as git allows — apply by commit id,
+# drop only after re-verifying the entry's id — and accept the residue: writers
+# that use gitsafe are excluded by the claim, and the object is recoverable
+# from the object store even if the wrong reflog entry is dropped.
+#
+# Usage:
+#   gitsafe git <args...>      explicit
+#   git() { gitsafe git "$@"; }   as a shell function, so plain `git` is guarded
+#
+# Environment:
+#   AXONRELAY_URL         backend base URL (e.g. http://host.tailnet.ts.net:8000)
+#   AXONRELAY_SESSION_ID  this session's id from register_session, if registered
+#   GITSAFE_ALLOW_UNSAFE  set to 1 for one command to bypass (recorded on stderr)
+
+set -euo pipefail
+
+AXONRELAY_URL="${AXONRELAY_URL:-}"
+SESSION_ID="${AXONRELAY_SESSION_ID:-}"
+TAG_PREFIX="[axonrelay:"
+
+# git's own global options (`git -C dir stash pop`, `git --git-dir=x reset`)
+# come *before* the subcommand. They are collected here and replayed on every
+# internal git call, so identity and the guarded command see the same repo.
+GLOBAL_OPTS=()
+
+die() { printf 'gitsafe: %s\n' "$*" >&2; exit 1; }
+note() { printf 'gitsafe: %s\n' "$*" >&2; }
+
+real_git() { command git ${GLOBAL_OPTS[@]+"${GLOBAL_OPTS[@]}"} "$@"; }
+
+# --- identity ---------------------------------------------------------------
+
+clone_path() { real_git rev-parse --show-toplevel 2>/dev/null || pwd; }
+
+# "owner/name" from a remote URL, for the remote guard: every clone of a repo
+# pushes to the same remote refs, so the *repo* is the identity there, not the
+# checkout. Empty when the URL cannot be parsed - the server then treats an
+# unregistered caller conservatively.
+repo_from_url() { # $1 = url
+  local url="$1"
+  url="${url%/}"; url="${url%.git}"
+  case "$url" in
+    *://*) url="${url#*://}"; url="${url#*@}"; url="${url#*/}" ;;   # https://host/owner/name
+    *:*)   url="${url#*:}" ;;                                       # git@host:owner/name
+    /*|.*) return 0 ;;                                              # a local path: no shared identity
+  esac
+  case "$url" in */*) printf '%s' "${url%/*}/${url##*/}" ;; esac
+}
+
+# Where `git push <args>` will actually land. The destination is the first
+# positional argument (a remote name or a URL), or `--repo=<x>`, or - when
+# nothing is named - the remote git itself would pick (branch.<b>.pushRemote,
+# remote.pushDefault, branch.<b>.remote, then origin). Guarding `origin` when
+# the push goes to `upstream` or to a URL would miss the claim on the
+# destination. Prints owner/name, or nothing when it cannot be determined.
+push_destination_repo() {
+  local a dest="" expect=0 skip=0 branch
+  for a in "$@"; do
+    if [ $expect -eq 1 ]; then dest="$a"; break; fi
+    if [ $skip -eq 1 ]; then skip=0; continue; fi
+    case "$a" in
+      --) ;;
+      --rep*=*) dest="${a#*=}"; break ;;
+      -*)
+        # Options that take their value as the NEXT argument must be consumed,
+        # or `push -o ci.skip upstream main` would take `ci.skip` for the
+        # destination. `--x=value` forms carry their value and need nothing.
+        if [ "${a%%=*}" = "$a" ]; then
+          if long_opt_in "$a" --repo; then expect=1
+          elif long_opt_in "$a" --push-option --receive-pack --exec; then skip=1
+          fi
+          case "$a" in -o|-[!-]*o) skip=1 ;; esac   # -o <opt>, also as the tail of a cluster (-fo)
+        fi ;;
+      *) dest="$a"; break ;;
+    esac
+  done
+  if [ -z "$dest" ]; then
+    branch=$(real_git symbolic-ref -q --short HEAD 2>/dev/null || true)
+    dest=$(real_git config --get "branch.$branch.pushRemote" 2>/dev/null \
+        || real_git config --get remote.pushDefault 2>/dev/null \
+        || real_git config --get "branch.$branch.remote" 2>/dev/null \
+        || printf 'origin')
+  fi
+  local url
+  if ! url=$(real_git remote get-url --push "$dest" 2>/dev/null); then
+    # Not a configured remote. git would accept a URL here; anything else is a
+    # sign we mis-parsed the command line, and guessing the destination is
+    # exactly the mistake the guard must not make. Refuse.
+    case "$dest" in
+      *://*|*:*|*/*) url="$dest" ;;
+      *) die "cannot tell where 'git push $*' will land ('$dest' is neither a remote nor a URL).
+  Name the remote explicitly, e.g. 'git push origin ...', or GITSAFE_ALLOW_UNSAFE=1." ;;
+    esac
+  fi
+  repo_from_url "$url"
+}
+
+# The tag written into a stash message. Falls back to a host+clone identity when
+# the caller never registered, so an unregistered subagent still cannot silently
+# adopt someone else's stash.
+owner_tag() {
+  if [ -n "$SESSION_ID" ]; then
+    printf '%ss%s]' "$TAG_PREFIX" "$SESSION_ID"
+  else
+    printf '%sunregistered@%s:%s]' "$TAG_PREFIX" "$(hostname -s)" "$(clone_path)"
+  fi
+}
+
+# --- AxonRelay (advisory; absence is not fatal, an error is) -----------------
+
+guard_resource() { # $1 = worktree|stash|refs|remote  [$2 = owner/name for remote]   returns 0 = allowed
+  [ -n "$AXONRELAY_URL" ] || { note "AXONRELAY_URL unset — claim check skipped (stash tags still enforced)"; return 0; }
+
+  # Who is asking (session_id) and *where the command actually runs* (host,
+  # clone_path). Both always go: a session registered in clone B running
+  # `git -C clone-A reset --hard` must be judged against A's claims, and the
+  # server does that by noticing the checkout is not the session's own.
+  local body status args=(--get --data-urlencode "resource=$1")
+  args+=(--data-urlencode "host=$(hostname -s)" --data-urlencode "clone_path=$(clone_path)")
+  [ -z "${2:-}" ] || args+=(--data-urlencode "repo=$2")
+  if [ -n "$SESSION_ID" ]; then
+    args+=(--data-urlencode "session_id=$SESSION_ID")
+  fi
+
+  # Two failure modes, treated differently. No connection at all: the board is
+  # advisory, so degrade to the stash tags and say so. A reachable server that
+  # answers with an error: something is wrong with *this* request (bad id, bad
+  # encoding, server fault), and letting a destructive command through on an
+  # error response would turn every bug into a bypass. Refuse.
+  body=$(curl -sS --max-time 5 -w '\n%{http_code}' "${args[@]}" "$AXONRELAY_URL/coordination/git/guard" 2>/dev/null) || {
+    note "AxonRelay unreachable — claim check skipped (stash tags still enforced)"
+    return 0
+  }
+  status="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  case "$status" in
+    2*) ;;
+    *)
+      note "refused: the guard endpoint answered HTTP $status for '$1' — not treating an error as permission."
+      printf '%s\n' "$body" | head -c 400 >&2; printf '\n' >&2
+      note "fix the cause, or override once with GITSAFE_ALLOW_UNSAFE=1."
+      return 1
+      ;;
+  esac
+
+  case "$body" in
+    *'"allowed":true'*|*'"allowed": true'*) return 0 ;;
+  esac
+
+  note "refused: another session holds the '$1' claim on this clone."
+  printf '%s\n' "$body" | tr ',' '\n' | grep -E '"(actor|host|clone_path|branch|focus|reason)"' >&2 || true
+  note "ask them via send_relay, or override once with GITSAFE_ALLOW_UNSAFE=1."
+  return 1
+}
+
+# --- stash ownership ---------------------------------------------------------
+
+stash_message() { # $1 = stash ref or commit id
+  real_git log -1 --format=%s "$1" 2>/dev/null || true
+}
+
+assert_stash_is_ours() { # $1 = stash ref (for messages)  $2 = its commit id
+  local msg mine
+  msg=$(stash_message "$2")
+  mine=$(owner_tag)
+
+  case "$msg" in
+    *"$mine"*) return 0 ;;
+  esac
+
+  case "$msg" in
+    *"$TAG_PREFIX"*)
+      local theirs
+      theirs=$(printf '%s' "$msg" | sed -n "s/.*\\[axonrelay:\\([^]]*\\)\\].*/\\1/p")
+      die "$1 belongs to another session ($theirs).
+  Popping it would take work that session parked and is still expecting.
+  Its message: $msg
+  If you are certain, re-run with GITSAFE_ALLOW_UNSAFE=1."
+      ;;
+    *)
+      die "$1 has no ownership tag, so it cannot be attributed to you.
+  It predates gitsafe, or was created by a bare git.
+  Its message: $msg
+  Inspect it with 'git stash show -p $1' before deciding, then
+  re-run with GITSAFE_ALLOW_UNSAFE=1 if it is yours."
+      ;;
+  esac
+}
+
+# The stash operand is whatever positional argument git would take as one -
+# `stash@{n}`, a bare `n`, or any revision such as a commit id from `stash list
+# --format=%H`. Matching on the `stash@` spelling alone would let a commit id
+# slip past the ownership check while the top entry is what gets inspected.
+# $1 = which positional (1-based) holds the stash; rest = args.
+resolve_stash_ref() {
+  local want="$1" a n=0; shift
+  for a in "$@"; do
+    case "$a" in
+      --) ;;
+      -*) ;;
+      *) n=$((n + 1)); if [ "$n" -eq "$want" ]; then printf '%s' "$a"; return; fi ;;
+    esac
+  done
+  printf 'stash@{0}'
+}
+
+is_stash_operand() { # $1 = arg, $2 = the resolved operand
+  [ "$1" = "$2" ]
+}
+
+stash_commit() { # $1 = stash operand -> commit id, or die
+  local ref="$1"
+  case "$ref" in
+    ''|*[!0-9]*) ;;
+    *) ref="stash@{$ref}" ;;   # git accepts a bare index: `git stash pop 2`
+  esac
+  real_git rev-parse -q --verify "$ref^{commit}" 2>/dev/null || die "$1 is not a stash entry."
+}
+
+# Drop the reflog entry whose commit is $1, re-verifying the index right before
+# the drop so a stack that shifted underneath us is noticed instead of dropping
+# a neighbour. Returns 1 if the entry is no longer on the stack.
+drop_stash_by_commit() {
+  local i=0 id
+  while id=$(real_git rev-parse -q --verify "stash@{$i}^{commit}" 2>/dev/null); do
+    if [ "$id" = "$1" ]; then
+      [ "$(real_git rev-parse -q --verify "stash@{$i}^{commit}" 2>/dev/null)" = "$1" ] || return 1
+      real_git stash drop -q "stash@{$i}" >/dev/null
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Replace the stash ref in an argument list with a commit id, appending the id
+# when no ref was given. Everything else (--index, -q) passes through.
+args_with_commit() { # $1 = commit; $2 = the operand as given; rest = original args
+  local commit="$1" operand="$2" a seen=0; shift 2
+  for a in "$@"; do
+    if [ $seen -eq 0 ] && is_stash_operand "$a" "$operand"; then printf '%s\n' "$commit"; seen=1; else printf '%s\n' "$a"; fi
+  done
+  [ $seen -eq 1 ] || printf '%s\n' "$commit"
+}
+
+# Split `stash push` / `stash save` arguments into (message, other args). Handles
+# `-m msg`, `-mmsg`, `--message msg`, `--message=msg`; for `save`, whose message
+# is positional, every non-option word is message text.
+STASH_MSG=""
+STASH_REST=()
+split_stash_message() { # $1 = push|save; rest = args
+  local op="$1" a expect=0 words=(); shift
+  STASH_MSG=""; STASH_REST=()
+  for a in "$@"; do
+    if [ $expect -eq 1 ]; then STASH_MSG="$a"; expect=0; continue; fi
+    case "$a" in
+      -m|--message) expect=1 ;;
+      --message=*) STASH_MSG="${a#--message=}" ;;
+      -m?*) STASH_MSG="${a#-m}" ;;
+      --) STASH_REST+=("$a") ;;
+      -*) STASH_REST+=("$a") ;;
+      *) if [ "$op" = save ]; then words+=("$a"); else STASH_REST+=("$a"); fi ;;
+    esac
+  done
+  [ $expect -eq 0 ] || die "'-m' given without a message"
+  if [ "$op" = save ] && [ ${#words[@]} -gt 0 ] && [ -z "$STASH_MSG" ]; then
+    STASH_MSG="${words[*]}"
+  fi
+}
+
+# --- command classification --------------------------------------------------
+
+# Consume git's global options ahead of the subcommand. Unknown dash-options are
+# refused rather than skipped: an option that takes a value we do not know about
+# would leave its value in the subcommand slot and the real subcommand unguarded.
+GLOBAL_CONSUMED=0
+take_global_options() { # sets GLOBAL_OPTS and GLOBAL_CONSUMED (not a subshell: the array must survive)
+  local n=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env|--exec-path|--attr-source)
+        [ $# -ge 2 ] || die "global option '$1' needs a value"
+        GLOBAL_OPTS+=("$1" "$2"); shift 2; n=$((n + 2)) ;;
+      --git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--exec-path=*|--attr-source=*|--list-cmds=*)
+        GLOBAL_OPTS+=("$1"); shift; n=$((n + 1)) ;;
+      -p|--paginate|-P|--no-pager|--bare|--no-replace-objects|--no-lazy-fetch|--no-optional-locks|--no-advice \
+      |--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs \
+      |--html-path|--man-path|--info-path|--version|--help|-h)
+        GLOBAL_OPTS+=("$1"); shift; n=$((n + 1)) ;;
+      -*) die "unrecognised global git option '$1' before the subcommand. gitsafe refuses rather than guess
+  which argument is the subcommand. Run it as 'git <subcommand> ...' or, if you must,
+  GITSAFE_ALLOW_UNSAFE=1." ;;
+      *) break ;;
+    esac
+  done
+  GLOBAL_CONSUMED=$n
+}
+
+# Per-argument matching. `$*` globbing would let `--follow-tags` match `*-f*`
+# by accident and, worse, miss `+refspec`, which is git's other force syntax.
+
+# git accepts any unambiguous prefix of a long option (`reset --har`), so an
+# exact match would let `--har` through unguarded. $1 = arg; rest = the full
+# long options that count. A `=value` suffix is ignored. Anything from `--x`
+# upward that is a prefix of one of them counts - an ambiguous prefix git would
+# reject is also counted, which errs on the guarded side.
+long_opt_in() {
+  local arg="${1%%=*}" cand; shift
+  case "$arg" in --?*) ;; *) return 1 ;; esac
+  for cand in "$@"; do
+    case "$cand" in "$arg"*) return 0 ;; esac
+  done
+  return 1
+}
+
+short_flag_in() { # $1 = arg, $2 = letters   true when $1 is a short-option cluster containing one of them
+  case "$1" in
+    -[!-]*) case "${1#-}" in *[$2]*) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+push_is_destructive() {
+  local a
+  for a in "$@"; do
+    case "$a" in +*) return 0 ;; esac   # +main:main
+    long_opt_in "$a" --force --force-with-lease --force-if-includes --delete --mirror --prune && return 0
+    short_flag_in "$a" fd && return 0   # -f, -d, -fu ...
+  done
+  return 1
+}
+
+branch_is_destructive() {
+  local a
+  for a in "$@"; do
+    long_opt_in "$a" --delete --move --force --copy && return 0
+    short_flag_in "$a" DdMmfC && return 0   # -D -d -M -m -f -C (copy over an existing branch)
+  done
+  return 1
+}
+
+tag_is_destructive() {
+  local a
+  for a in "$@"; do
+    long_opt_in "$a" --delete --force && return 0
+    short_flag_in "$a" df && return 0   # -d, -f, -fa, -am ... clusters included
+  done
+  return 1
+}
+
+reset_is_destructive() {
+  local a
+  for a in "$@"; do
+    long_opt_in "$a" --hard --merge --keep && return 0
+  done
+  return 1
+}
+
+clean_is_dry_run() {
+  local a
+  for a in "$@"; do
+    long_opt_in "$a" --dry-run && return 0
+    short_flag_in "$a" n && return 0
+  done
+  return 1
+}
+
+main() {
+  [ "${1:-}" = "git" ] || die "usage: gitsafe git <args...>"
+  shift
+  [ $# -gt 0 ] || { real_git; return; }
+
+  if [ "${GITSAFE_ALLOW_UNSAFE:-}" = "1" ]; then
+    note "BYPASS: GITSAFE_ALLOW_UNSAFE=1 — running unguarded: git $*"
+    command git "$@"
+    return
+  fi
+
+  take_global_options "$@"
+  shift "$GLOBAL_CONSUMED"
+  [ $# -gt 0 ] || { real_git; return; }
+
+  # Aliases are classified by what they expand to, not what they are called:
+  # `git -c alias.steal='stash pop' steal` or a ~/.gitconfig alias would
+  # otherwise land in the default branch unguarded. Shell aliases (`!cmd`)
+  # can run anything, so they are refused rather than guessed at.
+  local sub="$1" expansion depth=0; shift
+  while expansion=$(real_git config --get "alias.$sub" 2>/dev/null) && [ -n "$expansion" ]; do
+    case "$expansion" in
+      '!'*) die "'$sub' is a shell alias ($expansion); gitsafe cannot see what it runs.
+  Run the underlying git command directly, or GITSAFE_ALLOW_UNSAFE=1." ;;
+    esac
+    depth=$((depth + 1)); [ $depth -le 8 ] || die "alias '$sub' expands too deeply"
+    # Split the value the way git does (shell-style quoting) WITHOUT handing it
+    # to a shell: xargs honours quotes and backslashes but never expands or
+    # executes anything, so an alias value like `status); git stash clear; (`
+    # becomes inert words instead of a command.
+    local -a words=()
+    while IFS= read -r a; do words+=("$a"); done < <(printf '%s' "$expansion" | xargs -n1 printf '%s\n' 2>/dev/null) \
+      || die "alias '$sub' could not be parsed ($expansion)"
+    case "$expansion" in
+      *'$'*|*'`'*|*';'*|*'|'*|*'&'*|*'('*|*')'*|*'<'*|*'>'*)
+        die "alias '$sub' contains shell metacharacters ($expansion); refusing to interpret it." ;;
+    esac
+    [ ${#words[@]} -gt 0 ] || die "alias '$sub' is empty"
+    note "alias: $sub -> $expansion"
+    sub="${words[0]}"
+    set -- "${words[@]:1}" "$@"
+  done
+  case "$sub" in
+    stash)
+      # Consume the stash subcommand so "$@" holds only its arguments. A bare
+      # `git stash` (or `git stash -m msg`) means push, with nothing to consume.
+      local op="push"
+      case "${1:-}" in
+        pop|apply|drop|clear|push|save|list|show|branch|create|store|export|import)
+          op="$1"; shift ;;
+      esac
+      case "$op" in
+        pop|apply|drop)
+          local ref commit
+          ref=$(resolve_stash_ref 1 "$@")
+          commit=$(stash_commit "$ref")
+          assert_stash_is_ours "$ref" "$commit"
+          guard_resource stash || exit 1
+          # Work on the commit id, not the index: `stash@{0}` can mean a
+          # different entry by the time git runs if a bare writer pushed.
+          local -a rewritten=()
+          while IFS= read -r a; do rewritten+=("$a"); done < <(args_with_commit "$commit" "$ref" "$@")
+          case "$op" in
+            apply) real_git stash apply "${rewritten[@]}" ;;
+            drop)  drop_stash_by_commit "$commit" || die "$ref ($commit) is no longer on the stash stack; nothing dropped."
+                   note "dropped $ref ($commit)" ;;
+            pop)   real_git stash apply "${rewritten[@]}"
+                   drop_stash_by_commit "$commit" \
+                     || note "applied $ref but the entry ($commit) had already left the stack — nothing dropped." ;;
+          esac
+          ;;
+        branch)
+          # `stash branch <name> [<stash>]` applies and then drops the entry,
+          # so it is a pop in disguise. git only accepts a reflog ref here, so
+          # this one cannot be pinned to a commit id; re-check right before.
+          local ref commit
+          ref=$(resolve_stash_ref 2 "$@")   # stash branch <name> [<stash>]
+          commit=$(stash_commit "$ref")
+          assert_stash_is_ours "$ref" "$commit"
+          guard_resource stash || exit 1
+          [ "$(stash_commit "$ref")" = "$commit" ] || die "$ref changed underneath us; re-run."
+          real_git stash branch "$@"
+          ;;
+        clear)
+          die "'git stash clear' discards every entry in the clone, including
+  other sessions'. It is never safe here. Drop your own with
+  'gitsafe git stash drop stash@{n}'."
+          ;;
+        store|import)
+          # These put entries on the shared stack without going through `push`,
+          # so the entry would carry no ownership tag - and `store -m` only sets
+          # the reflog message, not the commit subject the tag check reads.
+          # Such an entry would be unusable through gitsafe for everyone,
+          # including its creator. Refuse rather than create an orphan.
+          die "'git stash $op' would add an entry with no ownership tag, which no
+  session could later pop through gitsafe. Use 'gitsafe git stash push' instead,
+  or GITSAFE_ALLOW_UNSAFE=1 if you really need the plumbing."
+          ;;
+        push|save)
+          guard_resource stash || exit 1
+          # Stamp the message so the entry can be attributed later. `save` is
+          # deprecated in git and takes its message positionally; normalise both
+          # onto `push -m`.
+          split_stash_message "$op" "$@"
+          real_git stash push -m "$(owner_tag) ${STASH_MSG:-wip}" ${STASH_REST[@]+"${STASH_REST[@]}"}
+          ;;
+        list|show|export)
+          real_git stash "$op" "$@"
+          ;;
+        *)
+          guard_resource stash || exit 1
+          real_git stash "$op" "$@"
+          ;;
+      esac
+      ;;
+
+    reset)
+      if reset_is_destructive "$@"; then guard_resource worktree || exit 1; fi
+      real_git reset "$@"
+      ;;
+
+    clean)
+      # Anything but a dry run can delete untracked work (and clean.requireForce
+      # may be off), so the flag list is not what decides.
+      if ! clean_is_dry_run "$@"; then guard_resource worktree || exit 1; fi
+      real_git clean "$@"
+      ;;
+
+    checkout|switch|restore)
+      # Only guarded when it would carry or clobber uncommitted work.
+      if [ -n "$(real_git status --porcelain 2>/dev/null)" ]; then
+        guard_resource worktree || exit 1
+      fi
+      real_git "$sub" "$@"
+      ;;
+
+    rebase|merge|cherry-pick|revert|am)
+      guard_resource worktree || exit 1
+      real_git "$sub" "$@"
+      ;;
+
+    branch)
+      if branch_is_destructive "$@"; then guard_resource refs || exit 1; fi
+      real_git branch "$@"
+      ;;
+
+    tag)
+      if tag_is_destructive "$@"; then guard_resource refs || exit 1; fi
+      real_git tag "$@"
+      ;;
+
+    push)
+      # The remote is shared by every clone of the repo on every host, so this
+      # is the `remote` resource, not the per-clone `refs`.
+      if push_is_destructive "$@"; then
+        local dest_repo
+        dest_repo=$(push_destination_repo "$@") || exit 1
+        guard_resource remote "$dest_repo" || exit 1
+      fi
+      real_git push "$@"
+      ;;
+
+    update-ref|symbolic-ref|reflog)
+      guard_resource refs || exit 1
+      real_git "$sub" "$@"
+      ;;
+
+    *)
+      real_git "$sub" "$@"
+      ;;
+  esac
+}
+
+main "$@"

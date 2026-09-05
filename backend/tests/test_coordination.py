@@ -197,6 +197,15 @@ class TestTerritory:
         assert forced["claim"].forced_over == [first["claim"].id]
         assert len(forced["conflicts"]) == 1
 
+        # The displaced claim is retired, so the board shows one holder and a
+        # later check by the forcing session is clean.
+        db.refresh(first["claim"])
+        assert first["claim"].status == models.ClaimStatusEnum.RELEASED
+        assert (
+            coordination.find_conflicts(db, repo=first["claim"].repo, paths=["backend/app"], exclude_session_id=bob.id)
+            == []
+        )
+
     def test_an_expired_claim_stops_blocking(self, db, alice, bob):
         result = coordination.claim_territory(db, session_id=alice.id, paths=["backend/app"])
         result["claim"].expires_at = datetime.utcnow() - timedelta(minutes=1)

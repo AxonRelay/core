@@ -22,6 +22,7 @@ re-registers into the same session and picks its state back up.
 
 from __future__ import annotations
 
+import posixpath
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -80,12 +81,58 @@ def get_or_create_actor(db: DBSession, name: str, actor_type: models.ActorTypeEn
     return actor
 
 
+def normalize_git_dir(git_dir: str | None, clone_path: str) -> str | None:
+    """Canonicalise a `git rev-parse --git-common-dir` value for comparison.
+
+    STASH and REFS conflicts are scoped by (host, git_dir), so two spellings of
+    one directory must compare equal or sibling worktrees stop contending. Git
+    itself is inconsistent here: in the main worktree `--git-common-dir` prints
+    the *relative* `.git`, in a linked worktree an absolute path. A relative
+    value is therefore resolved against `clone_path`, and both are normalised
+    (`..`, `//`, trailing slash). Symlinks cannot be resolved server-side - the
+    client should pass the result of `--path-format=absolute` through
+    `realpath` when a checkout lives behind one.
+    """
+    if not git_dir:
+        return None
+    value = git_dir.strip()
+    if not value:
+        return None
+    if not posixpath.isabs(value):
+        value = posixpath.join(clone_path, value)
+    value = posixpath.normpath(value)
+    return value or None
+
+
+def _lock_repo_workspaces(db: DBSession, repo: str) -> None:
+    """Serialise claim writers for one repo with a row lock on its workspaces.
+
+    Granting a claim is a check-then-insert: read the live claims, insert if
+    nothing contends. Two transactions can both read "free" and both insert,
+    and then two sessions each believe they hold an exclusive lease. The
+    approval ledger has the same shape and locks the task row (`crud.record_
+    approval`); here the unit of contention is the repo, so we lock every
+    workspace row of the repo, in id order so two lockers cannot deadlock on
+    each other. A workspace registered concurrently is not in our lock set,
+    but its own claim locks every pre-existing row - including ours - so the
+    two writers still serialise on a common row.
+
+    `FOR UPDATE` is a no-op on SQLite, which serialises writers globally anyway.
+    Under Postgres READ COMMITTED the conflict query that follows the lock sees
+    the rows the previous holder committed.
+    """
+    db.query(models.Workspace).filter(models.Workspace.repo == repo).order_by(
+        models.Workspace.id
+    ).with_for_update().all()
+
+
 def get_or_create_workspace(
     db: DBSession,
     host: str,
     repo: str,
     clone_path: str,
     label: str | None = None,
+    git_dir: str | None = None,
 ) -> models.Workspace:
     """Find the Workspace for this checkout, creating it on first sight.
 
@@ -93,6 +140,7 @@ def get_or_create_workspace(
     same machine are distinct workspaces, and the same clone seen again after a
     restart is the same workspace.
     """
+    git_dir = normalize_git_dir(git_dir, clone_path)
     workspace = (
         db.query(models.Workspace)
         .filter(
@@ -107,12 +155,20 @@ def get_or_create_workspace(
         workspace.last_seen_at = now
         if label:
             workspace.label = label
+        if git_dir:
+            workspace.git_dir = git_dir
         db.commit()
         db.refresh(workspace)
         return workspace
 
     workspace = models.Workspace(
-        host=host, repo=repo, clone_path=clone_path, label=label, created_at=now, last_seen_at=now
+        host=host,
+        repo=repo,
+        clone_path=clone_path,
+        git_dir=git_dir,
+        label=label,
+        created_at=now,
+        last_seen_at=now,
     )
     db.add(workspace)
     db.commit()
@@ -131,6 +187,7 @@ def register_session(
     branch: str | None = None,
     focus: str | None = None,
     label: str | None = None,
+    git_dir: str | None = None,
 ) -> models.Session:
     """Start or resume this actor's session in this workspace.
 
@@ -139,7 +196,7 @@ def register_session(
     one, so its claims and unread relays survive an agent restart.
     """
     actor = get_or_create_actor(db, actor_name, actor_type)
-    workspace = get_or_create_workspace(db, host=host, repo=repo, clone_path=clone_path, label=label)
+    workspace = get_or_create_workspace(db, host=host, repo=repo, clone_path=clone_path, label=label, git_dir=git_dir)
 
     now = datetime.utcnow()
     session = (
@@ -288,6 +345,8 @@ def find_conflicts(
     now = now or datetime.utcnow()
     conflicts: list[dict[str, Any]] = []
     for claim in live_claims(db, repo=repo, now=now):
+        if claim.resource is not None:
+            continue  # resource claims are matched by domain, not by path overlap
         if exclude_session_id is not None and claim.session_id == exclude_session_id:
             continue
         if not _conflicts_with(claim, mode):
@@ -319,6 +378,7 @@ def describe_holder(session: models.Session | None) -> dict[str, Any] | None:
         "actor": session.actor.name if session.actor else None,
         "host": workspace.host if workspace else None,
         "clone_path": workspace.clone_path if workspace else None,
+        "git_dir": workspace.git_dir if workspace else None,
         "branch": session.branch,
         "focus": session.focus,
         "stale": is_stale(session),
@@ -359,10 +419,13 @@ def claim_territory(
 
     ttl = max(1, min(int(ttl_minutes), MAX_CLAIM_TTL_MINUTES))
     now = datetime.utcnow()
+    _lock_repo_workspaces(db, repo)
     conflicts = find_conflicts(db, repo=repo, paths=normalized, mode=mode, exclude_session_id=session_id, now=now)
 
     if conflicts and not force:
         return {"granted": False, "claim": None, "conflicts": conflicts}
+    if conflicts:
+        _release_overridden(db, conflicts, now)
 
     claim = models.Claim(
         session_id=session_id,
@@ -381,6 +444,25 @@ def claim_territory(
     return {"granted": True, "claim": claim, "conflicts": conflicts}
 
 
+def _release_overridden(db: DBSession, conflicts: list[dict[str, Any]], now: datetime) -> None:
+    """Retire the claims a forced claim displaces.
+
+    A force is a statement that the new holder owns the resource *now*. Leaving
+    the displaced claims HELD would contradict that: the guard would keep
+    refusing the very session that just forced its way in, and the board would
+    show two exclusive holders. The displaced claims are transitioned to
+    RELEASED (never deleted) and the new claim's ``forced_over`` records which
+    ones, so the override stays visible to the session it displaced.
+    """
+    ids = [c["claim_id"] for c in conflicts]
+    if not ids:
+        return
+    for claim in db.query(models.Claim).filter(models.Claim.id.in_(ids)).all():
+        if claim.status == models.ClaimStatusEnum.HELD:
+            claim.status = models.ClaimStatusEnum.RELEASED
+            claim.released_at = now
+
+
 def _normalize_paths(paths: list[str]) -> list[str]:
     """Canonicalize and de-duplicate a claim's path patterns, order preserved."""
     if not paths:
@@ -391,6 +473,293 @@ def _normalize_paths(paths: list[str]) -> list[str]:
         if norm not in seen:
             seen.append(norm)
     return seen
+
+
+# =============================================================================
+# Git resources: the shared singletons a path claim cannot describe
+# =============================================================================
+#
+# A checkout has exactly one working tree, one index, one HEAD, one stash stack.
+# `git stash pop` names no path at all, so no path claim can guard it - which is
+# how one session ends up applying another's parked work. These claims cover
+# that, and each resource carries its own sharing boundary (see
+# models.ClaimResourceEnum).
+
+
+def _shares_git_dir(a: models.Workspace | None, b: models.Workspace | None) -> bool:
+    """Do two workspaces share one `.git` (and therefore one stash stack)?
+
+    Same host and same `git_dir` means sibling worktrees of one clone. When
+    either `git_dir` is unknown we fall back to (host, repo), which over-reports
+    rather than missing a collision - the same bias as path overlap.
+    """
+    if a is None or b is None:
+        return False
+    if a.id == b.id:
+        return True
+    if a.host != b.host:
+        return False
+    if a.git_dir and b.git_dir:
+        return a.git_dir == b.git_dir
+    return a.repo == b.repo
+
+
+def _resource_domains_overlap(
+    resource: models.ClaimResourceEnum,
+    a: models.Workspace | None,
+    b: models.Workspace | None,
+) -> bool:
+    """Whether two workspaces contend for `resource`.
+
+    WORKTREE is per checkout; STASH and REFS are per clone and therefore reach
+    across sibling worktrees; REMOTE is per repo, because every clone on every
+    host pushes to the same remote refs.
+    """
+    if a is None or b is None:
+        return False
+    if resource == models.ClaimResourceEnum.WORKTREE:
+        return a.id == b.id
+    if resource == models.ClaimResourceEnum.REMOTE:
+        return a.repo == b.repo
+    return _shares_git_dir(a, b)
+
+
+def find_resource_conflicts(
+    db: DBSession,
+    *,
+    session_id: int,
+    resource: models.ClaimResourceEnum,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Live claims on `resource` held by other sessions that contend with this one."""
+    now = now or datetime.utcnow()
+    session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if not session:
+        raise ValueError(f"Session {session_id} not found")
+
+    held = (
+        db.query(models.Claim)
+        .filter(
+            models.Claim.status == models.ClaimStatusEnum.HELD,
+            models.Claim.expires_at > now,
+            models.Claim.resource == resource,
+            models.Claim.session_id != session_id,
+        )
+        .order_by(models.Claim.created_at.asc())
+        .all()
+    )
+
+    conflicts = []
+    for claim in held:
+        other = claim.session.workspace if claim.session else None
+        if not _resource_domains_overlap(resource, session.workspace, other):
+            continue
+        conflicts.append(
+            {
+                "claim_id": claim.id,
+                "session_id": claim.session_id,
+                "resource": str(claim.resource),
+                "mode": str(claim.mode),
+                "reason": claim.reason,
+                "expires_at": claim.expires_at.isoformat(),
+                "holder": describe_holder(claim.session),
+            }
+        )
+    return conflicts
+
+
+def claim_resource(
+    db: DBSession,
+    *,
+    session_id: int,
+    resource: models.ClaimResourceEnum,
+    reason: str | None = None,
+    ttl_minutes: int = DEFAULT_CLAIM_TTL_MINUTES,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Take an exclusive lease on a shared git resource.
+
+    Always exclusive: there is no useful "shared read" of a stash stack you are
+    about to mutate. Refused on conflict unless ``force``, like a path claim.
+    Writers for one repo are serialised by a row lock (`_lock_repo_workspaces`)
+    so two sessions cannot both be granted the same singleton.
+    """
+    session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if not session:
+        raise ValueError(f"Session {session_id} not found")
+    if session.status != models.SessionStatusEnum.ACTIVE:
+        raise ValueError(f"Session {session_id} is not active")
+
+    ttl = max(1, min(int(ttl_minutes), MAX_CLAIM_TTL_MINUTES))
+    now = datetime.utcnow()
+    if session.workspace:
+        _lock_repo_workspaces(db, session.workspace.repo)
+    conflicts = find_resource_conflicts(db, session_id=session_id, resource=resource, now=now)
+
+    if conflicts and not force:
+        return {"granted": False, "claim": None, "conflicts": conflicts}
+    if conflicts:
+        _release_overridden(db, conflicts, now)
+
+    claim = models.Claim(
+        session_id=session_id,
+        repo=session.workspace.repo if session.workspace else "",
+        paths=[],
+        resource=resource,
+        mode=models.ClaimModeEnum.EXCLUSIVE,
+        reason=reason,
+        status=models.ClaimStatusEnum.HELD,
+        forced_over=[c["claim_id"] for c in conflicts] or None,
+        created_at=now,
+        expires_at=now + timedelta(minutes=ttl),
+    )
+    db.add(claim)
+    db.commit()
+    db.refresh(claim)
+    return {"granted": True, "claim": claim, "conflicts": conflicts}
+
+
+def guard_git_operation(
+    db: DBSession,
+    *,
+    session_id: int,
+    resource: models.ClaimResourceEnum,
+    host: str | None = None,
+    clone_path: str | None = None,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """Answer "may this session touch `resource` right now?" for the git wrapper.
+
+    Read-only and side-effect free: it reports who is in the way, and the caller
+    (`tools/gitsafe`) decides. A session that holds the claim itself is allowed;
+    so is one where nobody holds it, because claiming is advisory and we do not
+    want the guard to block work that was never coordinated.
+
+    A session id says who is asking, not where. `git -C other-clone reset
+    --hard` run with a session registered elsewhere would otherwise be judged
+    against the wrong workspace's claims. When the wrapper reports where the
+    command actually runs (``host``, ``clone_path``) and that is not the
+    session's own checkout, the caller is treated as an *unregistered* actor in
+    that checkout - refused whenever anyone holds the resource there.
+    """
+    session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if not session:
+        raise ValueError(f"Session {session_id} not found")
+
+    if host and clone_path:
+        workspace = session.workspace
+        if workspace is None or workspace.host != host or workspace.clone_path != clone_path:
+            result = guard_unregistered_caller(db, host=host, clone_path=clone_path, resource=resource, repo=repo)
+            result["session_id"] = session_id
+            result["caller"]["session_workspace_mismatch"] = True
+            return result
+
+    # A push can land on a repo other than the one this session registered for
+    # (`git push upstream --force`, a URL, `--repo=`). The remote's identity is
+    # the *destination*, so when the wrapper names one that is not the
+    # session's repo, judge the push against claims on that repo - where this
+    # session, whatever it holds here, is a stranger.
+    if resource == models.ClaimResourceEnum.REMOTE and repo and session.workspace and repo != session.workspace.repo:
+        result = guard_unregistered_caller(
+            db,
+            host=host or session.workspace.host,
+            clone_path=clone_path or session.workspace.clone_path,
+            resource=resource,
+            repo=repo,
+        )
+        result["session_id"] = session_id
+        result["caller"]["destination_repo_mismatch"] = True
+        return result
+
+    conflicts = find_resource_conflicts(db, session_id=session_id, resource=resource)
+    return {
+        "allowed": not conflicts,
+        "resource": str(resource),
+        "session_id": session_id,
+        "conflicts": conflicts,
+    }
+
+
+def guard_unregistered_caller(
+    db: DBSession,
+    *,
+    host: str,
+    clone_path: str,
+    resource: models.ClaimResourceEnum,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """Whether an *unregistered* caller may touch `resource` in this checkout.
+
+    This is the subagent case: a process spawned inside someone's working
+    directory that never registered a session, and so cannot be the holder of
+    any claim. It is located by (host, clone_path) rather than by session, and
+    is refused whenever **anyone** holds the resource in a contending domain -
+    including the session that owns the very clone it is running in, which is
+    the point: the parent claimed the worktree precisely so that nothing else
+    would disturb it.
+
+    When nobody holds the resource it is allowed through. Claims are advisory,
+    and a guard that blocked all uncoordinated work would simply be turned off.
+
+    For REMOTE the checkout does not matter - the remote is shared by every
+    clone of the repo - so an unknown workspace contends with every REMOTE claim
+    on ``repo`` when the wrapper could name it, and with every REMOTE claim at
+    all when it could not.
+    """
+    now = datetime.utcnow()
+    workspace = (
+        db.query(models.Workspace)
+        .filter(models.Workspace.host == host, models.Workspace.clone_path == clone_path)
+        .first()
+    )
+
+    held = (
+        db.query(models.Claim)
+        .filter(
+            models.Claim.status == models.ClaimStatusEnum.HELD,
+            models.Claim.expires_at > now,
+            models.Claim.resource == resource,
+        )
+        .order_by(models.Claim.created_at.asc())
+        .all()
+    )
+
+    conflicts = []
+    for claim in held:
+        other = claim.session.workspace if claim.session else None
+        if resource == models.ClaimResourceEnum.REMOTE:
+            # The remote is shared by every clone; only the destination repo
+            # matters. Prefer the repo the wrapper named (the push target),
+            # then the caller's own registered repo; with neither, no claim
+            # can be proven to be about a different remote.
+            target = repo or (workspace.repo if workspace else None)
+            if other is None or (target and other.repo != target):
+                continue
+        elif workspace is None:
+            # An unknown workspace (this clone has never registered) still
+            # contends with a same-host claim: we cannot prove it is a
+            # different checkout.
+            if other is None or other.host != host:
+                continue
+        elif not _resource_domains_overlap(resource, workspace, other):
+            continue
+        conflicts.append(
+            {
+                "claim_id": claim.id,
+                "session_id": claim.session_id,
+                "resource": str(claim.resource),
+                "reason": claim.reason,
+                "expires_at": claim.expires_at.isoformat(),
+                "holder": describe_holder(claim.session),
+            }
+        )
+
+    return {
+        "allowed": not conflicts,
+        "resource": str(resource),
+        "caller": {"host": host, "clone_path": clone_path, "repo": repo, "registered": workspace is not None},
+        "conflicts": conflicts,
+    }
 
 
 def release_claim(db: DBSession, claim_id: int) -> models.Claim | None:
@@ -631,6 +1000,7 @@ def board(db: DBSession, *, repo: str | None = None) -> dict[str, Any]:
                 "claim_id": c.id,
                 "repo": c.repo,
                 "paths": list(c.paths or []),
+                "resource": str(c.resource) if c.resource else None,
                 "mode": str(c.mode),
                 "reason": c.reason,
                 "expires_at": c.expires_at.isoformat(),

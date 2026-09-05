@@ -49,7 +49,7 @@ AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（inte
         MCP（ローカルは stdio / Tailscale・Tunnel 経由の Streamable HTTP）
                               ▼
               AxonRelay Backend（FastAPI + MCP サーバ同居）
-                 │   - MCP : 24 tools + 3 resources（メインインターフェース）
+                 │   - MCP : 26 tools + 3 resources（メインインターフェース）
                  │   - REST: /tasks /agents /coordination（読み取り中心）
                  │   - Postgres: 台帳 ＋ 調整ボード
                  │
@@ -100,7 +100,7 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 |-------|------|
 | `Workspace` | 1 台のマシン上の、1 リポジトリの、1 clone。同一性は `(host, repo, clone_path)`。同じ repo の 2 つの clone は別の Workspace。 |
 | `Session` | ある Actor が、ある Workspace で作業している期間。claim を持ち relay を受け取る単位。再登録で同じセッションを再開するので、エージェントが落ちても失われない。 |
-| `Claim` | repo 内のパスに対する**助言的で期限付き**のリース。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
+| `Claim` | **助言的で期限付き**のリース。repo 内のパス、またはパスで表現できない共有 git 資源（`worktree` / `stash` / `refs` / `remote`）に対して取る。重なる claim は既定で拒否（`force` で上書き可、上書きは記録される）。 |
 | `Relay` | 「観客」宛の永続メッセージ — 特定 Actor / 特定 clone / 特定 repo / 全体。pull で配信。 |
 | `RelayReceipt` | 受信者ごとの既読・ack 状態。1 人が ack してもブロードキャストが他の全員から消えない。 |
 
@@ -118,9 +118,15 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 （MCP elicitation による対話的承認）, `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`。
 
-**調整系 10 tools**: `register_session`, `heartbeat_session`, `end_session`,
+**調整系 12 tools**: `register_session`, `heartbeat_session`, `end_session`,
 `get_board`, `check_conflicts`, `claim_territory`, `release_territory`,
-`send_relay`, `read_inbox`, `ack_relay`。
+`claim_git_resource`, `check_git_resource`, `send_relay`, `read_inbox`, `ack_relay`。
+
+`refs/stash` はリポジトリ単位の ref なので、**兄弟 worktree が1つの stash スタックを共有する** —
+片方の `git stash pop` が、もう片方が退避した作業を奪える。守るべきパスが存在しない。
+[`tools/gitsafe`](tools/gitsafe) が機械的に止める: stash に所有セッションのタグを刻み
+（オフラインでも機能）、破壊的 git の前にボードへ照会する。詳細は
+[coordination-spec.md §4.3–4.4](docs/coordination-spec.md)。
 
 **3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
 `axonrelay://tasks/{id}/drafts/{version}`。
@@ -159,7 +165,7 @@ docker compose up -d postgres # Postgres のみ。runtime は Platform 側
 
 # backend（venv 推奨）
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # migration 006 まで適用・"self" Actor を seed
+cd backend && alembic upgrade head   # migration 008 まで適用・"self" Actor を seed
 
 # IDE 用に MCP サーバを起動
 python -m app.mcp.server                      # stdio — 1 台構成
@@ -203,12 +209,12 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（24 tools / 3 resources）、LangGraph Platform クライアント、migration 006 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（26 tools / 3 resources）、LangGraph Platform クライアント、migration 008 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
 - 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋**[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)** に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。**調整ボードを実際に使うには同ドキュメント §3（Tailscale + 共有 MCP エンドポイント）が必要** — コードは入っているが、まだどこでも稼働していない。
-- 🚧 **Tests**: SQLite 107 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳を競合させる Postgres スキーマ整合 16 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
+- 🚧 **Tests**: SQLite 156 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・git 資源 claim・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳と資源 claim を競合させる Postgres スキーマ整合 18 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
 
 ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。調整レイヤーの設計: [docs/coordination-spec.md](docs/coordination-spec.md)。
 

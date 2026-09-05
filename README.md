@@ -54,7 +54,7 @@ preserves and dogfoods.
            MCP (stdio locally · Streamable HTTP over Tailscale/Tunnel)
                               ▼
               AxonRelay Backend (FastAPI + MCP server, co-located)
-                 │   - MCP: 24 tools + 3 resources  (primary interface)
+                 │   - MCP: 26 tools + 3 resources  (primary interface)
                  │   - REST: /tasks /agents /coordination  (read-heavy)
                  │   - Postgres: the ledger + the coordination board
                  │
@@ -106,7 +106,7 @@ its hash chain.
 |-------|---------|
 | `Workspace` | One checkout of one repo on one machine, identified by `(host, repo, clone_path)`. Two clones of the same repo are two workspaces. |
 | `Session` | An Actor working inside a Workspace over a stretch of time. Holds claims, receives relays. Re-registering resumes it, so an agent restart loses nothing. |
-| `Claim` | An **advisory, expiring** lease on paths within a repo. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
+| `Claim` | An **advisory, expiring** lease — on paths within a repo, or on a shared git resource (`worktree` / `stash` / `refs` / `remote`) that no path pattern can describe. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
 | `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. |
 | `RelayReceipt` | Per-recipient read/ack state, so one peer acking a broadcast does not hide it from the others. |
 
@@ -124,9 +124,16 @@ Design, semantics, and the per-turn protocol agents follow:
 (interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
 
-**Coordination — 10 tools**: `register_session`, `heartbeat_session`,
+**Coordination — 12 tools**: `register_session`, `heartbeat_session`,
 `end_session`, `get_board`, `check_conflicts`, `claim_territory`,
-`release_territory`, `send_relay`, `read_inbox`, `ack_relay`.
+`release_territory`, `claim_git_resource`, `check_git_resource`, `send_relay`,
+`read_inbox`, `ack_relay`.
+
+`refs/stash` is a per-repository ref, so sibling git worktrees share one stash
+stack and `git stash pop` in one can consume work parked in another — with no
+path to guard. [`tools/gitsafe`](tools/gitsafe) enforces the guard mechanically:
+it tags stashes with their owning session (which works offline) and consults the
+board before destructive git.
 
 **3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
 `axonrelay://tasks/{id}/drafts/{version}`.
@@ -166,7 +173,7 @@ docker compose up -d postgres # Postgres only; runtime is on Platform
 
 # backend (venv recommended)
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # applies migrations through 006; seeds the "self" Actor
+cd backend && alembic upgrade head   # applies migrations through 008; seeds the "self" Actor
 
 # run the MCP server for the IDE
 python -m app.mcp.server                      # stdio — one machine
@@ -210,12 +217,12 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (24 tools / 3 resources), LangGraph Platform client, migrations through 006. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (26 tools / 3 resources), LangGraph Platform client, migrations through 008. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
 - 🚧 **Infra**: legacy `infra/` (AWS EC2 DNS) and `Caddyfile` removed. The cutover to Cloudflare Tunnel + Tailscale + Vercel/Pages is templated and documented in [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md); the account-side steps (DNS switch, EC2 decommission) remain a manual operator action.
-- 🚧 **Tests**: 107 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, the MCP tool surface) plus 16 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
+- 🚧 **Tests**: 156 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, the MCP tool surface) plus 18 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and on resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
 
 Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md). Coordination design: [docs/coordination-spec.md](docs/coordination-spec.md).
 

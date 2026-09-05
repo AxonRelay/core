@@ -421,6 +421,7 @@ def register_session(
     branch: str | None = None,
     focus: str | None = None,
     actor_type: str = "ai",
+    git_dir: str | None = None,
 ) -> dict:
     """Join the coordination board. Call this once at the start of a work session.
 
@@ -432,6 +433,10 @@ def register_session(
     `repo` must be the canonical remote identity (e.g. "AxonRelay/core") so that
     sibling clones of the same repository recognise each other; `clone_path` is
     the absolute path of *this* checkout, which is what distinguishes them.
+
+    Pass `git_dir` (`git rev-parse --git-common-dir`, absolute) so stash
+    collisions can be detected: sibling git worktrees have different clone_paths
+    but share one stash stack, and only the git dir identifies that.
     """
     resolved_type = models.ActorTypeEnum(actor_type)
     with _session() as db:
@@ -444,6 +449,7 @@ def register_session(
             clone_path=clone_path,
             branch=branch,
             focus=focus,
+            git_dir=git_dir,
         )
         return session_to_dict(session)
 
@@ -681,6 +687,58 @@ def draft_resource(task_id: int, version: int) -> str:
             if d.version == int(version):
                 return d.content
         raise ValueError(f"Task {task_id} has no draft v{version}")
+
+
+@mcp.tool()
+def claim_git_resource(
+    session_id: int,
+    resource: str,
+    reason: str | None = None,
+    ttl_minutes: int = 60,
+    force: bool = False,
+) -> dict:
+    """Claim a shared git resource that no path pattern can describe.
+
+    A checkout has exactly one working tree, index, HEAD and stash stack, and
+    `git stash pop` names no path — so a path claim cannot protect them. Take
+    one of these before a destructive git operation:
+
+      "worktree" — `reset --hard`, `clean -fd`, checking out over a dirty tree.
+                   Contends only with sessions in the *same* clone.
+      "stash"    — any `git stash` operation. **Contends across sibling git
+                   worktrees of the same clone**, because `refs/stash` is a
+                   per-repository ref: a second worktree does not give you a
+                   second stash stack.
+      "refs"     — deleting or moving local branches and tags. Also per-clone.
+      "remote"   — force-push, `+refspec`, `push --delete`. **Contends across
+                   every clone of the repo on every host**: they all push to
+                   the same remote refs.
+
+    Always exclusive, refused on conflict unless force=true, and expiring like a
+    path claim.
+    """
+    resolved = models.ClaimResourceEnum(resource)
+    with _session() as db:
+        result = coordination.claim_resource(
+            db, session_id=session_id, resource=resolved, reason=reason, ttl_minutes=ttl_minutes, force=force
+        )
+        return {
+            "granted": result["granted"],
+            "claim": claim_to_dict(result["claim"]) if result["claim"] else None,
+            "conflicts": result["conflicts"],
+        }
+
+
+@mcp.tool()
+def check_git_resource(session_id: int, resource: str) -> dict:
+    """Ask whether a git resource is free for this session, without claiming it.
+
+    This is what `tools/gitsafe` consults before letting a destructive git
+    command through. Read-only.
+    """
+    resolved = models.ClaimResourceEnum(resource)
+    with _session() as db:
+        return coordination.guard_git_operation(db, session_id=session_id, resource=resolved)
 
 
 @mcp.resource("axonrelay://board")

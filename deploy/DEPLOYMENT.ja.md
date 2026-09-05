@@ -41,18 +41,18 @@ Cloudflare Tunnel はダッシュボードと公開 API のためのもので、
 ```bash
 cp .env.example .env          # DATABASE_URL / LANGGRAPH_* / ANTHROPIC_API_KEY を記入
 docker compose up -d postgres backend
-docker compose exec backend alembic upgrade head   # 001..007 を適用
+docker compose exec backend alembic upgrade head   # 001..008 を適用
 ```
 
-**`alembic upgrade head` は必ず `007` まで到達させること。**
+**`alembic upgrade head` は必ず `008` まで到達させること。**
 migration 002 と 007 は「新規 Postgres にチェーンが適用できない」問題と
 「enum ラベルの大小不一致で Actor の insert が全て失敗する」問題を直しています。
-007 に届いていないと `register_session` が失敗し、調整ボードに参加できません。
+007 に届いていないと `register_session` が失敗し、調整ボードに参加できません。008 は git 資源 claim（§3.6）用の列を追加します。
 
 確認:
 
 ```bash
-docker compose exec backend alembic current    # -> 007 (head)
+docker compose exec backend alembic current    # -> 008 (head)
 curl -s http://localhost:8000/ | head -c 200   # -> ヘルスチェック JSON
 ```
 
@@ -223,6 +223,45 @@ EOF
 
 1台だけで使う場合は stdio のままで、ネットワーク設定は一切不要です:
 `python -m app.mcp.server`
+
+### 3.6 共有 clone を守る（gitsafe）
+
+1つの clone、またはその sibling worktree で複数のエージェントが作業するなら、
+[`tools/gitsafe`](../tools/gitsafe) を PATH に置きます。
+
+**理由:** `refs/stash` はリポジトリ単位の ref なので、`git worktree add` しても
+stash スタックは増えません。ある worktree での `git stash pop` が別 worktree で
+退避した作業を消費し、しかも `git stash pop` はパスを1つも指名しないため、
+パス claim では守れません。
+
+```bash
+export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"
+export AXONRELAY_SESSION_ID="<register_session が返した id>"
+git() { /path/to/core/tools/gitsafe git "$@"; }
+```
+
+session を登録するときは、sibling worktree が同じ stash スタックを共有していると
+認識できるように、clone の git dir を渡します:
+
+```bash
+git rev-parse --path-format=absolute --git-common-dir    # -> register_session(git_dir=...)
+```
+
+サーバは相対の `.git` を `clone_path` 基準で解決して正規化します。checkout が
+symlink 配下にある場合は値を `realpath` に通してください。
+
+読み取り系の git は常に素通しです。`stash push` はメッセージに `[axonrelay:s<id>]`
+を刻み、`pop` / `apply` / `drop` / `branch` は他人のタグが付いた entry を拒否し、
+`stash clear` / `stash store` は常に拒否します。`reset --hard`、`clean`（dry-run 以外）、
+dirty な `checkout`、`rebase`、`branch -D`（clone 単位の `refs` 資源）、
+`push --force` / `+refspec` / `push --delete`（repo 全体の `remote` 資源。`origin`
+ではなく push の実際の着地先で判定）はボードに照会します。git alias は展開結果で
+分類し、`-C` などのグローバルオプションも扱います。
+
+stash タグの検査はネットワーク無しで機能する（タグは stash メッセージの中にある）ので、
+AxonRelay に到達できないときもこの層は残ります。到達できない場合はこの層に縮退し、
+到達できたがエラー応答の場合はエラーを許可と見なさず拒否します。
+`GITSAFE_ALLOW_UNSAFE=1` で1回だけ迂回でき、stderr に記録されます。
 
 ---
 

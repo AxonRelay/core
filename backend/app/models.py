@@ -232,6 +232,33 @@ class ClaimModeEnum(enum.StrEnum):
     SHARED = "shared"
 
 
+class ClaimResourceEnum(enum.StrEnum):
+    """A git resource that is shared and cannot be split by path.
+
+    Path claims cover "who edits which files". These cover the mutable
+    singletons a git checkout has exactly one of, which no path pattern can
+    describe - and whose sharing boundaries differ:
+
+    WORKTREE  the working tree, index and HEAD of one checkout. Shared by every
+              session in the same Workspace.
+    STASH     the stash stack. ``refs/stash`` is a per-repository ref, so it is
+              shared by **every git worktree of the same clone** - checking out
+              a second worktree does not give you a second stash. This is what
+              lets one session pop another session's parked work.
+    REFS      local branches and tags. Also per-repository, so a branch deletion
+              or a branch move is visible to every worktree of that clone.
+    REMOTE    the refs on the shared remote. A force-push, `+refspec` or
+              `push --delete` lands on the *same* remote from every clone on
+              every host, so this contends across the whole repo - the one
+              resource whose boundary is neither the checkout nor the clone.
+    """
+
+    WORKTREE = "worktree"
+    STASH = "stash"
+    REFS = "refs"
+    REMOTE = "remote"
+
+
 class ClaimStatusEnum(enum.StrEnum):
     """Territory claim state. Rows are never deleted, only transitioned.
 
@@ -270,6 +297,14 @@ class Workspace(Base):
     host = Column(String(255), nullable=False, index=True)
     repo = Column(String(255), nullable=False, index=True)
     clone_path = Column(String(1000), nullable=False)
+
+    # `git rev-parse --git-common-dir`, absolute. Sibling worktrees of one clone
+    # share this while having different clone_paths, and that is exactly the set
+    # that shares a stash stack - so STASH conflicts are scoped by (host,
+    # git_dir), not by repo (too wide: separate clones are independent) and not
+    # by workspace (too narrow: it would miss the sibling-worktree collision).
+    git_dir = Column(String(1000), index=True)
+
     label = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -306,7 +341,7 @@ class Session(Base):
 
 
 class Claim(Base):
-    """An advisory, expiring lease on part of a repository.
+    """An advisory, expiring lease on part of a repository, or on a git resource.
 
     Advisory: holding one does not stop anyone writing. It makes the collision
     *visible* before it happens, which is what a fleet of semi-autonomous agents
@@ -320,7 +355,12 @@ class Claim(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     repo = Column(String(255), nullable=False, index=True)
-    paths = Column(JSON, nullable=False)
+
+    # Exactly one of these describes what is claimed: `paths` for a file-scoped
+    # claim, `resource` for one of the shared git singletons above.
+    paths = Column(JSON, nullable=False, default=list)
+    resource = Column(Enum(ClaimResourceEnum), index=True)
+
     mode = Column(Enum(ClaimModeEnum), nullable=False, default=ClaimModeEnum.EXCLUSIVE)
     reason = Column(Text)
     status = Column(Enum(ClaimStatusEnum), nullable=False, default=ClaimStatusEnum.HELD, index=True)
