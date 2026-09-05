@@ -162,7 +162,7 @@ gitsafe git stash push -m "wip"
 
 `pop` / `apply` / `drop` は、タグが自分のものでなければ拒否する。タグは stash メッセージの中にあるので、**AxonRelay が落ちていてもネットワークが無くても機能する。** 今回の事故はこの層だけでほぼ消える。
 
-`stash clear` は clone 内の全 entry を消すため、常に拒否する。
+`stash clear` は clone 内の全 entry を消すため、常に拒否する。`stash store` / `stash import` は所有者タグのない entry をスタックに載せる（`store -m` は reflog メッセージにしか効かず、タグ検査が読む commit subject には入らない）ため、誰も gitsafe 経由で pop できない孤児を作らないよう拒否する。
 
 **② AxonRelay の資源 claim**
 
@@ -172,7 +172,7 @@ gitsafe git stash push -m "wip"
 
 `git -C <dir> stash pop` のような git グローバルオプションはサブコマンドの前で消費し、内部の git 呼び出し全てに引き継ぐ。未知のグローバルオプションはどれがサブコマンドか推測せず拒否する（値を取るオプションを知らずに飛ばすと、本物のサブコマンドが無防備で通る）。
 
-git alias は**展開結果で分類する**（`git -c alias.steal='stash pop' steal` や `~/.gitconfig` の alias が既定分岐に落ちないように）。`!` で始まるシェル alias は何を実行するか見えないので拒否する。
+git alias は**展開結果で分類する**（`git -c alias.steal='stash pop' steal` や `~/.gitconfig` の alias が既定分岐に落ちないように）。展開値の分割は `eval` ではなく `xargs` で行い（クォートは解釈するが実行も展開もしない）、シェルメタ文字（`$` `` ` `` `;` `|` `&` `()` `<>`）を含む値と `!` で始まるシェル alias は拒否する。
 
 guard への照会には `session_id` に加えて**コマンドが実際に走る場所**（`host`, `clone_path`）を常に送る。session_id は「誰が」を示すだけで「どこで」は示さない — clone B に登録した session が `git -C clone-A reset --hard` を打った場合、サーバは checkout が session の workspace と一致しないことを検出し、その clone における**未登録の呼び出し元**として判定する（誰かが握っていれば拒否）。
 

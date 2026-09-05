@@ -344,11 +344,17 @@ main() {
   Run the underlying git command directly, or GITSAFE_ALLOW_UNSAFE=1." ;;
     esac
     depth=$((depth + 1)); [ $depth -le 8 ] || die "alias '$sub' expands too deeply"
-    case "$expansion" in
-      *'$'*|*'`'*) die "alias '$sub' contains shell expansion characters ($expansion); refusing to interpret it." ;;
-    esac
+    # Split the value the way git does (shell-style quoting) WITHOUT handing it
+    # to a shell: xargs honours quotes and backslashes but never expands or
+    # executes anything, so an alias value like `status); git stash clear; (`
+    # becomes inert words instead of a command.
     local -a words=()
-    eval "words=($expansion)"   # git splits alias values with shell quoting rules too
+    while IFS= read -r a; do words+=("$a"); done < <(printf '%s' "$expansion" | xargs -n1 printf '%s\n' 2>/dev/null) \
+      || die "alias '$sub' could not be parsed ($expansion)"
+    case "$expansion" in
+      *'$'*|*'`'*|*';'*|*'|'*|*'&'*|*'('*|*')'*|*'<'*|*'>'*)
+        die "alias '$sub' contains shell metacharacters ($expansion); refusing to interpret it." ;;
+    esac
     [ ${#words[@]} -gt 0 ] || die "alias '$sub' is empty"
     note "alias: $sub -> $expansion"
     sub="${words[0]}"
@@ -399,6 +405,16 @@ main() {
           die "'git stash clear' discards every entry in the clone, including
   other sessions'. It is never safe here. Drop your own with
   'gitsafe git stash drop stash@{n}'."
+          ;;
+        store|import)
+          # These put entries on the shared stack without going through `push`,
+          # so the entry would carry no ownership tag - and `store -m` only sets
+          # the reflog message, not the commit subject the tag check reads.
+          # Such an entry would be unusable through gitsafe for everyone,
+          # including its creator. Refuse rather than create an orphan.
+          die "'git stash $op' would add an entry with no ownership tag, which no
+  session could later pop through gitsafe. Use 'gitsafe git stash push' instead,
+  or GITSAFE_ALLOW_UNSAFE=1 if you really need the plumbing."
           ;;
         push|save)
           guard_resource stash || exit 1
