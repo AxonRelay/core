@@ -4,6 +4,24 @@
 
 **人＋AI 混成チームのためのガバナンス台帳と調整ボードを、MCP サーバとして公開する。**
 
+[![CI](https://github.com/AxonRelay/core/actions/workflows/ci.yml/badge.svg)](https://github.com/AxonRelay/core/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-3776ab.svg)](.python-version)
+
+**30 秒でわかる**
+
+- **何か** — コーディングエージェントが話しかける MCP サーバ。*誰が何を承認したか*の
+  改ざん検出可能な記録と、*いま誰がどこを編集しているか*の共有ボードを、複数マシン・
+  複数リポジトリ・複数 clone をまたいで持つ。
+- **誰向けか** — 複数のエージェント（Claude Code、Codex、…）を並行して走らせている
+  一人の開発者。互いの上書きを止めたい、人間が実際に承認した証跡が欲しい。
+- **何が要るか** — ボードと台帳の読み取り側には Docker と Python 3.12 だけ。エージェントに
+  タスクを*実行*させるときだけ LangGraph Platform のデプロイが要る。前者に API キーは
+  不要 — [Quick Start](#quick-start) を参照。
+- **何ではないか** — エージェントランタイムでも、承認 UI でも、メッセージバスでもない。
+  それらは意図的に LangGraph Platform・MCP elicitation・AG-UI に委譲している —
+  [理由](#なぜ存在するのか2026-年中盤の文脈)。
+
 AxonRelay は「**誰が**（人か AI か）、**どのドラフト版**に対して、**何をしたか**、そして
 **誰が・どんなコメントで・いつ承認/差戻したか**」を記録する。加えて、複数のマシン・
 複数のリポジトリ・**同一リポジトリの複数 clone** で複数のエージェントが同時に動き出した
@@ -137,6 +155,9 @@ tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-s
 
 ### REST API（読み取り中心・ダッシュボード用）
 
+backend を起動すると `http://localhost:8000/docs` に OpenAPI の対話 UI が出る
+（`docker compose up -d backend`、または `backend/` で `uvicorn app.main:app --reload`）。
+
 | Method | Path | 説明 |
 |--------|------|------|
 | `GET` | `/` | ヘルスチェック |
@@ -179,6 +200,9 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
 (cd backend && alembic upgrade head)    # migration 008 まで適用・"self" Actor を seed
 ```
+
+venv を有効にした状態なら `make dev` で後半 3 つと MCP サーバの起動をまとめて行える。
+`make help` で残り（`api` / `test` / `lint` / `frontend`）が出る。
 
 `.env` は自動で読まれる。`DATABASE_URL` は `localhost` を指しており、compose
 ネットワークの `postgres` というホスト名はコンテナの中でしか使われない。
@@ -248,7 +272,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — `gitsafe` を PATH ラッパにせず明示 opt-in に留める理由
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
-- [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ
+- [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ（アカウント側の手順のみ。backend 側は未実装）
 - [deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md) — **デプロイ手順（日本語）**。ホスティング切替と、調整ボードに必要な共有 MCP エンドポイントの立て方（[English](deploy/DEPLOYMENT.md)）
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL セットアップ & マイグレーション
 
