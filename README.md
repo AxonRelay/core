@@ -239,3 +239,11 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup
 - [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) ([日本語](deploy/DEPLOYMENT.ja.md)) — hosting cutover and the shared MCP endpoint the coordination board needs (Cloudflare Tunnel / Tailscale / Vercel)
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL setup & migrations
+
+---
+
+## License
+
+MIT - see [LICENSE](LICENSE). This is a personal proof of concept: the MCP
+transport has no per-caller authentication and is meant to stay on a private
+network. Run it accordingly.

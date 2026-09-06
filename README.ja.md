@@ -231,3 +231,10 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ
 - [deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md) — **デプロイ手順（日本語）**。ホスティング切替と、調整ボードに必要な共有 MCP エンドポイントの立て方（[English](deploy/DEPLOYMENT.md)）
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL セットアップ & マイグレーション
+
+---
+
+## ライセンス
+
+MIT - [LICENSE](LICENSE) を参照。個人 PoC であり、MCP transport には呼び出し元認証が
+ない。private network の内側で動かす前提のコードなので、そのつもりで扱うこと。

@@ -30,6 +30,7 @@ caddy_config/
 # IDE
 .vscode/
 .idea/
+.claude/settings.local.json
 *.swp
 *.swo
 *~
