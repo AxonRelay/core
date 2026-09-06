@@ -2,11 +2,51 @@
 
 ## Setup
 
-Enable local Git hooks to prevent accidental force pushes:
+Enable the local Git hooks:
 
 ```bash
 git config core.hooksPath .githooks
 ```
+
+`.githooks/pre-push` then runs three guards on every push:
+
+1. **Force push to `main`** - refused.
+2. **Credentials** - the commits being pushed are scanned for API keys, tokens,
+   private keys and passwords embedded in URLs. These patterns describe
+   credential *shapes*, not values, so they are committed here and work with no
+   setup.
+3. **Personal information** - the same commits are scanned against a denylist
+   you keep locally. Home directories, private addresses, an employer's name:
+   such a list has to spell out the strings it protects, so committing it would
+   publish exactly what it guards.
+
+Only added lines and commit metadata are scanned. A commit that *removes* a
+leaked string necessarily contains that string in its diff, and blocking the
+fix is how a guard gets switched off for good.
+
+The personal-information guard is skipped entirely when no denylist exists, so
+it is optional - but it is the half that knows about you. To set one up:
+
+```bash
+mkdir -p ~/.config/axonrelay
+$EDITOR ~/.config/axonrelay/push-denylist.txt
+chmod 600 ~/.config/axonrelay/push-denylist.txt
+```
+
+One extended regular expression per line; a line starting with `!` is an
+exception, which is what makes a broad pattern usable ("any email address"
+minus the few that are meant to be public). One file there covers every clone
+on the machine. `.githooks/denylist.local` (gitignored) works as a per-clone
+override, and `$PUSH_DENYLIST_FILE` overrides both.
+
+To push past either content guard once:
+
+```bash
+PUSH_GUARD_ALLOW=1 git push ...
+```
+
+It is recorded on stderr. A credential that ever reached a commit must be
+rotated - removing it from the tree is not enough.
 
 ## Git Workflow Rules
 
