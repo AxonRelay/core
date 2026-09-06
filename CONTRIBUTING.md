@@ -10,16 +10,28 @@ git config core.hooksPath .githooks
 
 ## Git Workflow Rules
 
-### Branch Protection (Manual Enforcement)
+### Branch Protection (Enforced by GitHub)
 
-Since branch protection is not available on GitHub Free for private repositories, we enforce these rules manually:
+The repository is public, so branch protection is available and **enabled** on
+`main`. These rules are enforced server-side, not by convention:
 
-#### main branch
+| Rule | Effect |
+|---|---|
+| Require a pull request | No direct pushes to `main`. Zero approvals are required (this is a solo project), but the PR is what runs CI |
+| Require status checks | `Lint Backend (Python)`, `Test Backend (pytest)`, `Test Migrations (Postgres)`, `Build Frontend (pnpm)` must pass, and the branch must be up to date with `main` first |
+| Require linear history | No merge commits - use "Squash and merge" |
+| Require conversation resolution | Review threads must be resolved before merging |
+| Block force pushes | `git push --force` to `main` is rejected |
+| Block deletion | `main` cannot be deleted |
+| Include administrators | The rules apply to the repository owner too |
 
-- **No direct commits** - All changes must go through Pull Requests
-- **No force push** - Never use `git push --force` on main
-- **No branch deletion** - main branch must never be deleted
-- **Squash merge only** - Use "Squash and merge" for all PRs
+Because administrators are included, there is no per-push escape hatch. A
+history rewrite or any other operation that genuinely needs a force push
+requires turning protection off in Settings, doing the work, and turning it
+back on - deliberately, not in passing.
+
+The `.githooks/pre-push` hook still exists as a local first line of defence,
+and `git config core.hooksPath .githooks` is still worth running.
 
 #### Feature branches
 
