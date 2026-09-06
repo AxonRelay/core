@@ -31,6 +31,9 @@ caddy_config/
 .vscode/
 .idea/
 .claude/settings.local.json
+
+# Local push guard: personal-information denylist (never commit this)
+.githooks/denylist.local
 *.swp
 *.swo
 *~
