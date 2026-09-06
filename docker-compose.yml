@@ -18,7 +18,10 @@ services:
     build: ./backend
     restart: always
     environment:
-      - DATABASE_URL=${DATABASE_URL:-postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay}
+      # Built here rather than taken from .env: .env's DATABASE_URL is the
+      # host's view (localhost), while inside the compose network the
+      # database is reached by service name.
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-axonrelay}:${POSTGRES_PASSWORD:-axonrelay_dev}@postgres:5432/${POSTGRES_DB:-axonrelay}
       - LANGGRAPH_API_URL=${LANGGRAPH_API_URL:-}
       - LANGGRAPH_API_KEY=${LANGGRAPH_API_KEY:-}
       - LANGGRAPH_ASSISTANT_ID=${LANGGRAPH_ASSISTANT_ID:-axonrelay}

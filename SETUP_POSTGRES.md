@@ -144,8 +144,9 @@ POSTGRES_DB=axonrelay
 POSTGRES_USER=axonrelay
 POSTGRES_PASSWORD=axonrelay_dev  # 本番環境では強力なパスワードに変更
 
-# データベース接続 URL
-DATABASE_URL=postgresql://axonrelay:axonrelay_dev@postgres:5432/axonrelay
+# データベース接続 URL（ホストから見た値。コンテナ内では docker-compose.yml が
+# サービス名 postgres で組み立てるので、ここは localhost のままでよい）
+DATABASE_URL=postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay
 ```
 
 **本番環境では**、`POSTGRES_PASSWORD` を強力なパスワードに変更してください。
