@@ -2,6 +2,9 @@
   "name": "axonrelay-dashboard",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "description": "AxonRelay read-only governance-ledger dashboard (Phase 2.5)",
   "scripts": {

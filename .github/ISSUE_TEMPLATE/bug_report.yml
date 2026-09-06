@@ -1,0 +1,39 @@
+name: Bug report
+description: Something did not do what the docs say it does
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got. Paste the exact error.
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: How were you talking to it
+      options:
+        - MCP over stdio (.mcp.json / claude mcp add)
+        - MCP over Streamable HTTP (--http)
+        - REST API / dashboard
+        - Not applicable (setup, migrations, docs)
+    validations:
+      required: true
+  - type: input
+    id: migration
+    attributes:
+      label: Migration head
+      description: Output of `alembic current` from `backend/`. Most setup failures are a migration that did not reach 008.
+      placeholder: 008 (head)
+  - type: input
+    id: python
+    attributes:
+      label: Python and OS
+      placeholder: 3.12.4, macOS 15
+  - type: checkboxes
+    id: platform
+    attributes:
+      label: LangGraph Platform
+      options:
+        - label: LANGGRAPH_API_URL is configured (needed only for create_task / run_task / approve_task / reject_task)

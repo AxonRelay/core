@@ -1,12 +1,15 @@
-fastapi
-uvicorn[standard]
-pydantic
-python-dotenv
-slowapi
-sqlalchemy
-alembic
-psycopg2-binary
-langgraph-sdk
-# Pinned to the 2.x line: 2.0 renamed FastMCP -> MCPServer and moved it to
-# mcp.server.mcpserver, so an unpinned install silently breaks app/mcp/server.py.
+# Floors are the minor lines CI resolves today; caps stop the next major from
+# arriving unannounced. Dependabot moves the floors; a cap is moved by hand,
+# after reading the changelog.
+fastapi>=0.141,<1
+uvicorn[standard]>=0.52,<1
+pydantic>=2.13,<3
+python-dotenv>=1.2,<2
+slowapi>=0.1.10,<1
+sqlalchemy>=2.0,<3
+alembic>=1.19,<2
+psycopg2-binary>=2.9,<3
+langgraph-sdk>=0.4,<1
+# 2.0 renamed FastMCP -> MCPServer and moved it to mcp.server.mcpserver, so an
+# install outside this line silently breaks app/mcp/server.py.
 mcp>=2.1,<3
