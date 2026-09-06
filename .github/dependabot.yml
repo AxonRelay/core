@@ -18,6 +18,12 @@ updates:
     groups:
       frontend-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # The type definitions follow the Node version we actually run (22, per
+      # engines and CI). A newer major would type-check against APIs that do
+      # not exist at runtime. Bump this by hand when Node is bumped.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

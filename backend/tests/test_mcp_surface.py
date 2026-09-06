@@ -106,39 +106,80 @@ def test_default_invocation_runs_stdio(server, monkeypatch):
     assert calls == [((), {})]
 
 
+def _capture_http_start(server, monkeypatch):
+    """Stub the two calls main() makes for --http and return their records.
+
+    main() builds the ASGI app with `mcp.streamable_http_app(...)` and hands it
+    to `uvicorn.run(...)`; neither may actually run under test.
+    """
+    import uvicorn
+
+    built = []
+    served = []
+    sentinel = object()
+    monkeypatch.setattr(server.mcp, "streamable_http_app", lambda **k: built.append(k) or sentinel)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **k: served.append((app, k)))
+    return built, served, sentinel
+
+
 def test_http_flag_passes_host_port_and_path_to_the_transport(server, monkeypatch):
     """Regression: main() used to set `mcp.settings.host`, which mcp 2.x rejects.
 
     `Settings` has no host/port fields — the server crashed on startup with
     `ValueError: "Settings" object has no field "host"`, so --http never served
-    anything. host/port/path are transport kwargs of `run()`, not settings.
+    anything. The path belongs to the app builder; host and port belong to the
+    server that runs it.
     """
-    calls = []
-    monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.delenv(server.http_auth.TOKEN_ENV, raising=False)
+    built, served, sentinel = _capture_http_start(server, monkeypatch)
     monkeypatch.setattr(sys, "argv", ["app.mcp.server", "--http", "--host", "0.0.0.0", "--port", "9999"])
 
     server.main()
 
-    assert calls == [
-        ((), {"transport": "streamable-http", "host": "0.0.0.0", "port": 9999, "streamable_http_path": "/mcp"})
-    ]
+    assert built == [{"streamable_http_path": "/mcp", "host": "0.0.0.0"}]
+    assert served == [(sentinel, {"host": "0.0.0.0", "port": 9999})]
 
 
 def test_http_binds_loopback_by_default(server, monkeypatch):
-    """The transport has no per-caller auth, so it must not default to a public bind."""
-    calls = []
-    monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append((a, k)))
+    """The transport has no per-caller auth by default, so it must not default to a public bind."""
+    monkeypatch.delenv(server.http_auth.TOKEN_ENV, raising=False)
+    _built, served, _sentinel = _capture_http_start(server, monkeypatch)
     monkeypatch.setattr(sys, "argv", ["app.mcp.server", "--http"])
 
     server.main()
 
-    assert calls[0][1]["host"] == "127.0.0.1"
+    assert served[0][1]["host"] == "127.0.0.1"
+
+
+def test_http_serves_the_app_untouched_without_a_token(server, monkeypatch):
+    monkeypatch.delenv(server.http_auth.TOKEN_ENV, raising=False)
+    _built, served, sentinel = _capture_http_start(server, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["app.mcp.server", "--http"])
+
+    server.main()
+
+    assert served[0][0] is sentinel
+
+
+def test_http_wraps_the_app_when_a_token_is_set(server, monkeypatch):
+    """ADR-008: the token is opt-in, and when opted in it sits in front of the SDK app."""
+    monkeypatch.setenv(server.http_auth.TOKEN_ENV, "secret")
+    _built, served, sentinel = _capture_http_start(server, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["app.mcp.server", "--http"])
+
+    server.main()
+
+    app = served[0][0]
+    assert isinstance(app, server.http_auth.BearerTokenMiddleware)
+    assert app.app is sentinel
 
 
 def test_the_http_kwargs_match_the_sdk_signature(server):
-    """Bind the kwargs against the real SDK method, so an SDK rename fails here."""
-    signature = inspect.signature(server.mcp.run_streamable_http_async)
-    signature.bind(host="127.0.0.1", port=8765, streamable_http_path="/mcp")
+    """Bind the kwargs against the real SDK and uvicorn signatures, so a rename fails here."""
+    import uvicorn
+
+    inspect.signature(server.mcp.streamable_http_app).bind(streamable_http_path="/mcp", host="127.0.0.1")
+    inspect.signature(uvicorn.run).bind(object(), host="127.0.0.1", port=8765)
 
 
 def test_the_streamable_http_app_mounts_the_mcp_endpoint(server):
