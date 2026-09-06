@@ -159,25 +159,45 @@ tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-s
 
 ## Quick Start
 
+**必要なもの**
+
+| やりたいこと | 必要なもの |
+|---|---|
+| 調整ボードと、台帳の読み取り側 — `register_session` / `claim_territory` / `send_relay` / `list_tasks` / `verify_task_ledger`、ダッシュボード | Docker（Postgres 用）と Python 3.12。**API キーは不要** |
+| タスクの作成・実行、ドラフトの承認・差戻し — `create_task` / `run_task` / `approve_task` / `reject_task` | [`axonrelay-graph/`](axonrelay-graph/) を LangGraph Platform にデプロイしたものと LLM キー（`.env` の `LANGGRAPH_*` と `ANTHROPIC_API_KEY`） |
+
+タスク作成は Platform の thread を確保し、承認は thread を再開するため、この
+4 つは Platform を設定するまで `PlatformNotConfiguredError` で明示的に失敗する。
+それ以外は最初の 1 分から動く。
+
+**5 コマンド**
+
 ```bash
-cp .env.example .env          # LANGGRAPH_* と ANTHROPIC_API_KEY を記入
-docker compose up -d postgres # Postgres のみ。runtime は Platform 側
-
-# backend（venv 推奨）
+cp .env.example .env                    # ラップトップならそのままで動く。LANGGRAPH_* はあとで
+docker compose up -d postgres           # Postgres を 127.0.0.1:5432 に
+python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # migration 008 まで適用・"self" Actor を seed
-
-# IDE 用に MCP サーバを起動
-python -m app.mcp.server                      # stdio — 1 台構成
-python -m app.mcp.server --http --port 8765   # Streamable HTTP — 複数デバイス構成
+(cd backend && alembic upgrade head)    # migration 008 まで適用・"self" Actor を seed
 ```
 
-その後 Claude Code を接続する — [docs/mcp-server.md](docs/mcp-server.md) を参照。
+`.env` は自動で読まれる。`DATABASE_URL` は `localhost` を指しており、compose
+ネットワークの `postgres` というホスト名はコンテナの中でしか使われない。
 
-調整ボードが意味を持つには、**複数デバイスが 1 つのインスタンスを共有している**必要がある。
-`--http` で起動し、Tailscale か Cloudflare Tunnel 経由で到達させる。このトランスポートには
-呼び出し元認証がないため、private network に留めること
-（手順は **[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)**）。
+**Claude Code をつなぐ**
+
+リポジトリ直下に project scope の [`.mcp.json`](.mcp.json) を同梱している。venv を
+有効にしたシェルでリポジトリのルートから起動すると、`axonrelay` サーバを有効にするか
+聞かれる:
+
+```bash
+claude
+```
+
+他のクライアント、複数デバイス向けの Streamable HTTP transport、tool リファレンス:
+[docs/mcp-server.md](docs/mcp-server.md)。調整ボードが意味を持つには、**複数デバイスが
+1 つのインスタンスを共有している**必要がある。`--http` で起動し、Tailscale 経由で
+到達させる。このトランスポートには呼び出し元認証がないため、private network に
+留めること（手順は **[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)**）。
 
 Platform にデプロイする前にローカルで graph を動かす:
 

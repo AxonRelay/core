@@ -167,25 +167,45 @@ Writes are also exposed via MCP and are the primary path from the IDE.
 
 ## Quick Start
 
+**What you need**
+
+| To do this | You need |
+|---|---|
+| The coordination board and the ledger's read side - `register_session`, `claim_territory`, `send_relay`, `list_tasks`, `verify_task_ledger`, the dashboard | Docker (for Postgres) and Python 3.12. **No API keys.** |
+| Create and run tasks, approve and reject drafts - `create_task`, `run_task`, `approve_task`, `reject_task` | A LangGraph Platform deployment of [`axonrelay-graph/`](axonrelay-graph/) plus an LLM key: `LANGGRAPH_*` and `ANTHROPIC_API_KEY` in `.env` |
+
+Creating a task allocates a Platform thread and approving one resumes it, so
+those four tools fail with an explicit `PlatformNotConfiguredError` until
+Platform is set up. Everything else works from the first minute.
+
+**Five commands**
+
 ```bash
-cp .env.example .env          # fill in LANGGRAPH_* and ANTHROPIC_API_KEY
-docker compose up -d postgres # Postgres only; runtime is on Platform
-
-# backend (venv recommended)
+cp .env.example .env                    # works as-is on a laptop; add LANGGRAPH_* later
+docker compose up -d postgres           # Postgres on 127.0.0.1:5432
+python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-cd backend && alembic upgrade head   # applies migrations through 008; seeds the "self" Actor
-
-# run the MCP server for the IDE
-python -m app.mcp.server                      # stdio — one machine
-python -m app.mcp.server --http --port 8765   # Streamable HTTP — several devices
+(cd backend && alembic upgrade head)    # migrations through 008; seeds the "self" Actor
 ```
 
-Then point Claude Code at it — see [docs/mcp-server.md](docs/mcp-server.md).
+`.env` is read automatically. Its `DATABASE_URL` points at `localhost`; the
+compose network's `postgres` hostname is only used inside the containers.
 
-Several devices must share **one** instance for the coordination board to mean
-anything. Serve `--http` and reach it over Tailscale or a Cloudflare Tunnel; the
-transport has no per-caller auth, so it must stay on a private network
-([deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md)).
+**Connect Claude Code**
+
+The repository ships a project-scoped [`.mcp.json`](.mcp.json). Start Claude
+Code from the repository root with the venv active, and it offers to enable the
+`axonrelay` server:
+
+```bash
+claude
+```
+
+Other clients, the Streamable HTTP transport for several devices, and the full
+tool reference: [docs/mcp-server.md](docs/mcp-server.md). Several devices must
+share **one** instance for the coordination board to mean anything; serve
+`--http` and reach it over Tailscale. The transport has no per-caller auth, so
+it must stay on a private network ([deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md)).
 
 To run the LangGraph graph locally before deploying to Platform:
 
