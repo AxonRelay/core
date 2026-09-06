@@ -3,7 +3,7 @@
 # after reading the changelog.
 fastapi>=0.141,<1
 uvicorn[standard]>=0.52,<1
-pydantic>=2.13,<3
+pydantic>=2.13.5,<3
 python-dotenv>=1.2,<2
 slowapi>=0.1.10,<1
 sqlalchemy>=2.0,<3
