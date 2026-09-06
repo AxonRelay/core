@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "axonrelay": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "-c",
+        "cd \"$(git rev-parse --show-toplevel)/backend\" && exec python -m app.mcp.server"
+      ]
+    }
+  }
+}
