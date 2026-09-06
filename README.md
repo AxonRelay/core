@@ -4,6 +4,25 @@
 
 **A governance ledger and coordination board for mixed human + AI teams, exposed as an MCP server.**
 
+[![CI](https://github.com/AxonRelay/core/actions/workflows/ci.yml/badge.svg)](https://github.com/AxonRelay/core/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-3776ab.svg)](.python-version)
+
+**In thirty seconds**
+
+- **What it is** - an MCP server your coding agent talks to. It keeps a
+  tamper-evident record of *who approved what*, and a shared board of *who is
+  editing what right now* - across machines, repositories and clones.
+- **Who it is for** - one person running several agents (Claude Code, Codex,
+  ...) in parallel, who wants them to stop overwriting each other and wants a
+  paper trail a human actually signed.
+- **What it needs** - Docker and Python 3.12 for the board and the ledger's
+  read side. A LangGraph Platform deployment only if agents should *run* tasks
+  through it. No API keys for the first part - see [Quick Start](#quick-start).
+- **What it is not** - an agent runtime, an approval UI, or a message bus.
+  Those are delegated to LangGraph Platform, MCP elicitation and AG-UI on
+  purpose - [why](#why-this-exists-mid-2026-context).
+
 AxonRelay records *who* — human or AI — did *what*, on *which draft version*, and
 *who approved or rejected it with what comment, and when*. It also answers the
 question that comes *before* the decision, once several agents work at once
@@ -145,6 +164,9 @@ dependency is pinned.
 
 ### REST API (read-heavy, for the dashboard)
 
+Interactive OpenAPI docs at `http://localhost:8000/docs` once the backend is up
+(`docker compose up -d backend`, or `uvicorn app.main:app --reload` from `backend/`).
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Health check |
@@ -256,7 +278,7 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — why `gitsafe` stays opt-in instead of shadowing `git` on PATH
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
-- [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup
+- [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup (account side only; the backend side is not built yet)
 - [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) ([日本語](deploy/DEPLOYMENT.ja.md)) — hosting cutover and the shared MCP endpoint the coordination board needs (Cloudflare Tunnel / Tailscale / Vercel)
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL setup & migrations
 
