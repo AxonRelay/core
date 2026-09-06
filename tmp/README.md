@@ -33,53 +33,13 @@
 
 ---
 
-## 手動同期（AxonRelay を立てていないとき / 単独 clone のとき）
+## AxonRelay を立てていないとき
 
-以下は調整レイヤーを使わない場合の従来手順。
-
-同じ `AxonRelay/core` を **複数の場所にクローン**している場合（別マシン、worktree、CI 用、レビュー用など）、`tmp/` の中身は **git では同期されません**。
-
-意図的な手動同期の手順例：
-
-### A. 単純コピー&ペースト
-
-最も簡単。`session-progress.md` の中身を選択してコピー → 別クローン側で上書きペースト。
-
-### B. ファイルを直接転送
-
-```bash
-# 別マシンのクローンへ scp
-scp tmp/session-progress.md user@otherhost:/path/to/AxonRelay/core/tmp/session-progress.md
-
-# 同一マシンの別 worktree へ
-cp tmp/session-progress.md ../another-clone/AxonRelay/core/tmp/
-```
-
-### C. クラウドストレージ経由
-
-iCloud / Dropbox / Drive などの個人ストレージにシンボリックリンクで同期する。
-（**※ 勤務先のクラウドは使わない** — 個人 PoC の constraint #3 により、勤務先関連の同期経路は禁止）
-
-### D. Gist (private) 経由（Codex / 別レビュアーに見せる用）
-
-```bash
-gh gist create --secret tmp/session-progress.md
-# 別クローン側で
-gh gist view <gist-id> --filename session-progress.md > tmp/session-progress.md
-```
-
----
-
-## 同期時の衝突回避のために
-
-複数クローンで同時に編集すると衝突しがちなので、`session-progress.md` の冒頭に以下を入れておくと安全：
-
-```markdown
-> Last updated: 2026-04-30 14:30 JST on host `mbp16`
-> Source clone: /Users/foo/workspace/AxonRelay/core
-```
-
-「最新の進捗はどのクローン由来か」を一目で判別できるようにする。
+調整レイヤーを使わない単独 clone なら、`tmp/session-progress.md` はこの clone だけの
+メモとして使えばよい。複数 clone で同じファイルを**手で**配る運用（コピー、`scp`、
+private gist）はかつてここに手順があったが、それはこのリポジトリが解こうとしている
+問題そのものであり、いまは上の表の MCP tool がその役を担う。手で配る場合は、冒頭に
+「いつ・どのホスト・どの clone で更新したか」を一行書いておくと、どれが最新かで迷わない。
 
 ---
 
