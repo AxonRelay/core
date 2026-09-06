@@ -96,6 +96,12 @@ cloudflared tunnel route dns axonrelay api.axonrelay.com
 TLS は Cloudflare 側で終端され、`backend:8000` に転送されます。ホスト側に
 インバウンドポートを開ける必要はありません。
 
+backend を Tunnel の背後で動かすときは、環境変数に `AXONRELAY_TRUST_PROXY=1` を
+設定してください。全リクエストがコネクタのアドレスから届くため、これが無いと
+レート制限が全員を 1 クライアントとして数えます。設定すると `X-Forwarded-For` の
+先頭ホップで数えます。ポートに直接到達できる構成では設定しないこと — 直接の
+呼び出し元はそのヘッダを自分で書けるためです。
+
 ---
 
 ## 3. Tailscale と共有 MCP エンドポイント（調整ボードに必須）
@@ -130,31 +136,35 @@ DATABASE_URL="postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay" \
 > `could not translate host name "postgres"` で起動に失敗します。
 
 > ⚠️ **`--host 0.0.0.0` が安全なのは Tailscale の内側にいる場合だけです。**
-> このトランスポートには**呼び出し元認証がありません** — ポートに到達できる人は
-> 誰でも台帳を読め、タスクを承認できます。tailnet にバインドするか、既定の
+> このトランスポートには既定で**呼び出し元認証がありません** — ポートに到達できる
+> 人は誰でも台帳を読め、タスクを承認できます。tailnet にバインドするか、既定の
 > `127.0.0.1` のままにしてください。**インターネットに公開しないこと。**
 > Cloudflare Access を前段に置かない限り、`8765` を Tunnel の ingress に
 > 追加しないこと。
+
+**二段目（複数デバイスで使うなら推奨）:** ホスト側の環境変数に `AXONRELAY_MCP_TOKEN`
+を設定すると、全リクエストに `Authorization: Bearer <token>` が必須になり、無ければ
+MCP 層に届く前に `401` が返ります。tailnet の規則を置き換えるものではなく、バインド
+先やトンネルの設定ミスが「即座に全権」にならないための保険です
+（[ADR-008](../docs/adr-008-optional-bearer-token.md)）。
+
+```bash
+export AXONRELAY_MCP_TOKEN="$(openssl rand -hex 32)"   # リポジトリには置かない
+```
 
 再起動をまたいで動かし続けるかはオペレータの判断です（macOS ならユーザー
 launchd agent、Linux なら systemd unit）。このリポジトリは何もインストールしません。
 
 ### 3.3 各デバイスの MCP クライアントを向ける
 
-Claude Code（`~/.claude/settings.json` またはプロジェクトの `.claude/settings.json`）:
+Claude Code:
 
-```json
-{
-  "mcpServers": {
-    "axonrelay": {
-      "type": "http",
-      "url": "http://<host>.<tailnet>.ts.net:8765/mcp"
-    }
-  }
-}
+```bash
+claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp \
+  -H "Authorization: Bearer <token>"        # トークン未設定なら -H は不要
 ```
 
-Codex CLI も同じ URL を自分の MCP 設定に書きます。
+Codex CLI も同じ URL（とヘッダ）を自分の MCP 設定に書きます。
 各エージェントは自分の `host` / `clone_path` で `register_session` を呼び、
 互いをボード上で認識します。
 
