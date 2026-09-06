@@ -5,12 +5,16 @@
 AxonRelay is a personal proof of concept. Its threat model is deliberately
 narrow, and you should know where the edges are before running it.
 
-**There is no per-caller authentication.** Neither the REST API (`:8000`) nor
-the MCP server's Streamable HTTP transport (`:8765`) checks who is calling.
-Anyone who can reach the port can read the ledger, approve tasks, claim
-territory and send relays. This is a documented design decision
-([README](README.md#license), [coordination-spec §10](docs/coordination-spec.md)):
-the boundary is drawn at the network layer, not in the application.
+**Authentication is a network boundary, plus one optional secret.** The
+REST API (`:8000`) does not check who is calling. The MCP server's Streamable
+HTTP transport (`:8765`) does not either, *unless* `AXONRELAY_MCP_TOKEN` is set,
+in which case every request must carry `Authorization: Bearer <token>`
+([ADR-008](docs/adr-008-optional-bearer-token.md)). Without the token, anyone
+who can reach a port can read the ledger, approve tasks, claim territory and
+send relays. This is a documented design decision
+([coordination-spec §10](docs/coordination-spec.md)): the boundary is drawn at
+the network layer, and the token is a second layer for the MCP transport, not
+a replacement for the first.
 
 So the rules are:
 

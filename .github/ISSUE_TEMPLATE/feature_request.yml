@@ -1,0 +1,19 @@
+name: Feature request
+description: Something the ledger or the board should record, answer, or refuse
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The situation
+      description: What were several agents (or you and an agent) doing when the gap showed up?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would want instead
+  - type: markdown
+    attributes:
+      value: |
+        A note on scope: the project deliberately does not own the agent runtime, the approval UI, or a message bus - see [ADR-006](../blob/main/docs/adr-006-no-message-broker.md) and [delta-mvp-spec](../blob/main/docs/delta-mvp-spec.md). Proposals that re-add those are welcome as a discussion, but will be weighed against that pivot.

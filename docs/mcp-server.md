@@ -20,7 +20,9 @@ cd backend
 python -m app.mcp.server --http --port 8765
 ```
 
-調整レイヤーは **全員が同じインスタンスを見ていること**が前提なので、デバイスが複数あるならこちらを使う。既定のバインドは loopback。**呼び出し元認証はない**ので、他デバイスからの到達は Tailscale か Cloudflare Tunnel 経由にする（**[deploy/DEPLOYMENT.ja.md](../deploy/DEPLOYMENT.ja.md)** に手順）。公開バインドは想定外。
+調整レイヤーは **全員が同じインスタンスを見ていること**が前提なので、デバイスが複数あるならこちらを使う。既定のバインドは loopback。**既定では呼び出し元認証がない**ので、他デバイスからの到達は Tailscale か Cloudflare Tunnel 経由にする（**[deploy/DEPLOYMENT.ja.md](../deploy/DEPLOYMENT.ja.md)** に手順）。公開バインドは想定外。
+
+`AXONRELAY_MCP_TOKEN` を設定すると、全リクエストに `Authorization: Bearer <token>` を要求する（[ADR-008](./adr-008-optional-bearer-token.md)）。クライアントは `claude mcp add -t http ... -H "Authorization: Bearer <token>"` のように固定ヘッダで渡す。
 
 クライアント側の設定例：
 
@@ -37,27 +39,30 @@ python -m app.mcp.server --http --port 8765
 
 ### Claude Code の設定
 
-`~/.claude/settings.json`（または プロジェクト `.claude/settings.json`）に追記：
+リポジトリ直下に project scope の **[`.mcp.json`](../.mcp.json)** を同梱している。venv を
+有効にしたシェルで、リポジトリのルートから `claude` を起動すると、初回に `axonrelay`
+サーバを有効にするか聞かれる。`.env` は自動で読まれるので、`DATABASE_URL` を別途渡す
+必要はない。エントリは `backend/` で `python -m app.mcp.server` を実行するだけ。
 
-```json
-{
-  "mcpServers": {
-    "axonrelay": {
-      "command": "python",
-      "args": ["-m", "app.mcp.server"],
-      "cwd": "/Users/dev/workspace/AxonRelay/core/backend",
-      "env": {
-        "DATABASE_URL": "postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay",
-        "LANGGRAPH_API_URL": "https://your-langgraph-platform-url",
-        "LANGGRAPH_API_KEY": "lsv2_...",
-        "LANGGRAPH_ASSISTANT_ID": "axonrelay"
-      }
-    }
-  }
-}
+リポジトリの外から使う、または user scope に置くなら `claude mcp add`:
+
+```bash
+claude mcp add -s user axonrelay \
+  -e DATABASE_URL=postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay \
+  -- bash -c 'cd /path/to/core/backend && exec python -m app.mcp.server'
 ```
 
-> **注意**: `cwd` は backend/ の絶対パス。Postgres / LangGraph Platform の接続情報が必要。
+複数デバイスで 1 つの HTTP transport を共有する場合（[deploy/DEPLOYMENT.ja.md](../deploy/DEPLOYMENT.ja.md) §3）:
+
+```bash
+claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
+```
+
+設定先は `.mcp.json`（project）か `claude mcp add`（local / user）のどちらかで、
+`~/.claude/settings.json` は MCP サーバの設定を読まない。
+
+> LangGraph Platform を使うときは `.env` の `LANGGRAPH_API_URL` / `LANGGRAPH_API_KEY` /
+> `LANGGRAPH_ASSISTANT_ID` を埋める。未設定でも調整系 tool と読み取り系 tool は動く。
 
 ## 提供する Tools
 

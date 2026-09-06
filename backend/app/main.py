@@ -14,12 +14,12 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from app import coordination, crud, langgraph_client, models, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
+from app.ratelimit import client_key
 from app.schema import (
     ActorResponse,
     AgentDefinitionCreateRequest,
@@ -37,7 +37,7 @@ from app.schema import (
     TaskWithAssignmentsResponse,
 )
 
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=client_key)
 
 
 @asynccontextmanager
