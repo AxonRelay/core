@@ -225,6 +225,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — ピボット仕様（Actor モデル / スコープ / dogfood シナリオ）
 - [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: 在席・territory claim・relay
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — 調整レイヤーにメッセージブローカーを入れない理由
+- [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — `gitsafe` を PATH ラッパにせず明示 opt-in に留める理由
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ

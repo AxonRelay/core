@@ -183,7 +183,7 @@ stash の対象は `stash@{n}` という綴りではなく**位置引数**で決
 
 **読み取り系（`status` `diff` `log` `show` `stash list`）は常に素通し。**
 
-**原子性の限界。** 所有者チェックと git の変更は2ステップで、その間に gitsafe を通さない裸の `git stash push` が割り込めばスタックはずれる。`pop` / `apply` / `drop` は index（`stash@{0}`）ではなく commit id で操作し、`drop` は直前に id を再確認することで窓を git が許す限界まで狭めている。残る窓は、gitsafe を使う書き手は claim で排除されていること、誤って drop しても commit はオブジェクトストアに残ることをもって受容する。`stash branch` だけは git が reflog 参照しか受けないため commit に固定できず、直前の再確認のみ。
+**原子性の限界。** 所有者チェックと git の変更は2ステップで、その間に gitsafe を通さない裸の `git stash push` が割り込めばスタックはずれる。`pop` / `apply` / `drop` は index（`stash@{0}`）ではなく commit id で操作し、`drop` は直前に id を再確認することで窓を git が許す限界まで狭めている。残る窓は、gitsafe を使う書き手は claim で排除されていること、誤って drop しても commit がしばらくは到達不能オブジェクトとして残り `git fsck --unreachable` で拾えることをもって受容する（ただし `git gc` の prune 対象なので恒久的な保証ではない — [ADR-007](./adr-007-gitsafe-enforcement-path.md)）。`stash branch` だけは git が reflog 参照しか受けないため commit に固定できず、直前の再確認のみ。
 
 #### サブエージェントをどう扱うか
 
@@ -199,7 +199,7 @@ stash の対象は `stash@{n}` という綴りではなく**位置引数**で決
 
 既知の制約: サブエージェントは親の環境変数を継承するため、`AXONRELAY_SESSION_ID` をそのまま引き継ぐと親と区別できない。実害は軽い（親セッションとして振る舞うことになり、*別 clone* からの奪取は依然防げる）が、厳密に分けたい場合はサブセッションにも `register_session` させる。
 
-さらなる限界: ラッパは `command git` や絶対パス指定で迂回できる。「PATH 上の `git` がラッパである」ことが前提で、`ghsafe` と同じ性質の制約。
+さらなる限界: ラッパは `command git` や絶対パス指定で迂回できる。前置き（`gitsafe git …`）かシェル関数で `git` を覆う運用が前提であり、PATH 上に `git` という名前のラッパを置く方式は採らない（[ADR-007](./adr-007-gitsafe-enforcement-path.md)）。`ghsafe` と同じ性質の制約。
 
 ---
 
@@ -316,7 +316,7 @@ python -m app.mcp.server --http --port 8765   # Streamable HTTP — リモート
 | claim の自動取得（ファイル書き込みをフックして claim） | エージェントが「これから何をするか」を宣言することに価値がある。事後の自動記録では衝突を予防できない |
 | coordination イベントの hash chain | 改ざん耐性が必要なのは承認記録。claim / relay は追記のみで十分 |
 | MCP transport の呼び出し元認証 | 個人 PoC。ネットワーク層（Tailscale / Tunnel）で境界を引く |
-| `gitsafe` の迂回不能化 | `command git` / 絶対パスで抜けられる。PATH 上の git がラッパである前提を敷く以上のことはしない（`ghsafe` と同じ立場） |
+| `gitsafe` の迂回不能化 | `command git` / 絶対パスで抜けられる。PATH 上に `git` という名前のラッパを置く方式は採らない（自己再帰・影響範囲・ネットワーク依存の対価が、防ぐ事故の重さに見合わない）。決定と根拠は [ADR-007](./adr-007-gitsafe-enforcement-path.md) |
 | git 以外の破壊的操作 | エージェントがファイルを直接上書きする類は本レイヤーの範囲外 |
 | A2A プロトコルでの Relay 表現 | [§11.3](./delta-mvp-spec.md) で採用候補に格上げ済みだが、まず内部モデルを dogfood してから |
 
