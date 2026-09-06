@@ -9,7 +9,10 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # Loopback only. Nothing outside this host needs the database: the MCP
+      # server runs here and reaches it at localhost, and the backend reaches
+      # it over the compose network.
+      - "127.0.0.1:5432:5432"
 
   backend:
     build: ./backend
@@ -20,7 +23,10 @@ services:
       - LANGGRAPH_API_KEY=${LANGGRAPH_API_KEY:-}
       - LANGGRAPH_ASSISTANT_ID=${LANGGRAPH_ASSISTANT_ID:-axonrelay}
     ports:
-      - "8000:8000"
+      # Loopback by default. Set BACKEND_BIND_ADDR to the host's Tailscale
+      # address to let other devices reach the REST API (gitsafe's guard
+      # queries it) - never to 0.0.0.0: there is no per-caller auth.
+      - "${BACKEND_BIND_ADDR:-127.0.0.1}:8000:8000"
     depends_on:
       - postgres
     volumes:
