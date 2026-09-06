@@ -2,7 +2,7 @@
 -r requirements.txt
 
 # Linting & Formatting
-ruff>=0.8.0
+ruff>=0.16.5
 
 # Testing
-pytest>=8.0.0
+pytest>=9.1.1
