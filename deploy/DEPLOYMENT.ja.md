@@ -235,10 +235,16 @@ stash スタックは増えません。ある worktree での `git stash pop` �
 パス claim では守れません。
 
 ```bash
-export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"
+export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"   # ← ホスト側で BACKEND_BIND_ADDR の設定が要る
 export AXONRELAY_SESSION_ID="<register_session が返した id>"
 git() { /path/to/core/tools/gitsafe git "$@"; }
 ```
+
+> **backend の到達性。** compose が publish する `8000` は既定で loopback に
+> バインドされる。他デバイスの `gitsafe` から照会させるには、ホスト側の `.env` で
+> `BACKEND_BIND_ADDR` をそのホストの Tailscale アドレス（`100.x.y.z`）にして
+> `docker compose up -d backend` を掛け直すこと。**`0.0.0.0` にはしない** —
+> この API には呼び出し元認証がない。
 
 session を登録するときは、sibling worktree が同じ stash スタックを共有していると
 認識できるように、clone の git dir を渡します:

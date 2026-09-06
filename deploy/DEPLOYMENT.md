@@ -140,10 +140,16 @@ parked in another, and since `git stash pop` names no path, no path claim can
 guard it.
 
 ```bash
-export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"
+export AXONRELAY_URL="http://<host>.<tailnet>.ts.net:8000"   # needs BACKEND_BIND_ADDR set on the host
 export AXONRELAY_SESSION_ID="<id from register_session>"
 git() { /path/to/core/tools/gitsafe git "$@"; }
 ```
+
+> **Reaching the backend.** The port compose publishes for `8000` binds to
+> loopback by default. To let another device's `gitsafe` query it, set
+> `BACKEND_BIND_ADDR` in the host's `.env` to that host's Tailscale address
+> (`100.x.y.z`) and re-run `docker compose up -d backend`. **Never `0.0.0.0`** -
+> this API has no per-caller authentication.
 
 When registering the session, pass the clone's git dir so sibling worktrees are
 recognised as sharing one stash stack:
