@@ -210,6 +210,9 @@ pip install -r backend/requirements.txt
 (cd backend && alembic upgrade head)    # migrations through 008; seeds the "self" Actor
 ```
 
+Or, with the venv active, `make dev` runs the last three and starts the MCP
+server; `make help` lists the rest (`api`, `test`, `lint`, `frontend`).
+
 `.env` is read automatically. Its `DATABASE_URL` points at `localhost`; the
 compose network's `postgres` hostname is only used inside the containers.
 
