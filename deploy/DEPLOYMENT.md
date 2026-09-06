@@ -53,6 +53,12 @@ Then either:
 The tunnel terminates TLS at Cloudflare and forwards to `backend:8000` — no
 inbound ports open on the host.
 
+Set `AXONRELAY_TRUST_PROXY=1` in the backend's environment when it runs behind
+the tunnel. Every request then arrives from the connector's address, and
+without this the rate limiter would count all callers as one client; with it,
+the limiter keys on the first `X-Forwarded-For` hop. Do not set it when the
+port is reachable directly, since a direct caller can write that header.
+
 ## 3. Tailscale + the shared MCP endpoint (required for the coordination board)
 
 The coordination board (Phase 3) only means anything if **every device and every

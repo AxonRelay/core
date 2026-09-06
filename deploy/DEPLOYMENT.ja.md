@@ -96,6 +96,12 @@ cloudflared tunnel route dns axonrelay api.axonrelay.com
 TLS は Cloudflare 側で終端され、`backend:8000` に転送されます。ホスト側に
 インバウンドポートを開ける必要はありません。
 
+backend を Tunnel の背後で動かすときは、環境変数に `AXONRELAY_TRUST_PROXY=1` を
+設定してください。全リクエストがコネクタのアドレスから届くため、これが無いと
+レート制限が全員を 1 クライアントとして数えます。設定すると `X-Forwarded-For` の
+先頭ホップで数えます。ポートに直接到達できる構成では設定しないこと — 直接の
+呼び出し元はそのヘッダを自分で書けるためです。
+
 ---
 
 ## 3. Tailscale と共有 MCP エンドポイント（調整ボードに必須）
