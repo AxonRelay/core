@@ -1,0 +1,25 @@
+# Keeps three dependency surfaces current. Security updates are enabled at
+# the repository level; this file adds the routine version bumps, grouped so a
+# week's worth of patch releases arrives as one PR rather than a dozen.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+    groups:
+      backend-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    groups:
+      frontend-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

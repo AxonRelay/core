@@ -1,5 +1,10 @@
 name: CI
 
+# The workflow only checks out and tests; it never writes to the repository,
+# so the token it receives should not be able to either.
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: [main]
