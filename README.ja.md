@@ -201,6 +201,9 @@ pip install -r backend/requirements.txt
 (cd backend && alembic upgrade head)    # migration 008 まで適用・"self" Actor を seed
 ```
 
+venv を有効にした状態なら `make dev` で後半 3 つと MCP サーバの起動をまとめて行える。
+`make help` で残り（`api` / `test` / `lint` / `frontend`）が出る。
+
 `.env` は自動で読まれる。`DATABASE_URL` は `localhost` を指しており、compose
 ネットワークの `postgres` というホスト名はコンテナの中でしか使われない。
 
