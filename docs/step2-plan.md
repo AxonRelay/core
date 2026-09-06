@@ -228,7 +228,7 @@ Step 2 の完了後、dogfood の実態が §2 の想定（self + 2〜3 AI、1 �
 | 3.10 | `focus` の自動更新（IDE フックから heartbeat） | 未着手 |
 
 仕様: [coordination-spec.md](./coordination-spec.md)。メッセージブローカーを入れない判断:
-[adr-006-no-message-broker.md](./adr-006-no-message-broker.md)（issue #21 / #38 / PR #35 の打ち切り理由を含む）。
+[adr-006-no-message-broker.md](./adr-006-no-message-broker.md)（issue #21 / #38 / PR #35 の打ち切り理由を含む。番号は公開前の非公開リポジトリのもの）。
 
 ---
 

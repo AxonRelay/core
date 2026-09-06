@@ -1,6 +1,8 @@
 # ADR-007: `gitsafe` を PATH ラッパにしない（強制経路を明示 opt-in に留める）
 
-> 決定: 2026-09-06 / Status: 採用 / 関連: [coordination-spec.md §4.4](./coordination-spec.md), PR #45, `tools/gitsafe`
+> 決定: 2026-09-06 / Status: 採用 / 関連: [coordination-spec.md §4.4](./coordination-spec.md), PR #45（git 資源ガードのクロスレビュー）, `tools/gitsafe`
+>
+> **番号について:** PR 番号は公開前の非公開リポジトリのもので、公開リポジトリには存在しない。
 
 ---
 
