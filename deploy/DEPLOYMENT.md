@@ -76,31 +76,37 @@ DATABASE_URL="postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay" \
 > published port, `@localhost:5432`, or startup fails with
 > `could not translate host name "postgres"`.
 
-> **`--host 0.0.0.0` is only safe behind Tailscale.** This transport has **no
-> per-caller authentication**: anyone who can reach the port can read the ledger
-> and approve tasks. Bind it to the tailnet (or keep the default `127.0.0.1` and
-> front it with the tunnel); never expose it to the public internet. Do not add
-> `8765` to the Cloudflare Tunnel ingress unless you put Cloudflare Access in
-> front of it.
+> **`--host 0.0.0.0` is only safe behind Tailscale.** By default this transport
+> has **no per-caller authentication**: anyone who can reach the port can read
+> the ledger and approve tasks. Bind it to the tailnet (or keep the default
+> `127.0.0.1` and front it with the tunnel); never expose it to the public
+> internet. Do not add `8765` to the Cloudflare Tunnel ingress unless you put
+> Cloudflare Access in front of it.
 
-Then point each device's MCP client at the one endpoint:
+**Second layer (recommended once more than one device is involved):** set
+`AXONRELAY_MCP_TOKEN` in the host's environment and every request must carry
+`Authorization: Bearer <token>` or gets a 401 before the MCP layer sees it. It
+does not replace the tailnet rule; it means a slipped bind or a misrouted
+tunnel is not immediately total ([ADR-008](../docs/adr-008-optional-bearer-token.md)).
 
-```json
-{
-  "mcpServers": {
-    "axonrelay": {
-      "type": "http",
-      "url": "http://<host>.<tailnet>.ts.net:8765/mcp"
-    }
-  }
-}
+```bash
+export AXONRELAY_MCP_TOKEN="$(openssl rand -hex 32)"   # keep it out of the repository
 ```
 
-Codex CLI takes the same URL in its own MCP config. Each agent then calls
+Then point each device's MCP client at the one endpoint. For Claude Code:
+
+```bash
+claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp \
+  -H "Authorization: Bearer <token>"        # omit -H if no token is set
+```
+
+Codex CLI takes the same URL (and header) in its own MCP config. Each agent then calls
 `register_session` with its own `host` / `clone_path`, and they see each other on
 the board.
 
-**Sanity check** from a second device — it should list 24 tools:
+**Sanity check** from a second device — it should list 26 tools (add
+`headers={"Authorization": "Bearer <token>"}` to `streamable_http_client` if
+the token is set):
 
 ```bash
 python - <<'EOF'

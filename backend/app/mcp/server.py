@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from contextlib import contextmanager
 from typing import Any
 
@@ -28,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from app import coordination, crud, langgraph_client, models, service, territory
 from app.database import SessionLocal
+from app.mcp import http_auth
 from app.mcp.serializers import (
     actor_to_dict,
     agent_definition_to_dict,
@@ -772,10 +775,16 @@ def main() -> None:
         mcp.run()
         return
 
-    # Bound to loopback by default: this transport has no per-caller auth, so
-    # reaching it from another device should go through Tailscale or a
-    # Cloudflare Tunnel rather than a public bind. See deploy/DEPLOYMENT.md.
-    mcp.run(transport="streamable-http", host=args.host, port=args.port, streamable_http_path=args.path)
+    # Bound to loopback by default. Reaching it from another device should go
+    # through Tailscale rather than a public bind; setting AXONRELAY_MCP_TOKEN
+    # additionally requires a bearer token on every request. Neither replaces
+    # the other. See deploy/DEPLOYMENT.md and app/mcp/http_auth.py.
+    import uvicorn
+
+    app = http_auth.wrap_if_configured(mcp.streamable_http_app(streamable_http_path=args.path, host=args.host))
+    if os.environ.get(http_auth.TOKEN_ENV, "").strip():
+        print(f"bearer token required ({http_auth.TOKEN_ENV} is set)", file=sys.stderr)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
