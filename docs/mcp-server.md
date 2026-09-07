@@ -83,6 +83,18 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
 | `get_self_actor()` | オペレータ Human Actor |
 
+### 呼び出し元 identity と scope（任意）
+
+`AXONRELAY_REQUIRE_AUTH=1` のインスタンスでは、HTTP transport の全呼び出しに credential が要る（[ADR-011](./adr-011-caller-identity.md)）。stdio は常に loopback 信頼で、フラグの有無にかかわらず credential は不要。
+
+```bash
+python -m app.credentials issue --actor self --scopes ledger:read,ledger:write,coordination:read,coordination:write
+# → token は一度だけ表示される。保存は SHA-256 のみ
+claude mcp add -t http -H "Authorization: Bearer <token>" axonrelay http://127.0.0.1:8765/mcp
+```
+
+各 tool に必要な scope は `backend/app/authz.py` の `TOOL_SCOPES`。読み取り系は `ledger:read` / `coordination:read`、書き込み系は `ledger:write` / `coordination:write`、削除は `administration`。scope が足りない呼び出しは「必要な scope 名」だけを返して拒否される。`get_self_actor()` は**サーバから見た呼び出し元の Actor** を返すので、credential がどの identity に結びついているかはこれで確認できる。
+
 ### Safe Envelope（content-blind 取り込み）
 
 `AXONRELAY_SAFE_MODE=1` のインスタンスでは上の書き込み系 tool と調整レイヤーの書き込み系 tool は固定文言で拒否され、以下だけが書き込み経路になる（[ADR-010](./adr-010-safe-envelope.md)、[schema](./schemas/safe-envelope-v1.json)）。
