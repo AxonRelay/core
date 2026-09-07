@@ -90,7 +90,9 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type"],
+    # Authorization is needed once AXONRELAY_REQUIRE_AUTH is on; without it the
+    # browser preflight fails and the dashboard has no way to present a credential.
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -121,6 +123,16 @@ async def _unauthenticated(request: Request, exc: authz.Unauthenticated) -> JSON
 async def _forbidden(request: Request, exc: authz.Forbidden) -> JSONResponse:
     """403 naming the scope required. Nothing about the resource, which the caller may not know exists."""
     return JSONResponse(status_code=403, content={"detail": str(exc), "required_scope": exc.scope.value})
+
+
+@app.exception_handler(authz.AuthzError)
+async def _authz_refused(request: Request, exc: authz.AuthzError) -> JSONResponse:
+    """403 for a refusal raised inside an endpoint (an actor claim, another Actor's session).
+
+    The Unauthenticated / Forbidden handlers take precedence for their own
+    types; this catches the rest of the family so a refusal never leaves as a 500.
+    """
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
 @app.exception_handler(safe_envelope.SafeModeRefused)
@@ -448,6 +460,7 @@ def _record_decision(db: Session, **kwargs) -> models.Approval:
     formed; the state it assumed is gone), 404 for a vanished task. The error
     text names versions only, never content.
     """
+    authz.check_may_approve(db, kwargs["task_id"])
     try:
         return crud.record_approval(db, **kwargs)
     except crud.TaskNotFoundError as e:
@@ -768,6 +781,9 @@ async def coordination_inbox_endpoint(
     db: Session = Depends(get_db),
 ):
     """A session's relay inbox. Reading here marks the relays read, as MCP does."""
+    # Reading writes RelayReceipts, so reading somebody else's inbox would
+    # silently mark their relays as seen. The read scope does not cover that.
+    authz.check_session_owner(db, session_id)
     try:
         return coordination.read_inbox(db, session_id, include_acked=include_acked)
     except ValueError as e:

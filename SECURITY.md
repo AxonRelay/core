@@ -35,8 +35,12 @@ server records for that caller's approvals, sessions and tasks, so a request
 parameter cannot claim somebody else's identity, and it carries scopes
 (`ledger:read`, `ledger:write`, `coordination:read`, `coordination:write`,
 `export:read`, `administration`) that every tool and every route is mapped to.
-Only the SHA-256 of a token is stored; tokens never appear in a log, an error or
-a response. Unset, the process behaves as before and every call runs as the
+A scope is necessary, not sufficient: a credential may only drive its own
+coordination sessions, and may only approve a task it holds the `approver`
+role on (or, for a human Actor, any task). Only the SHA-256 of a token is
+stored; tokens never appear in a log, an error or a response. The health check
+and FastAPI's schema routes stay open by decision - the schema describes shapes
+this repository already publishes. Unset, the process behaves as before and every call runs as the
 operator. **stdio is always loopback-trusted**, with or without the flag: it has
 no request to carry a credential and the caller is a process you started.
 
