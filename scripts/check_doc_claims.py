@@ -62,6 +62,17 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
+# A match preceded, within the same clause, by a negation or an out-of-scope
+# phrase is a disclaimer, which is exactly what the policy asks people to
+# write ("AxonRelay is not GDPR compliant", "SOC 2 certification is out of
+# scope"). Those are not flagged.
+NEGATION = re.compile(
+    r"(?:\bnot\b|\bno\b|\bnever\b|\bneither\b|\bnor\b|n't\b|\bwithout\b|\bout of scope\b|\bfalse\b|\bwrong\b"
+    r"|\bincorrect\b|\bdoes not\b|\bnothing\b|\bnone\b|\bnon-|ではな|しない|でない|ない|対象外|誤り|否定)",
+    re.I,
+)
+NEGATION_WINDOW = 80
+
 ALLOW_LINE = "claim-check:allow"
 BLOCK_OFF = "claim-check:off"
 BLOCK_ON = "claim-check:on"
@@ -83,13 +94,33 @@ def tracked_markdown() -> list[Path]:
     return [REPO / p for p in files if not p.startswith(EXCLUDED_PREFIXES) and p not in EXCLUDED_PATHS]
 
 
+MARKER = re.compile(r"(<!--\s*claim-check:(?:off|on)\s*-->)")
+CLAUSE_END = re.compile(r"[.。;]\s|[.。;]$")
+
+
+def _negated(joined: str, start: int, end: int) -> bool:
+    """Is the match inside a clause that negates it (before or after the match)?"""
+    clause_start = max(
+        joined.rfind(". ", 0, start),
+        joined.rfind("。", 0, start),
+        joined.rfind("; ", 0, start),
+        start - NEGATION_WINDOW,
+        -1,
+    )
+    tail = CLAUSE_END.search(joined, end)
+    clause_end = min(tail.start() if tail else len(joined), end + NEGATION_WINDOW)
+    return bool(NEGATION.search(joined[clause_start + 1 : start])) or bool(NEGATION.search(joined[end:clause_end]))
+
+
 def scan_text(text: str) -> list[tuple[int, str, str]]:
     """Return (line_number, pattern_name, excerpt) for every hit.
 
     Markdown prose is hard-wrapped, so lines are joined into paragraphs
     (runs of non-blank lines) before matching; the reported line number is
-    the paragraph's first line. Table rows and list items are paragraphs of
-    their own only if separated by blank lines, which is fine for a guard.
+    the paragraph's first line. A line carrying ``claim-check:allow`` is left
+    out of its paragraph — the marker covers that line, not its neighbours.
+    ``claim-check:off`` / ``claim-check:on`` may share a line; the text between
+    them on that line is skipped and scanning resumes after ``on``.
     """
     hits: list[tuple[int, str, str]] = []
     enabled = True
@@ -100,26 +131,38 @@ def scan_text(text: str) -> list[tuple[int, str, str]]:
         if not paragraph:
             return
         joined = " ".join(part.strip() for part in paragraph)
-        if ALLOW_LINE not in joined:
-            for name, pattern in PATTERNS:
-                match = pattern.search(joined)
-                if match:
-                    lo = max(0, match.start() - 60)
-                    hits.append((start, name, joined[lo : match.end() + 60]))
+        for name, pattern in PATTERNS:
+            for match in pattern.finditer(joined):
+                if _negated(joined, match.start(), match.end()):
+                    continue
+                lo = max(0, match.start() - 60)
+                hits.append((start, name, joined[lo : match.end() + 60]))
+                break
         paragraph.clear()
 
     for lineno, line in enumerate(text.splitlines(), start=1):
-        if BLOCK_OFF in line:
+        if BLOCK_OFF in line or BLOCK_ON in line:
+            # Walk the line marker by marker, keeping only the segments that
+            # fall in an enabled span; the state after the last marker carries
+            # over to the following lines.
             flush()
-            enabled = False
-            continue
-        if BLOCK_ON in line:
-            enabled = True
+            kept: list[str] = []
+            for segment in MARKER.split(line):
+                if MARKER.fullmatch(segment):
+                    enabled = "on" in segment
+                elif enabled and segment.strip():
+                    kept.append(segment.strip())
+            if kept:
+                start = lineno
+                paragraph.append(" ".join(kept))
+                flush()
             continue
         if not enabled:
             continue
         if not line.strip():
             flush()
+            continue
+        if ALLOW_LINE in line:
             continue
         if not paragraph:
             start = lineno
@@ -158,6 +201,9 @@ def selftest() -> int:
         "an audit-ready ledger for regulated teams",
         "AI Act に準拠した台帳",
         "the EU AI Act's high-risk obligations reach full\nenforcement on 2026-08-02, and their core asks",
+        "x <!-- claim-check:allow -->\nAxonRelay is GDPR compliant",
+        "<!-- claim-check:off --> full enforcement <!-- claim-check:on -->\nfull enforcement here",
+        "<!-- claim-check:off -->\nfull enforcement\n<!-- claim-check:on --> AxonRelay is GDPR compliant",
     ]
     must_pass = [
         "規制グレード対応（電子署名 / タイムスタンプ局 / 21 CFR Part 11 / GxP）は対象外",
@@ -169,6 +215,13 @@ def selftest() -> int:
         "<!-- claim-check:off -->\n### heading full enforcement\nbody full enforcement\n<!-- claim-check:on -->\nsafe text",
         "It certifies nothing and makes nothing conform to the EU AI Act or any other regulation.",
         "何も認証せず、EU AI Act やその他の規制への対応を何ら提供しない。",
+        "AxonRelay is not GDPR compliant.",
+        "AxonRelay does not claim GDPR compliance.",
+        "Nothing here is SOC 2 certified.",
+        "SOC 2 compliance is out of scope.",
+        "AxonRelay は GDPR に準拠しない。",
+        "規制グレード対応（21 CFR Part 11 等）は対象外",
+        "<!-- claim-check:off --> full enforcement <!-- claim-check:on --> safe text here",
     ]
     ok = True
     for sample in must_hit:
