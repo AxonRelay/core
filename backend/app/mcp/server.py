@@ -29,7 +29,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from app import coordination, crud, langgraph_client, models, service, territory
+from app import coordination, crud, langgraph_client, models, safe_envelope, service, territory
 from app.database import SessionLocal
 from app.mcp import http_auth
 from app.mcp.serializers import (
@@ -53,6 +53,18 @@ def _session():
         yield db
     finally:
         db.close()
+
+
+def _free_text_surface() -> None:
+    """Refuse, value-free, when the instance runs in Safe Envelope mode (app/safe_envelope.py).
+
+    Raised as ToolError so the SDK returns the fixed message as the tool
+    result instead of logging a traceback that could carry the arguments.
+    """
+    try:
+        safe_envelope.refuse_free_text_if_safe_mode()
+    except safe_envelope.SafeModeRefused as e:
+        raise ToolError(str(e)) from None
 
 
 def _resolve_status(status: str | None) -> models.TaskStatusEnum | None:
@@ -151,6 +163,7 @@ async def create_task(
         description: Optional longer description / context.
         assignments: Optional list of {actor_id: int, role: str} dicts.
     """
+    _free_text_surface()
     with _session() as db:
         self_actor = crud.get_self_actor(db)
         creator_actor_id = self_actor.id if self_actor else None
@@ -191,6 +204,7 @@ def _sync_state(db, task: models.Task, result: dict[str, Any]) -> None:
 @mcp.tool()
 async def run_task(task_id: int) -> dict:
     """Kick off graph execution on Platform. Blocks until interrupt or completion."""
+    _free_text_surface()
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
@@ -286,6 +300,7 @@ async def approve_task(
     is recorded and status="stale_decision" is returned. A modified_draft is
     stored as a new draft version and the approval binds to that version.
     """
+    _free_text_surface()
     return await _apply_decision(
         task_id,
         action="approved",
@@ -309,6 +324,7 @@ async def reject_task(
     artifact_version / expected_commitment work as in approve_task: the
     rejection is recorded against the draft you read, or not at all.
     """
+    _free_text_surface()
     combined = " | ".join(p for p in [comment, reason] if p) or None
     return await _apply_decision(
         task_id,
@@ -347,6 +363,7 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
     cannot slip a different draft in between the check and the record. A task
     with no draft returns status="no_artifact" before asking anything.
     """
+    _free_text_surface()
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
@@ -436,6 +453,7 @@ def create_agent(
     config: dict[str, Any] | None = None,
 ) -> dict:
     """Create an AI agent definition (and its underlying Actor)."""
+    _free_text_surface()
     with _session() as db:
         try:
             agent_type_enum = models.AgentTypeEnum(agent_type)
@@ -457,6 +475,7 @@ def update_agent(
     is_active: bool | None = None,
 ) -> dict:
     """Update an AI agent definition."""
+    _free_text_surface()
     with _session() as db:
         agent_type_enum = None
         if agent_type:
@@ -521,6 +540,7 @@ def register_session(
     collisions can be detected: sibling git worktrees have different clone_paths
     but share one stash stack, and only the git dir identifies that.
     """
+    _free_text_surface()
     resolved_type = models.ActorTypeEnum(actor_type)
     with _session() as db:
         session = coordination.register_session(
@@ -545,6 +565,7 @@ def heartbeat_session(session_id: int, focus: str | None = None, branch: str | N
     ("refactoring app/crud.py", "waiting on review of #44"). A session that goes
     quiet for 30 minutes is shown as stale to everyone else.
     """
+    _free_text_surface()
     with _session() as db:
         session = coordination.heartbeat_session(db, session_id, focus=focus, branch=branch)
         if not session:
@@ -622,6 +643,7 @@ def claim_territory(
     The lease expires after ttl_minutes (default 60) so a crashed agent cannot
     hold territory forever. Release it with release_territory when you are done.
     """
+    _free_text_surface()
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         result = coordination.claim_territory(
@@ -677,6 +699,7 @@ def send_relay(
     when you are about to do something others should know about ("rewriting the
     migration chain"), and "handoff" when you are passing work on.
     """
+    _free_text_surface()
     resolved_kind = models.RelayKindEnum(kind)
     with _session() as db:
         relay = coordination.send_relay(
@@ -711,6 +734,7 @@ def ack_relay(relay_id: int, session_id: int, note: str | None = None) -> dict:
     Acking is per recipient: it does not hide a broadcast from anyone else, and
     the receipt records that you saw it.
     """
+    _free_text_surface()
     with _session() as db:
         receipt = coordination.ack_relay(db, relay_id=relay_id, session_id=session_id, note=note)
         return {
@@ -800,6 +824,7 @@ def claim_git_resource(
     Always exclusive, refused on conflict unless force=true, and expiring like a
     path claim.
     """
+    _free_text_surface()
     resolved = models.ClaimResourceEnum(resource)
     with _session() as db:
         result = coordination.claim_resource(
@@ -836,6 +861,42 @@ def board_resource() -> str:
 
 
 # ========== Entry point ==========
+
+
+# ========== Safe Envelope (content-blind ingestion) ==========
+
+
+@mcp.tool()
+def ingest_safe_envelope(envelope: dict[str, Any]) -> dict:
+    """Ingest one metadata-only Safe Envelope (schema: docs/schemas/safe-envelope-v1.json).
+
+    The envelope carries opaque identifiers, an action and outcome from closed
+    lists, a source-produced artifact commitment and timestamps — never a
+    title, body, path or URL; unknown fields are rejected. Rejections name the
+    offending field names only. Re-sending the same event_id is idempotent.
+    Same service as POST /envelopes.
+    """
+    with _session() as db:
+        try:
+            event, created = safe_envelope.ingest(db, envelope)
+        except safe_envelope.EnvelopeRejected as e:
+            raise ToolError(str(e)) from None
+        payload = safe_envelope.event_to_dict(event)
+        payload["created"] = created
+        return payload
+
+
+@mcp.tool()
+def list_safe_events(limit: int = 100, action: str | None = None) -> list[dict]:
+    """Stored Safe Envelopes, newest first (optionally one action)."""
+    action_enum = None
+    if action:
+        try:
+            action_enum = models.SafeActionEnum(action)
+        except ValueError:
+            raise ToolError("Invalid action") from None
+    with _session() as db:
+        return [safe_envelope.event_to_dict(e) for e in safe_envelope.list_events(db, limit=limit, action=action_enum)]
 
 
 def main() -> None:

@@ -55,9 +55,11 @@ MODEL_ENUMS = [
     models.ClaimResourceEnum,
     models.ClaimStatusEnum,
     models.RelayKindEnum,
+    models.SafeActionEnum,
+    models.SafeOutcomeEnum,
 ]
 
-COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts"}
+COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts", "safe_events"}
 
 
 def _expected_head() -> str:
