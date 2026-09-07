@@ -164,6 +164,13 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 **3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
 `axonrelay://tasks/{id}/drafts/{version}`。
 
+**Safe Envelope — 2 tools**: `ingest_safe_envelope`, `list_safe_events`。
+`AXONRELAY_SAFE_MODE=1` にするとインスタンスは content-blind になる: 上記のうち自由文を
+受ける tool はすべて固定文言で拒否し、envelope——opaque id・閉じた enum・producer が算出した
+artifact commitment・timestamp だけ——が唯一の書き込み経路になる
+（[ADR-010](docs/adr-010-safe-envelope.md)、[schema](docs/schemas/safe-envelope-v1.json)）。
+フラグ無しでは全文の個人 PoC のまま。
+
 tool リファレンスと Claude Code 設定: **[docs/mcp-server.md](docs/mcp-server.md)**。
 
 `mcp>=2.1,<3` が必要 — 2.0 で `FastMCP` が `MCPServer` に改称されたため、依存はピン止めしている。
@@ -179,6 +186,7 @@ backend を起動すると `http://localhost:8000/docs` に OpenAPI の対話 UI
 | `GET` | `/actors` `/actors/{id}` `/actors/me` | Actor |
 | `GET`/`POST`/`PUT`/`DELETE` | `/agents` `/agents/{id}` | AI エージェント定義 |
 | `GET`/`POST`/`PUT`/`DELETE` | `/tasks` `/tasks/{id}` | タスク |
+| `POST`/`GET` | `/envelopes` | Safe Envelope の取り込みと一覧（content-blind。`AXONRELAY_SAFE_MODE` 下では唯一の書き込み経路） |
 | `POST` | `/tasks/{id}/run` | Platform で interrupt/完了まで実行 |
 | `GET` | `/tasks/pending/approvals` | 統一承認受信箱 |
 | `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | 承認 / 差戻し |
@@ -213,7 +221,7 @@ cp .env.example .env                    # ラップトップならそのまま�
 docker compose up -d postgres           # Postgres を 127.0.0.1:5432 に
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-(cd backend && alembic upgrade head)    # migration 009 まで適用・"self" Actor を seed
+(cd backend && alembic upgrade head)    # migration 010 まで適用・"self" Actor を seed
 ```
 
 venv を有効にした状態なら `make dev` で後半 3 つと MCP サーバの起動をまとめて行える。
@@ -259,6 +267,8 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | LLM 認証情報 |
 | `WRITER_MODEL` / `REVIEWER_MODEL` | `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` | ロール別モデル |
 | `DISCORD_*` | — | Discord モバイル承認（Phase 2.6・未接続） |
+| `AXONRELAY_SAFE_MODE` | — | `1` でインスタンスを content-blind にする: 自由文を受ける surface は拒否、Safe Envelope が唯一の書き込み経路（[ADR-010](docs/adr-010-safe-envelope.md)） |
+| `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS` | — | `1` で `identifier_policy: public`（`owner/repo` slug）の envelope を受理。それ以外は opaque id 必須 |
 
 データベースのセットアップとマイグレーションは [SETUP_POSTGRES.md](SETUP_POSTGRES.md) を参照。
 
@@ -268,12 +278,12 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（26 tools / 3 resources）、LangGraph Platform クライアント、migration 009 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（28 tools / 3 resources）、LangGraph Platform クライアント、migration 010 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
 - 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋**[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)** に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。**調整ボードを実際に使うには同ドキュメント §3（Tailscale + 共有 MCP エンドポイント）が必要** — コードは入っているが、まだどこでも稼働していない。
-- 🚧 **Tests**: SQLite 156 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・git 資源 claim・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳と資源 claim を競合させる Postgres スキーマ整合 18 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
+- 🚧 **Tests**: SQLite 264 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・git 資源 claim・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳と資源 claim を競合させる Postgres スキーマ整合 24 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
 
 ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。調整レイヤーの設計: [docs/coordination-spec.md](docs/coordination-spec.md)。
 
@@ -287,6 +297,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — 調整レイヤーにメッセージブローカーを入れない理由
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — `gitsafe` を PATH ラッパにせず明示 opt-in に留める理由
 - [docs/adr-009-artifact-commitment.md](docs/adr-009-artifact-commitment.md) — 承認が判断対象の draft 版と本文 commitment を名指しする理由と、それが証明しないこと
+- [docs/adr-010-safe-envelope.md](docs/adr-010-safe-envelope.md) — content-blind モード: Safe Envelope が受け付けるもの、他の surface が拒否するもの、拒否された値を保存・ログ・エラーに残さない仕組み
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ（アカウント側の手順のみ。backend 側は未実装）
