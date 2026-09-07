@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import pytest
-from fastapi.routing import APIRoute
 from mcp.server.mcpserver.exceptions import ToolError
 
 from app import authz, crud, models
@@ -212,7 +211,7 @@ def test_claiming_another_actor_is_refused_not_ignored(db, self_actor):
     with authz.bind(principal):
         authz.check_claimed_actor(None)  # omitted: fine
         authz.check_claimed_actor(agent.name)  # its own: fine
-        with pytest.raises(authz.Forbidden):
+        with pytest.raises(authz.ActorMismatch):
             authz.check_claimed_actor("self")
 
 
@@ -290,28 +289,67 @@ def test_the_authenticated_actor_is_what_actors_me_reports(client, db, self_acto
     assert body["name"] == "writer-bot"
 
 
-def test_an_approval_is_attributed_to_the_credential_not_a_parameter(client, db, self_actor, enforced, monkeypatch):
-    """Cross-actor: two credentials approving one task are two different reviewers."""
+def _waiting_task(db, thread_id="t-authz"):
+    task = models.Task(thread_id=thread_id, title="t", status=models.TaskStatusEnum.WAITING_APPROVAL)
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    crud.add_draft(db, task_id=task.id, content="draft")
+    return task
+
+
+@pytest.fixture
+def no_platform(monkeypatch):
     from app import langgraph_client
 
     async def _resume(*a, **k):
         return {}
 
     monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+
+def test_an_approval_is_attributed_to_the_credential_not_a_parameter(client, db, self_actor, enforced, no_platform):
+    """Cross-actor: the reviewer is the credential's Actor, whatever the request says."""
     agent = _make_ai(db)
     token, _ = _credential(db, agent, {authz.Scope.LEDGER_WRITE})
-
-    task = models.Task(thread_id="t-authz", title="t", status=models.TaskStatusEnum.WAITING_APPROVAL)
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    crud.add_draft(db, task_id=task.id, content="draft")
+    task = _waiting_task(db)
+    crud.create_task_assignment(db, task.id, agent.id, models.AssignmentRoleEnum.APPROVER)
 
     response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ok"}, headers=_auth(token))
 
     assert response.status_code == 200
     assert response.json()["reviewer_actor_id"] == agent.id
     assert crud.get_approvals(db, task.id)[0].reviewer_actor_id == agent.id
+
+
+def test_an_agent_cannot_approve_a_task_it_is_not_an_approver_on(client, db, self_actor, enforced, no_platform):
+    """`ledger:write` covers creating and running tasks; approving needs the role."""
+    agent = _make_ai(db)
+    token, _ = _credential(db, agent, {authz.Scope.LEDGER_WRITE})
+    task = _waiting_task(db, "t-selfapprove")
+    crud.create_task_assignment(db, task.id, agent.id, models.AssignmentRoleEnum.EXECUTOR)
+
+    response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ship my own draft"}, headers=_auth(token))
+
+    assert response.status_code == 403
+    assert "approver" in response.json()["detail"]
+    assert crud.get_approvals(db, task.id) == []
+
+
+def test_a_human_credential_may_approve_without_an_assignment(client, db, self_actor, enforced, no_platform):
+    """The operator approves by definition; that is what a human Actor is here."""
+    token, _ = _credential(db, self_actor, {authz.Scope.LEDGER_WRITE})
+    task = _waiting_task(db, "t-human")
+
+    response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ok"}, headers=_auth(token))
+
+    assert response.status_code == 200
+    assert response.json()["reviewer_actor_id"] == self_actor.id
+
+
+def test_without_enforcement_approving_is_unchanged(client, db, self_actor, unenforced, no_platform):
+    task = _waiting_task(db, "t-loopback")
+    assert client.post(f"/tasks/{task.id}/approve", json={"comment": "ok"}).status_code == 200
 
 
 def test_no_token_reaches_a_response_body_or_a_log_record(client, db, self_actor, enforced, caplog):
@@ -491,16 +529,23 @@ def test_every_mcp_resource_template_has_a_scope():
 
 
 def test_every_rest_route_has_a_decision():
+    """Every route in the table, not only the API ones.
+
+    FastAPI's schema routes are Starlette routes, so the application-wide
+    dependency never sees them; if they were left out of this check their
+    openness would be an accident instead of the decision PUBLIC_ROUTES makes.
+    """
     from app.main import app
 
     routes = {
         (method, route.path)
         for route in app.routes
-        if isinstance(route, APIRoute)
+        if getattr(route, "methods", None)
         for method in route.methods - {"HEAD", "OPTIONS"}
     }
     assert routes - set(authz.ROUTE_SCOPES) - authz.PUBLIC_ROUTES == set()
     assert set(authz.ROUTE_SCOPES) - routes == set()
+    assert {r for r in routes if isinstance(r, tuple)} >= authz.PUBLIC_ROUTES
 
 
 def test_the_two_surfaces_agree_on_what_a_scope_means():
@@ -523,3 +568,119 @@ def test_export_read_is_declared_and_reserved():
     assert authz.Scope.EXPORT_READ in authz.ALL_SCOPES
     mapped = set(authz.TOOL_SCOPES.values()) | {s for s in authz.ROUTE_SCOPES.values() if s}
     assert authz.Scope.EXPORT_READ not in mapped
+
+
+# ------------------------------------------------- a session id is an identity claim
+
+
+def _session_for(db, actor, *, host="h", repo="r", clone="/c"):
+    from app import coordination
+
+    return coordination.register_session(
+        db, actor_name=actor.name, host=host, repo=repo, clone_path=clone, actor_type=actor.type
+    )
+
+
+def _as_credential(db, actor):
+    return authz.Principal(
+        actor_id=actor.id, actor_name=actor.name, scopes=authz.ALL_SCOPES, source="credential", credential_id=1
+    )
+
+
+def test_a_credential_may_only_drive_its_own_session(db, self_actor):
+    agent = _make_ai(db)
+    mine = _session_for(db, agent, clone="/mine")
+    theirs = _session_for(db, self_actor, clone="/theirs")
+
+    with authz.bind(_as_credential(db, agent)):
+        authz.check_session_owner(db, mine.id)  # its own: fine
+        authz.check_session_owner(db, None)  # nothing claimed: fine
+        with pytest.raises(authz.ActorMismatch):
+            authz.check_session_owner(db, theirs.id)
+
+
+def test_the_operator_may_drive_every_session_on_the_machine(db, self_actor, unenforced):
+    agent = _make_ai(db)
+    theirs = _session_for(db, agent)
+    with authz.bind(authz.loopback_principal(db)):
+        authz.check_session_owner(db, theirs.id)
+
+
+def test_reading_another_sessions_inbox_is_refused_over_rest(client, db, self_actor, enforced):
+    """It writes RelayReceipts, so a read scope must not reach it."""
+    agent = _make_ai(db)
+    theirs = _session_for(db, self_actor, clone="/theirs")
+    token, _ = _credential(db, agent, {authz.Scope.COORDINATION_READ})
+
+    response = client.get(f"/coordination/sessions/{theirs.id}/inbox", headers=_auth(token))
+
+    assert response.status_code == 403
+    assert "another Actor" in response.json()["detail"]
+
+
+def test_every_coordination_tool_that_takes_a_session_id_checks_it():
+    """A session id is a request parameter; each surface that accepts one must verify it."""
+    import inspect
+
+    source = inspect.getsource(server)
+    for tool in (
+        "heartbeat_session",
+        "end_session",
+        "claim_territory",
+        "release_territory",
+        "send_relay",
+        "read_inbox",
+        "ack_relay",
+        "claim_git_resource",
+        "check_conflicts",
+    ):
+        start = source.index(f"def {tool}(")
+        body = source[start : start + 2000]
+        assert "check_session_owner" in body, f"{tool} takes a session id without checking it"
+
+
+# ------------------------------------------------- the two bearer layers coexist
+
+
+def test_a_credential_passes_the_shared_token_gate(db, self_actor, monkeypatch, enforced):
+    """ADR-008's gate and ADR-011's identity share one header; configuring both must still work."""
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from app.mcp import http_auth
+
+    monkeypatch.setenv(http_auth.TOKEN_ENV, "shared-secret")
+    token, _ = _credential(db, self_actor, {authz.Scope.LEDGER_READ})
+
+    def _factory():
+        return db
+
+    monkeypatch.setattr("app.database.SessionLocal", _factory)
+
+    async def ok(request):
+        return PlainTextResponse("reached")
+
+    app = http_auth.wrap_if_configured(Starlette(routes=[Route("/mcp", ok, methods=["POST"])]))
+    client = TestClient(app)
+
+    assert client.post("/mcp", headers={"Authorization": "Bearer shared-secret"}).status_code == 200
+    assert client.post("/mcp", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+    assert client.post("/mcp", headers={"Authorization": "Bearer neither"}).status_code == 401
+
+
+# ------------------------------------------------------------- open by decision
+
+
+def test_the_schema_routes_are_open_on_purpose(client, enforced):
+    """They describe the API's shape, which this repository publishes anyway."""
+    assert client.get("/openapi.json").status_code == 200
+    assert ("GET", "/openapi.json") in authz.PUBLIC_ROUTES
+
+
+def test_the_authorization_header_survives_the_cors_preflight():
+    from app.main import app
+
+    cors = next(m for m in app.user_middleware if "CORS" in str(m))
+    assert "Authorization" in cors.kwargs["allow_headers"]

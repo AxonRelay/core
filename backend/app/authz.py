@@ -102,6 +102,19 @@ class Forbidden(AuthzError):
         super().__init__(f"this credential does not carry the '{scope.value}' scope")
 
 
+class ActorMismatch(AuthzError):
+    """A valid credential asking to act as, or on behalf of, a different Actor.
+
+    Separate from :class:`Forbidden` on purpose: naming a scope here would tell
+    a caller that already holds that scope it does not, and would hide that the
+    argument, not the grant, is the problem.
+    """
+
+
+class ApprovalNotPermitted(AuthzError):
+    """A credential that may write to the ledger but may not approve *this* task."""
+
+
 @dataclass(frozen=True)
 class Principal:
     """Who is calling, resolved server-side."""
@@ -291,7 +304,67 @@ def check_claimed_actor(name: str | None) -> None:
         return
     if name != principal.actor_name:
         logger.info("authz refused an actor claim that does not match the credential")
-        raise Forbidden(Scope.ADMINISTRATION)
+        raise ActorMismatch("this credential acts as its own Actor; omit the name or pass that Actor's name")
+
+
+def check_session_owner(db: Session, session_id: int | None) -> None:
+    """Refuse a call that drives another Actor's coordination session.
+
+    Every coordination surface addresses a session by id, and an id is a
+    request parameter: without this, a `coordination:write` credential could
+    send relays as another agent, drop its territory claims or end its session,
+    and a `coordination:read` one could read an inbox — which marks the
+    owner's relays read and so is a write in disguise.
+
+    A loopback caller is the operator's own process, which legitimately drives
+    every session on the machine, so the check applies to credentials only.
+    """
+    principal = _current.get()
+    if principal is None or principal.source != "credential" or session_id is None:
+        return
+    session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if session is None:
+        # Not this layer's 404 to raise; the surface reports a missing session.
+        return
+    if session.actor_id != principal.actor_id:
+        logger.info("authz refused a session that belongs to another actor")
+        raise ActorMismatch("this session belongs to another Actor")
+
+
+def check_may_approve(db: Session, task_id: int) -> None:
+    """May this caller record an approval or rejection on this task?
+
+    `ledger:write` covers creating and running tasks as well as deciding on
+    them, so on its own it would let an agent credential approve the draft it
+    just produced and be recorded as the reviewer — the one thing the ledger
+    exists to make legible. So a credential may decide on a task when either:
+
+    * its Actor holds the `approver` assignment on that task (the data model
+      already says who may approve; nothing enforced it until now), or
+    * its Actor is a human — the operator, who approves by definition.
+
+    A loopback caller is the operator and is unaffected, so the personal PoC
+    behaves as before.
+    """
+    principal = _current.get()
+    if principal is None or principal.source != "credential" or principal.actor_id is None:
+        return
+    assigned = (
+        db.query(models.TaskAssignment)
+        .filter(
+            models.TaskAssignment.task_id == task_id,
+            models.TaskAssignment.actor_id == principal.actor_id,
+            models.TaskAssignment.role == models.AssignmentRoleEnum.APPROVER,
+        )
+        .first()
+    )
+    if assigned is not None:
+        return
+    actor = db.query(models.Actor).filter(models.Actor.id == principal.actor_id).first()
+    if actor is not None and actor.type == models.ActorTypeEnum.HUMAN:
+        return
+    logger.info("authz refused an approval by an actor with no approver assignment")
+    raise ApprovalNotPermitted("this Actor is not an approver on this task; assign it the 'approver' role first")
 
 
 # ------------------------------------------------------- the surface → scope maps
@@ -341,9 +414,24 @@ RESOURCE_SCOPES: dict[str, Scope] = {
     "axonrelay://tasks/{task_id}/drafts/{version}": Scope.LEDGER_READ,
 }
 
-#: Routes that answer without a credential at all. Only the health check: a
-#: liveness probe that needs a secret is a liveness probe that stops working.
-PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/")})
+#: Routes that answer without a credential at all.
+#:
+#: The health check, because a liveness probe that needs a secret is a
+#: liveness probe that stops working. And FastAPI's own schema routes: they
+#: describe the API's shape, which this repository publishes anyway, and they
+#: are Starlette routes rather than `APIRoute`s so the application-wide
+#: dependency never sees them — naming them here makes that a decision rather
+#: than an accident, and the structural test checks the whole route table, not
+#: just the API ones.
+PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/"),
+        ("GET", "/openapi.json"),
+        ("GET", "/docs"),
+        ("GET", "/docs/oauth2-redirect"),
+        ("GET", "/redoc"),
+    }
+)
 
 #: Every other REST route, by (method, path template). ``None`` means the route
 #: needs an authenticated caller but no particular scope; a route in neither
@@ -371,7 +459,7 @@ ROUTE_SCOPES: dict[tuple[str, str], Scope | None] = {
     ("GET", "/tasks/{task_id}/ledger/verify"): Scope.LEDGER_READ,
     ("GET", "/tasks/{task_id}/assignments"): Scope.LEDGER_READ,
     ("POST", "/tasks/{task_id}/assignments"): Scope.LEDGER_WRITE,
-    ("DELETE", "/tasks/{task_id}/assignments/{actor_id}"): Scope.LEDGER_WRITE,
+    ("DELETE", "/tasks/{task_id}/assignments/{actor_id}"): Scope.ADMINISTRATION,
     ("GET", "/coordination/board"): Scope.COORDINATION_READ,
     ("GET", "/coordination/sessions"): Scope.COORDINATION_READ,
     ("GET", "/coordination/claims"): Scope.COORDINATION_READ,
