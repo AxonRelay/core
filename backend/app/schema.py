@@ -42,7 +42,9 @@ class AgentDefinitionResponse(BaseModel):
     actor_id: int
     agent_type: str
     description: str | None
-    config: dict | None
+    #: The config's key names, never its values - it is where credentials go
+    #: (app/disclosure.py). Populated from the ORM row by `config_keys`.
+    config_keys: list[str] | None = None
     is_active: bool
     created_at: datetime
     updated_at: datetime

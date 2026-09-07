@@ -2,19 +2,19 @@
 
 MCP returns JSON-friendly payloads, not Pydantic / SQLAlchemy objects. These
 helpers project ORM rows into plain dicts the LLM can read directly.
+
+Everything about the coordination plane, and every Actor, goes through
+`app.disclosure`, which decides what a response may contain in the current
+mode (issue #26). These functions stay as the one place a row becomes a dict;
+they just no longer decide *which* fields that dict has.
 """
 
-from app import models
+from app import disclosure, models
 
 
 def actor_to_dict(actor: models.Actor | None) -> dict | None:
-    if not actor:
-        return None
-    return {
-        "id": actor.id,
-        "type": str(actor.type),
-        "name": actor.name,
-    }
+    """An Actor's name is arbitrary text, so safe mode gets its opaque ref instead."""
+    return disclosure.actor_view(actor)
 
 
 def assignment_to_dict(assignment: models.TaskAssignment) -> dict:
@@ -83,7 +83,9 @@ def agent_definition_to_dict(agent: models.AgentDefinition) -> dict:
         "actor_id": agent.actor_id,
         "agent_type": str(agent.agent_type),
         "description": agent.description,
-        "config": agent.config,
+        # Never the config's values: it is where an operator puts credentials
+        # (app/disclosure.py). The key names describe its shape.
+        "config_keys": disclosure.config_keys(agent.config),
         "is_active": agent.is_active,
         "actor": actor_to_dict(agent.actor),
     }
@@ -93,61 +95,16 @@ def agent_definition_to_dict(agent: models.AgentDefinition) -> dict:
 
 
 def workspace_to_dict(workspace: models.Workspace | None) -> dict | None:
-    if not workspace:
-        return None
-    return {
-        "id": workspace.id,
-        "host": workspace.host,
-        "repo": workspace.repo,
-        "clone_path": workspace.clone_path,
-        "git_dir": workspace.git_dir,
-        "label": workspace.label,
-    }
+    return disclosure.workspace_view(workspace)
 
 
 def session_to_dict(session: models.Session) -> dict:
-    return {
-        "session_id": session.id,
-        "actor_id": session.actor_id,
-        "actor": actor_to_dict(session.actor),
-        "workspace": workspace_to_dict(session.workspace),
-        "branch": session.branch,
-        "focus": session.focus,
-        "status": str(session.status),
-        "started_at": session.started_at.isoformat(),
-        "last_heartbeat_at": session.last_heartbeat_at.isoformat(),
-        "ended_at": session.ended_at.isoformat() if session.ended_at else None,
-    }
+    return disclosure.session_view(session)
 
 
 def claim_to_dict(claim: models.Claim) -> dict:
-    return {
-        "claim_id": claim.id,
-        "session_id": claim.session_id,
-        "repo": claim.repo,
-        "paths": list(claim.paths or []),
-        "resource": str(claim.resource) if claim.resource else None,
-        "mode": str(claim.mode),
-        "reason": claim.reason,
-        "status": str(claim.status),
-        "forced_over": claim.forced_over,
-        "created_at": claim.created_at.isoformat(),
-        "expires_at": claim.expires_at.isoformat(),
-        "released_at": claim.released_at.isoformat() if claim.released_at else None,
-    }
+    return disclosure.claim_view(claim)
 
 
 def relay_to_dict(relay: models.Relay) -> dict:
-    return {
-        "relay_id": relay.id,
-        "kind": str(relay.kind),
-        "subject": relay.subject,
-        "body": relay.body,
-        "from_session_id": relay.from_session_id,
-        "from_actor_id": relay.from_actor_id,
-        "to_actor_id": relay.to_actor_id,
-        "to_workspace_id": relay.to_workspace_id,
-        "to_repo": relay.to_repo,
-        "in_reply_to_id": relay.in_reply_to_id,
-        "created_at": relay.created_at.isoformat(),
-    }
+    return disclosure.relay_view(relay)

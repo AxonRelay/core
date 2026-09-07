@@ -151,8 +151,14 @@ Three guarantees that are easy to conflate:
 | `Workspace` | One checkout of one repo on one machine, identified by `(host, repo, clone_path)`. Two clones of the same repo are two workspaces. |
 | `Session` | An Actor working inside a Workspace over a stretch of time. Holds claims, receives relays. Re-registering resumes it, so an agent restart loses nothing. |
 | `Claim` | An **advisory, expiring** lease — on paths within a repo, or on a shared git resource (`worktree` / `stash` / `refs` / `remote`) that no path pattern can describe. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
-| `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. |
+| `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. Carries a structured `code` beside its prose. |
 | `RelayReceipt` | Per-recipient read/ack state, so one peer acking a broadcast does not hide it from the others. |
+
+Every response about the board passes a disclosure policy
+([ADR-012](docs/adr-012-metadata-minimization.md)): in content-blind mode it
+carries opaque references, structured codes and counts, not host names,
+absolute paths or prose. Operational rows expire on a documented schedule
+(`python -m app.retention`); the ledger never does.
 
 Design, semantics, and the per-turn protocol agents follow:
 **[docs/coordination-spec.md](docs/coordination-spec.md)**.
@@ -248,7 +254,7 @@ cp .env.example .env                    # works as-is on a laptop; add LANGGRAPH
 docker compose up -d postgres           # Postgres on 127.0.0.1:5432
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-(cd backend && alembic upgrade head)    # migrations through 011; seeds the "self" Actor
+(cd backend && alembic upgrade head)    # migrations through 012; seeds the "self" Actor
 ```
 
 Or, with the venv active, `make dev` runs the last three and starts the MCP
@@ -306,12 +312,12 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (28 tools / 3 resources), LangGraph Platform client, migrations through 011. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (28 tools / 3 resources), LangGraph Platform client, migrations through 012. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
 - 🚧 **Infra**: legacy `infra/` (AWS EC2 DNS) and `Caddyfile` removed. The cutover to Cloudflare Tunnel + Tailscale + Vercel/Pages is templated and documented in [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md); the account-side steps (DNS switch, EC2 decommission) remain a manual operator action.
-- 🚧 **Tests**: 339 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, the MCP tool surface) plus 29 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and on resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
+- 🚧 **Tests**: 385 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, the MCP tool surface) plus 36 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and on resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
 
 Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md). Coordination design: [docs/coordination-spec.md](docs/coordination-spec.md).
 
@@ -327,6 +333,7 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 - [docs/adr-009-artifact-commitment.md](docs/adr-009-artifact-commitment.md) — why every approval names the draft version and content commitment it decided on, and what that does not prove
 - [docs/adr-010-safe-envelope.md](docs/adr-010-safe-envelope.md) — the content-blind mode: what the Safe Envelope admits, what every other surface refuses, and how rejected values stay out of storage, logs and errors
 - [docs/adr-011-caller-identity.md](docs/adr-011-caller-identity.md) — per-caller credentials and the six scopes: how the recorded Actor stops being a request parameter, and why stdio stays loopback-trusted
+- [docs/adr-012-metadata-minimization.md](docs/adr-012-metadata-minimization.md) — what a shared board may say about a machine, the retention windows, and a threat model naming what stays observable
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup (account side only; the backend side is not built yet)

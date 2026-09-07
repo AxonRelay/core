@@ -144,6 +144,21 @@ def _free_text_surface() -> None:
         raise ToolError(str(e)) from None
 
 
+def _resolve_enum(enum_cls, value: str | None, label: str):
+    """A structured code, or None. An unknown value is refused by name, never guessed."""
+    if not value:
+        return None
+    try:
+        return enum_cls(value)
+    except ValueError:
+        allowed = ", ".join(m.value for m in enum_cls)
+        raise ToolError(f"Invalid {label}. One of: {allowed}") from None
+
+
+def _resolve_focus_code(value: str | None) -> models.FocusCodeEnum | None:
+    return _resolve_enum(models.FocusCodeEnum, value, "focus code")
+
+
 def _resolve_status(status: str | None) -> models.TaskStatusEnum | None:
     if not status:
         return None
@@ -612,6 +627,7 @@ def register_session(
     focus: str | None = None,
     actor_type: str = "ai",
     git_dir: str | None = None,
+    focus_code: str | None = None,
 ) -> dict:
     """Join the coordination board. Call this once at the start of a work session.
 
@@ -643,13 +659,16 @@ def register_session(
             clone_path=clone_path,
             branch=branch,
             focus=focus,
+            focus_code=_resolve_focus_code(focus_code),
             git_dir=git_dir,
         )
         return session_to_dict(session)
 
 
 @mcp.tool()
-def heartbeat_session(session_id: int, focus: str | None = None, branch: str | None = None) -> dict:
+def heartbeat_session(
+    session_id: int, focus: str | None = None, branch: str | None = None, focus_code: str | None = None
+) -> dict:
     """Report that you are still working, and update what you are working on.
 
     `focus` is the one line other agents see on the board - keep it current
@@ -660,7 +679,9 @@ def heartbeat_session(session_id: int, focus: str | None = None, branch: str | N
     with _session() as _db:
         authz.check_session_owner(_db, session_id)
     with _session() as db:
-        session = coordination.heartbeat_session(db, session_id, focus=focus, branch=branch)
+        session = coordination.heartbeat_session(
+            db, session_id, focus=focus, focus_code=_resolve_focus_code(focus_code), branch=branch
+        )
         if not session:
             raise ValueError(f"Session {session_id} not found")
         return session_to_dict(session)
@@ -728,6 +749,7 @@ def claim_territory(
     ttl_minutes: int = 60,
     repo: str | None = None,
     force: bool = False,
+    reason_code: str | None = None,
 ) -> dict:
     """Take an advisory lease on the paths you are about to edit.
 
@@ -753,6 +775,7 @@ def claim_territory(
             repo=repo,
             mode=resolved_mode,
             reason=reason,
+            reason_code=_resolve_enum(models.ClaimReasonCodeEnum, reason_code, "reason code"),
             ttl_minutes=ttl_minutes,
             force=force,
         )
@@ -792,6 +815,7 @@ def send_relay(
     to_workspace_id: int | None = None,
     to_repo: str | None = None,
     in_reply_to_id: int | None = None,
+    code: str | None = None,
 ) -> dict:
     """Leave a durable message for other sessions. They read it on their own turn.
 
@@ -813,6 +837,7 @@ def send_relay(
             db,
             subject=subject,
             body=body,
+            code=_resolve_enum(models.RelayCodeEnum, code, "relay code"),
             from_session_id=from_session_id,
             to_actor_id=to_actor_id,
             to_workspace_id=to_workspace_id,
@@ -837,7 +862,7 @@ def read_inbox(session_id: int, include_acked: bool = False, limit: int = 50) ->
 
 
 @mcp.tool()
-def ack_relay(relay_id: int, session_id: int, note: str | None = None) -> dict:
+def ack_relay(relay_id: int, session_id: int, note: str | None = None, ack_code: str | None = None) -> dict:
     """Acknowledge a relay so it leaves your inbox, optionally with a reply note.
 
     Acking is per recipient: it does not hide a broadcast from anyone else, and
@@ -847,12 +872,19 @@ def ack_relay(relay_id: int, session_id: int, note: str | None = None) -> dict:
     with _session() as _db:
         authz.check_session_owner(_db, session_id)
     with _session() as db:
-        receipt = coordination.ack_relay(db, relay_id=relay_id, session_id=session_id, note=note)
+        receipt = coordination.ack_relay(
+            db,
+            relay_id=relay_id,
+            session_id=session_id,
+            note=note,
+            ack_code=_resolve_enum(models.AckCodeEnum, ack_code, "ack code"),
+        )
         return {
             "relay_id": receipt.relay_id,
             "session_id": receipt.session_id,
             "acked_at": receipt.acked_at.isoformat() if receipt.acked_at else None,
             "ack_note": receipt.ack_note,
+            "ack_code": str(receipt.ack_code) if receipt.ack_code else None,
         }
 
 
@@ -914,6 +946,7 @@ def claim_git_resource(
     reason: str | None = None,
     ttl_minutes: int = 60,
     force: bool = False,
+    reason_code: str | None = None,
 ) -> dict:
     """Claim a shared git resource that no path pattern can describe.
 
@@ -941,7 +974,13 @@ def claim_git_resource(
     resolved = models.ClaimResourceEnum(resource)
     with _session() as db:
         result = coordination.claim_resource(
-            db, session_id=session_id, resource=resolved, reason=reason, ttl_minutes=ttl_minutes, force=force
+            db,
+            session_id=session_id,
+            resource=resolved,
+            reason=reason,
+            reason_code=_resolve_enum(models.ClaimReasonCodeEnum, reason_code, "reason code"),
+            ttl_minutes=ttl_minutes,
+            force=force,
         )
         return {
             "granted": result["granted"],
