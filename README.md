@@ -171,7 +171,8 @@ Design, semantics, and the per-turn protocol agents follow:
 
 **Ledger — 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
 `list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
-(interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
+(interactive approval via MCP elicitation, in whichever shape the negotiated
+protocol revision uses — see `docs/mcp-server.md`), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
 
 **Coordination — 12 tools**: `register_session`, `heartbeat_session`,
@@ -303,6 +304,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 | `AXONRELAY_REQUIRE_AUTH` | — | `1` requires a per-caller credential on every HTTP call and records the credential's Actor ([ADR-011](docs/adr-011-caller-identity.md)); stdio stays loopback-trusted |
 | `AXONRELAY_SAFE_MODE` | — | `1` runs the instance content-blind: free-text surfaces refuse, the Safe Envelope is the only write path ([ADR-010](docs/adr-010-safe-envelope.md)) |
 | `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS` | — | `1` accepts envelopes with `identifier_policy: public` (`owner/repo` slugs); otherwise identifiers must be opaque |
+| `AXONRELAY_REQUEST_STATE_KEY` | — | 32+ bytes keying the sealed handle that resumes a half-finished interactive approval on MCP 2026-07-28 ([ADR-013](docs/adr-013-mcp-2026-interaction.md)); unset, the key is process-local and a restart makes the client ask again |
 
 See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
@@ -334,6 +336,7 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 - [docs/adr-010-safe-envelope.md](docs/adr-010-safe-envelope.md) — the content-blind mode: what the Safe Envelope admits, what every other surface refuses, and how rejected values stay out of storage, logs and errors
 - [docs/adr-011-caller-identity.md](docs/adr-011-caller-identity.md) — per-caller credentials and the six scopes: how the recorded Actor stops being a request parameter, and why stdio stays loopback-trusted
 - [docs/adr-012-metadata-minimization.md](docs/adr-012-metadata-minimization.md) — what a shared board may say about a machine, the retention windows, and a threat model naming what stays observable
+- [docs/adr-013-mcp-2026-interaction.md](docs/adr-013-mcp-2026-interaction.md) — the two MCP interaction models an approval can travel on, how the decision stays bound to the draft that was shown across rounds, and why a replayed round cannot append twice
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup (account side only; the backend side is not built yet)

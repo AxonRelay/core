@@ -152,7 +152,8 @@ content-blind モードでは opaque ref・構造化コード・件数だけに�
 
 **台帳系 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
 `list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
-（MCP elicitation による対話的承認）, `verify_task_ledger`, `get_drafts`,
+（MCP elicitation による対話的承認。問いの運び方は交渉した改訂に従う——`docs/mcp-server.md`）,
+`verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`。
 
 **調整系 12 tools**: `register_session`, `heartbeat_session`, `end_session`,
@@ -278,6 +279,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 | `WRITER_MODEL` / `REVIEWER_MODEL` | `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` | ロール別モデル |
 | `DISCORD_*` | — | Discord モバイル承認（Phase 2.6・未接続） |
 | `AXONRELAY_REQUIRE_AUTH` | — | `1` で HTTP 呼び出しに per-caller credential を要求し、記録する Actor を credential 側で決める（[ADR-011](docs/adr-011-caller-identity.md)）。stdio は loopback 信頼のまま |
+| `AXONRELAY_REQUEST_STATE_KEY` | — | MCP 2026-07-28 で未完了の対話的承認を再開するハンドルの鍵（32 バイト以上、[ADR-013](docs/adr-013-mcp-2026-interaction.md)）。未設定ならプロセスローカルで、再起動をまたぐと問い直しになる |
 | `AXONRELAY_SAFE_MODE` | — | `1` でインスタンスを content-blind にする: 自由文を受ける surface は拒否、Safe Envelope が唯一の書き込み経路（[ADR-010](docs/adr-010-safe-envelope.md)） |
 | `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS` | — | `1` で `identifier_policy: public`（`owner/repo` slug）の envelope を受理。それ以外は opaque id 必須 |
 
@@ -311,6 +313,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/adr-010-safe-envelope.md](docs/adr-010-safe-envelope.md) — content-blind モード: Safe Envelope が受け付けるもの、他の surface が拒否するもの、拒否された値を保存・ログ・エラーに残さない仕組み
 - [docs/adr-011-caller-identity.md](docs/adr-011-caller-identity.md) — per-caller credential と 6 つの scope: 記録される Actor がリクエストパラメータでなくなる理由と、stdio を loopback 信頼のままにする理由
 - [docs/adr-012-metadata-minimization.md](docs/adr-012-metadata-minimization.md) — 共有ボードがマシンについて何を言ってよいか、保持期間、なお観測できるものを列挙した脅威モデル
+- [docs/adr-013-mcp-2026-interaction.md](docs/adr-013-mcp-2026-interaction.md) — 承認の問いが乗りうる 2 つの MCP 対話モデル、ラウンドをまたいで表示した draft に判断を束縛する方法、再送が二重に記録されない理由
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ（アカウント側の手順のみ。backend 側は未実装）

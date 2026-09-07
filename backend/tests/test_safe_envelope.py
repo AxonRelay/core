@@ -356,9 +356,12 @@ def test_safe_mode_refuses_every_mcp_free_text_tool(mcp_db, safe_mode, outbound,
 def test_review_pending_task_is_refused_before_it_shows_anything(mcp_db, safe_mode):
     tool = server.mcp._tool_manager.get_tool("review_pending_task")
     assert tool is not None
-    # It needs an elicitation context; the guard runs before that matters.
+    # The guard lives in the resolver that pins the draft, which is the first
+    # thing the framework runs and the last point before a draft could reach
+    # the wire as an elicitation. A bare Context is enough to get there: the
+    # refusal happens before anything needs a session to talk to.
     with pytest.raises(ToolError) as exc:
-        asyncio.run(tool.run({"task_id": 1}, context=None))
+        asyncio.run(tool.run({"task_id": 1}, context=server.Context(mcp_server=server.mcp)))
     assert str(exc.value).endswith(safe_envelope.SAFE_MODE_REFUSAL)
 
 

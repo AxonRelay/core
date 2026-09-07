@@ -343,6 +343,21 @@ class CommitmentMismatchError(LedgerError):
     """A supplied commitment does not match the artifact content."""
 
 
+def find_decision(db: Session, task_id: int, decision_key: str):
+    """The approval already recorded under `decision_key`, or None.
+
+    The read half of decision idempotency (migration 013). Callers that can be
+    replayed - the 2026-07-28 multi-round `tools/call` re-sends its arguments
+    every round - use this to tell "the decision was already made" apart from
+    "make it again".
+    """
+    return (
+        db.query(models.Approval)
+        .filter(models.Approval.task_id == task_id, models.Approval.decision_key == decision_key)
+        .one_or_none()
+    )
+
+
 def _lock_task(db: Session, task_id: int) -> models.Task:
     """Take the per-task row lock that serializes ledger writers.
 
@@ -429,6 +444,7 @@ def record_approval(
     artifact_version: int | None = None,
     expected_commitment: str | None = None,
     modified_draft: str | None = None,
+    decision_key: str | None = None,
 ):
     """Record an approval / rejection event bound to the artifact it decided on.
 
@@ -446,6 +462,13 @@ def record_approval(
     * `modified_draft` appends a new draft version (producer = the reviewer)
       **before** the approval is written, and the approval binds to that new
       version.
+    * `decision_key` makes the write idempotent: if this task already carries
+      an approval under that key, the existing row is returned and **nothing
+      is appended** - not the approval, and not the `modified_draft` version
+      it would have created. A replayed round therefore reads as the decision
+      it repeats rather than as a second one. The lookup happens under the
+      task row lock, and migration 013's unique index is the backstop for two
+      rounds that race past it on separate connections.
 
     created_at is set explicitly here (not via the column default) so the value
     that is hashed is exactly the value persisted.
@@ -462,6 +485,14 @@ def record_approval(
     # Lock the task row *before* reading drafts or the chain head, so a
     # concurrent writer on the same task waits here rather than racing us.
     _lock_task(db, task_id)
+
+    # Idempotency first: a replay must not append a draft version either, so
+    # this runs before `modified_draft` is considered and before the staleness
+    # checks, which the replay would fail once its own decision moved the task on.
+    if decision_key is not None:
+        already = find_decision(db, task_id, decision_key)
+        if already is not None:
+            return already
 
     shown = _latest_draft(db, task_id)
     if shown is None:
@@ -527,6 +558,7 @@ def record_approval(
         artifact_commitment=binding.commitment,
         artifact_commitment_algorithm=binding.commitment_algorithm,
         producer_actor_id=binding.producer_actor_id,
+        decision_key=decision_key,
     )
     db.add(db_approval)
     db.commit()

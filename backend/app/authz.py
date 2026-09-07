@@ -410,6 +410,10 @@ TOOL_SCOPES: dict[str, Scope] = {
 #: read tools do and take the same scope.
 RESOURCE_SCOPES: dict[str, Scope] = {
     "axonrelay://board": Scope.COORDINATION_READ,
+    # The protocol-compatibility matrix names no ledger content, but what it
+    # describes is how an approval is asked for, so it sits with the ledger's
+    # read scope rather than becoming this table's one unauthenticated entry.
+    "axonrelay://compat": Scope.LEDGER_READ,
     "axonrelay://tasks/{task_id}": Scope.LEDGER_READ,
     "axonrelay://tasks/{task_id}/drafts/{version}": Scope.LEDGER_READ,
 }
