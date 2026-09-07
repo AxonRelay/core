@@ -78,12 +78,74 @@ def test_a_released_claim_goes_and_a_live_one_stays(db, agent):
     old = coordination.claim_territory(db, session_id=session.id, paths=["a"])["claim"]
     live = coordination.claim_territory(db, session_id=session.id, paths=["b"])["claim"]
     coordination.release_claim(db, old.id)
-    _aged(db, old, "created_at", retention.FINISHED_CLAIM_DAYS + 1)
+    _aged(db, old, "released_at", retention.FINISHED_CLAIM_DAYS + 1)
 
     result = retention.sweep(db)
 
     assert result.claims == 1
     assert [c.id for c in db.query(models.Claim).all()] == [live.id]
+
+
+def test_the_window_runs_from_when_a_claim_finished_not_when_it_was_taken(db, agent):
+    """A long-lived claim released a minute ago is the one a peer is about to ask about."""
+    session = _session(db)
+    claim = coordination.claim_territory(db, session_id=session.id, paths=["a"], ttl_minutes=60 * 24 * 90)["claim"]
+    _aged(db, claim, "created_at", retention.FINISHED_CLAIM_DAYS * 10)
+    coordination.release_claim(db, claim.id)
+
+    assert retention.sweep(db).claims == 0
+    assert db.query(models.Claim).count() == 1
+
+
+def test_an_expired_claim_ages_from_its_expiry(db, agent):
+    session = _session(db)
+    claim = coordination.claim_territory(db, session_id=session.id, paths=["a"])["claim"]
+    _aged(db, claim, "expires_at", 1)
+    assert retention.sweep(db).claims == 0  # expired, but only just
+
+    _aged(db, claim, "expires_at", retention.FINISHED_CLAIM_DAYS + 1)
+    assert retention.sweep(db).claims == 1
+
+
+def test_a_broadcast_only_ever_leaves_on_the_long_window(db, agent):
+    """A receipt exists only for a session that read it, so "all acked" proves nothing about a broadcast."""
+    sender = _session(db, "/sender")
+    reader = coordination.register_session(
+        db, actor_name="reader", host="h", repo="r", clone_path="/reader", actor_type=models.ActorTypeEnum.AI
+    )
+    coordination.register_session(
+        db, actor_name="quiet", host="h", repo="r", clone_path="/quiet", actor_type=models.ActorTypeEnum.AI
+    )
+    relay = coordination.send_relay(db, from_session_id=sender.id, subject="fleet-wide")
+    coordination.read_inbox(db, session_id=reader.id)
+    coordination.ack_relay(db, relay_id=relay.id, session_id=reader.id)
+    _aged(db, relay, "created_at", retention.ACKED_RELAY_DAYS + 1)
+
+    assert retention.sweep(db).relays == 0, "one peer acking must not delete it for the others"
+
+    _aged(db, relay, "created_at", retention.UNACKED_RELAY_DAYS + 1)
+    assert retention.sweep(db).relays == 1
+
+
+def test_sweeping_a_session_does_not_resurrect_a_delivered_relay(db, agent):
+    """Receipts cascade off a session; losing them would make an acked relay look unread."""
+    sender = _session(db, "/sender")
+    reader = coordination.register_session(
+        db, actor_name="reader", host="h", repo="r", clone_path="/reader", actor_type=models.ActorTypeEnum.AI
+    )
+    relay = coordination.send_relay(db, from_session_id=sender.id, subject="s", to_actor_id=reader.actor_id)
+    coordination.read_inbox(db, session_id=reader.id)
+    coordination.ack_relay(db, relay_id=relay.id, session_id=reader.id)
+    coordination.end_session(db, reader.id)
+    _aged(db, reader, "ended_at", retention.ENDED_SESSION_DAYS + 1)
+    _aged(db, relay, "created_at", retention.ACKED_RELAY_DAYS + 1)
+
+    result = retention.sweep(db)
+
+    assert result.sessions == 1
+    assert result.relay_receipts == 1, "the receipt is counted, not absorbed by a cascade"
+    assert db.query(models.Relay).count() == 0, "a delivered relay goes with its receipts"
+    assert coordination.board(db)["open_relays"] == []
 
 
 def test_a_relay_everyone_acked_goes_with_its_receipts(db, agent):

@@ -733,21 +733,12 @@ def guard_unregistered_caller(
                 continue
         elif not _resource_domains_overlap(resource, workspace, other):
             continue
-        conflicts.append(
-            {
-                "claim_id": claim.id,
-                "session_id": claim.session_id,
-                "resource": str(claim.resource),
-                "reason": claim.reason,
-                "expires_at": claim.expires_at.isoformat(),
-                "holder": describe_holder(claim.session),
-            }
-        )
+        conflicts.append(disclosure.conflict_view(claim, holder=describe_holder(claim.session)))
 
     return {
         "allowed": not conflicts,
         "resource": str(resource),
-        "caller": {"host": host, "clone_path": clone_path, "repo": repo, "registered": workspace is not None},
+        "caller": disclosure.guard_caller_view(host=host, clone_path=clone_path, repo=repo, workspace=workspace),
         "conflicts": conflicts,
     }
 
