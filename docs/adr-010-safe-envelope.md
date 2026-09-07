@@ -49,11 +49,11 @@ Envelope は Pydantic model（`extra="forbid"`）で、JSON Schema を
 | `policy_version` | `^[A-Za-z0-9._-]{1,32}$` |
 | `identifier_policy` | `opaque`（既定）/ `public` |
 | `event_id`, `actor_id`, `workspace_id?`, `session_id?`, `artifact_id?` | opaque id: `^[A-Za-z0-9_-]{16,128}$`（`/` `.` `:` `@` を含めない = パス・URL・メール・slug が通らない） |
-| `repository_id` | opaque id、または `public` policy 下で `owner/repo` slug |
+| `repository_id` | policy で形が決まる: `opaque` なら opaque id と同じ形、`public` なら `owner` / `owner/repo` slug（他の識別子は常に opaque） |
 | `action` | 閉集合 enum（`session_start` … `relay_ack`） |
 | `outcome` | `success` / `refused` / `conflict` / `error` |
 | `artifact_commitment?` | `^[0-9a-f]{64}$`、**producer が算出**。core は再計算しない |
-| `artifact_commitment_algorithm?` | `sha256-utf8-v1`（ADR-009 と同じラベル） |
+| `artifact_commitment_algorithm?` | `app.ledger.COMMITMENT_ALGORITHM` と同一の値のみ（ADR-009 と同じラベル） |
 | `artifact_version?` | 整数 ≥ 1 |
 | `occurred_at` | timezone-aware datetime |
 | `producer_signature?` | base64url、16〜1024 文字。保存・返却のみで検証はしない |
@@ -62,7 +62,13 @@ Envelope は Pydantic model（`extra="forbid"`）で、JSON Schema を
 `url` / `clone_path` / `host` … を入れる**場所が無い**。未知フィールドは拒否。
 
 保存先 `safe_events` テーブルには **Text 列が存在しない**（テストで構造的に保証）。
-`event_id` は unique で、再送は冪等（既存行を返し `created=false`）。
+`event_id` は unique で、再送は冪等（既存行を返し `created=false`）。同時再送で
+unique 制約に負けた側も既存行を返す（insert-first）。
+
+safe mode の網羅はテストが構造的に強制する: MCP の全 tool と REST の全書き込み
+route は「拒否」「読み取り専用（id / enum のみ）」「envelope」のいずれかに分類されて
+いなければならず、未分類の surface が増えるとテストが落ちる。`check_conflicts` は
+読み取りだが呼び出し元のパスを受けて返すため拒否側に置く。
 
 ### 3. 拒否は値を含まない
 

@@ -59,7 +59,7 @@
     "artifact_commitment_algorithm": {
       "anyOf": [
         {
-          "const": "sha256-utf8-v1",
+          "maxLength": 32,
           "type": "string"
         },
         {
@@ -67,6 +67,7 @@
         }
       ],
       "default": null,
+      "description": "Only 'sha256-utf8-v1' is accepted.",
       "title": "Artifact Commitment Algorithm"
     },
     "artifact_id": {
@@ -141,18 +142,10 @@
       "title": "Producer Signature"
     },
     "repository_id": {
-      "anyOf": [
-        {
-          "pattern": "^[A-Za-z0-9_-]{16,128}$",
-          "type": "string"
-        },
-        {
-          "pattern": "^[A-Za-z0-9._-]{1,100}(/[A-Za-z0-9._-]{1,100})?$",
-          "type": "string"
-        }
-      ],
-      "description": "Opaque token, or a public slug under the public policy.",
-      "title": "Repository Id"
+      "description": "Under the opaque policy: an opaque token (same shape as event_id). Under the public policy: an `owner` or `owner/repo` slug.",
+      "maxLength": 201,
+      "title": "Repository Id",
+      "type": "string"
     },
     "schema_version": {
       "const": 1,
