@@ -155,15 +155,30 @@ class Task(Base):
 
 
 class Draft(Base):
-    """Version history of task drafts."""
+    """Version history of task drafts — the artifacts approvals bind to.
+
+    ``(task_id, version)`` is unique so a version number names exactly one
+    artifact. ``commitment`` is the SHA-256 of the content (see
+    app/ledger.py); it is what an approval records, so the ledger can prove
+    which bytes were approved without ever re-reading them.
+    """
 
     __tablename__ = "drafts"
+    __table_args__ = (UniqueConstraint("task_id", "version", name="uq_drafts_task_version"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Artifact commitment (migration 009). NULL only on rows the backfill
+    # could not reach; record_approval fills it in before binding to them.
+    commitment = Column(String(64))
+    commitment_algorithm = Column(String(32))
+    # Producer of this version. Deliberately not a FK: a ledger field must not
+    # be rewritten (SET NULL) because an Actor row was deleted.
+    producer_actor_id = Column(Integer)
 
     task = relationship("Task", back_populates="drafts")
 
@@ -174,7 +189,7 @@ class Approval(Base):
     __tablename__ = "approvals"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     reviewer_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"))
     action = Column(String(20), nullable=False)
     comment = Column(Text)
@@ -185,8 +200,28 @@ class Approval(Base):
     prev_hash = Column(String(64))
     entry_hash = Column(String(64))
 
+    # Which payload the row was hashed with: 1 = event only (migrations
+    # 004–008; 009 stamps those rows), 2 = artifact-bound. NULL only on rows
+    # that were never hashed (pre-004). Verification picks the payload by this.
+    hash_version = Column(Integer)
+
+    # Artifact binding (migration 009) — all five fields are inside the v2
+    # hash. NULL on legacy rows, which are reported as not artifact-bound.
+    artifact_ref = Column(String(255))
+    artifact_version = Column(Integer)
+    artifact_commitment = Column(String(64))
+    artifact_commitment_algorithm = Column(String(32))
+    producer_actor_id = Column(Integer)  # not a FK, same reason as Draft
+
     task = relationship("Task", back_populates="approvals")
     reviewer = relationship("Actor", back_populates="approvals", foreign_keys=[reviewer_actor_id])
+
+    @property
+    def artifact_bound(self) -> bool:
+        """True when this entry names the exact artifact it approved."""
+        from app import ledger  # ledger has no model imports; local to keep the module graph acyclic
+
+        return (self.hash_version or 1) >= ledger.ARTIFACT_BINDING_SINCE and self.artifact_commitment is not None
 
 
 class ExternalLink(Base):
@@ -279,6 +314,28 @@ class RelayKindEnum(enum.StrEnum):
     ANSWER = "answer"
     HANDOFF = "handoff"
     WARNING = "warning"
+
+
+class SafeActionEnum(enum.StrEnum):
+    """What a Safe Envelope reports happened. Closed set; free text has no slot."""
+
+    SESSION_START = "session_start"
+    SESSION_HEARTBEAT = "session_heartbeat"
+    SESSION_END = "session_end"
+    CLAIM_REQUEST = "claim_request"
+    CLAIM_RELEASE = "claim_release"
+    ARTIFACT_PRODUCED = "artifact_produced"
+    DECISION_APPROVE = "decision_approve"
+    DECISION_REJECT = "decision_reject"
+    RELAY_NOTICE = "relay_notice"
+    RELAY_ACK = "relay_ack"
+
+
+class SafeOutcomeEnum(enum.StrEnum):
+    SUCCESS = "success"
+    REFUSED = "refused"
+    CONFLICT = "conflict"
+    ERROR = "error"
 
 
 class Workspace(Base):
@@ -433,3 +490,38 @@ class RelayReceipt(Base):
 
     relay = relationship("Relay", back_populates="receipts")
     session = relationship("Session")
+
+
+class SafeEvent(Base):
+    """One ingested Safe Envelope (app/safe_envelope.py). Append-only, metadata only.
+
+    Every column is a bounded identifier, an enum, a digest or a timestamp. The
+    table has no text column by design: a producer that wanted to send a
+    title, a body or a path has no field to put it in, and the schema rejects
+    unknown fields before anything reaches this row.
+    """
+
+    __tablename__ = "safe_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schema_version = Column(Integer, nullable=False)
+    policy_version = Column(String(32), nullable=False)
+    identifier_policy = Column(String(16), nullable=False)
+
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    actor_ref = Column(String(128), nullable=False, index=True)
+    repository_ref = Column(String(201), nullable=False, index=True)
+    workspace_ref = Column(String(128))
+    session_ref = Column(String(128), index=True)
+
+    action = Column(Enum(SafeActionEnum), nullable=False, index=True)
+    outcome = Column(Enum(SafeOutcomeEnum), nullable=False)
+
+    artifact_ref = Column(String(128))
+    artifact_version = Column(Integer)
+    artifact_commitment = Column(String(64))
+    artifact_commitment_algorithm = Column(String(32))
+
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    received_at = Column(DateTime, nullable=False)
+    producer_signature = Column(String(1024))

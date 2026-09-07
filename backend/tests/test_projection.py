@@ -53,3 +53,32 @@ def test_projection_appends_new_draft_across_revision_rounds(db):
     drafts = crud.get_drafts(db, task.id)
     assert [d.version for d in drafts] == [1, 2]
     assert drafts[1].content == "d2"
+
+
+def test_projection_keeps_a_reviewers_version_the_graph_never_saw(db, self_actor):
+    """record_approval writes a modified draft *before* the graph resumes.
+
+    If that resume fails, the ledger is one version ahead of the graph. When
+    the graph later produces its own next draft at the same index, it must
+    be appended as a further version, not silently dropped because the index
+    is taken - the operator would otherwise be shown a draft with no row.
+    """
+    task = _task(db)
+    project_run_state(db, task, {"drafts": ["d1"], "reviewer_comments": ["c1"]}, waiting_for_human=True)
+    crud.record_approval(db, task.id, self_actor.id, "approved", modified_draft="operator edit")  # v2
+    # The resume "failed"; the graph revises on its own and comes back with a second draft.
+    project_run_state(db, task, {"drafts": ["d1", "d2-from-graph"], "reviewer_comments": ["c1", "c2"]}, True)
+
+    drafts = crud.get_drafts(db, task.id)
+    assert [d.content for d in drafts] == ["d1", "operator edit", "d2-from-graph"]
+    assert task.current_draft == "d2-from-graph"
+
+
+def test_projection_does_not_duplicate_the_modified_draft_the_graph_echoes(db, self_actor):
+    """Happy path: the graph appends the modified draft at the index the ledger already used."""
+    task = _task(db)
+    project_run_state(db, task, {"drafts": ["d1"], "reviewer_comments": ["c1"]}, waiting_for_human=True)
+    crud.record_approval(db, task.id, self_actor.id, "approved", modified_draft="operator edit")  # v2
+    project_run_state(db, task, {"drafts": ["d1", "operator edit"], "final_output": "operator edit"}, False)
+
+    assert [d.content for d in crud.get_drafts(db, task.id)] == ["d1", "operator edit"]

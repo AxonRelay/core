@@ -71,17 +71,26 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `list_tasks(status?, limit?)` | タスク一覧 |
 | `list_pending_approvals()` | **統一承認受信箱** — 最も重要 |
 | `get_task(task_id)` | タスク詳細（assignments / drafts / approvals 同梱） |
-| `get_drafts(task_id)` | ドラフト履歴 |
+| `get_drafts(task_id)` | ドラフト履歴（各版の `commitment` = 本文 SHA-256 と `producer_actor_id` を含む） |
 | `create_task(title, description?, assignments?)` | 新規タスク + Platform thread 確保 |
 | `run_task(task_id)` | Platform 上で graph 実行 → 承認待ちまで |
-| `approve_task(task_id, comment?, modified_draft?)` | 承認（任意で edit） |
-| `reject_task(task_id, comment?, reason?)` | 差戻し（revision loop） |
-| `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。elicitation 非対応クライアントは `approve_task`/`reject_task` を使う |
-| `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy}`。`legacy` は hash chain 導入前の行数） |
+| `approve_task(task_id, comment?, modified_draft?, artifact_version?, expected_commitment?)` | 承認（任意で edit）。`artifact_version` / `expected_commitment` を渡すと**読んだ版に束縛**され、task が先に進んでいれば何も記録せず `status="stale_decision"` を返す。`modified_draft` は新しい draft 版として保存され、承認はその版に束縛される。戻り値に `approval`（束縛と hash を含む）を同梱 |
+| `reject_task(task_id, comment?, reason?, artifact_version?, expected_commitment?)` | 差戻し（revision loop）。束縛引数の意味は `approve_task` と同じ |
+| `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。表示した draft の版と commitment に判断を束縛するので、待っている間に draft が差し替わると `stale_decision` になる。elicitation 非対応クライアントは `approve_task`/`reject_task` を使う |
+| `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy, artifact_bound, unbound}`。`legacy` は hash chain 導入前の行数、`artifact_bound` は判断対象の draft 版と commitment を名指しする行数、`unbound` はそれ以外。[ADR-009](./adr-009-artifact-commitment.md)） |
 | `list_agents(agent_type?, is_active?)` | AI Actor 一覧 |
 | `create_agent(name, agent_type, ...)` | AI Actor 定義 |
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
 | `get_self_actor()` | オペレータ Human Actor |
+
+### Safe Envelope（content-blind 取り込み）
+
+`AXONRELAY_SAFE_MODE=1` のインスタンスでは上の書き込み系 tool と調整レイヤーの書き込み系 tool は固定文言で拒否され、以下だけが書き込み経路になる（[ADR-010](./adr-010-safe-envelope.md)、[schema](./schemas/safe-envelope-v1.json)）。
+
+| Tool | 用途 |
+|---|---|
+| `ingest_safe_envelope(envelope)` | metadata-only の envelope を 1 件取り込む。opaque id・action/outcome enum・producer 算出の artifact commitment・timestamp のみ。未知フィールドは拒否、拒否理由はフィールド名だけ。同じ `event_id` の再送は冪等 |
+| `list_safe_events(limit?, action?)` | 取り込み済み envelope を新しい順に返す |
 
 ### 調整レイヤー (Phase 3)
 

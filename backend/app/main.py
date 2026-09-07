@@ -11,12 +11,14 @@ human Actor (name="self") represents the operator.
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from app import coordination, crud, langgraph_client, models, service
+from app import coordination, crud, langgraph_client, models, safe_envelope, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.ratelimit import client_key
@@ -63,9 +65,32 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def _value_free_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 without the rejected input.
+
+    FastAPI's default body echoes `input` (the submitted value) and `ctx` for
+    every error. A rejected value may be exactly what a caller must not have
+    sent to a shared instance, so the body names the location and error type
+    and nothing else. Same policy as the Safe Envelope service.
+    """
+    detail = [{"loc": list(err.get("loc", ())), "type": err.get("type", "value_error")} for err in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.exception_handler(safe_envelope.SafeModeRefused)
+async def _safe_mode_refused(request: Request, exc: safe_envelope.SafeModeRefused) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": safe_envelope.SAFE_MODE_REFUSAL})
+
+
+def _free_text_surface() -> None:
+    """Dependency for every endpoint that accepts arbitrary text (see app/safe_envelope.py)."""
+    safe_envelope.refuse_free_text_if_safe_mode()
+
+
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "AxonRelay"}
+    return {"status": "ok", "service": "AxonRelay", "safe_mode": safe_envelope.safe_mode()}
 
 
 # ========== Actor Endpoints ==========
@@ -124,7 +149,12 @@ async def list_agents(
 
 @app.post("/agents", response_model=AgentDefinitionResponse)
 @limiter.limit("30/minute")
-async def create_agent(request: Request, agent_data: AgentDefinitionCreateRequest, db: Session = Depends(get_db)):
+async def create_agent(
+    request: Request,
+    agent_data: AgentDefinitionCreateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
+):
     try:
         agent_type = models.AgentTypeEnum(agent_data.agent_type)
     except ValueError as e:
@@ -154,6 +184,7 @@ async def update_agent(
     agent_id: int,
     agent_data: AgentDefinitionUpdateRequest,
     db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     agent_type = None
     if agent_data.agent_type:
@@ -207,7 +238,12 @@ async def list_tasks_endpoint(
 
 @app.post("/tasks", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("30/minute")
-async def create_task_endpoint(request: Request, task_data: TaskCreateRequest, db: Session = Depends(get_db)):
+async def create_task_endpoint(
+    request: Request,
+    task_data: TaskCreateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
+):
     self_actor = crud.get_self_actor(db)
     creator_actor_id = self_actor.id if self_actor else None
 
@@ -253,7 +289,11 @@ async def get_task_endpoint(request: Request, task_id: int, db: Session = Depend
 @app.put("/tasks/{task_id}", response_model=TaskResponse)
 @limiter.limit("30/minute")
 async def update_task_endpoint(
-    request: Request, task_id: int, task_data: TaskUpdateRequest, db: Session = Depends(get_db)
+    request: Request,
+    task_id: int,
+    task_data: TaskUpdateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     status_enum = None
     if task_data.status:
@@ -297,7 +337,9 @@ def _sync_state_to_db(db: Session, task: models.Task, values: dict, waiting_for_
 
 @app.post("/tasks/{task_id}/run", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("10/minute")
-async def run_task_endpoint(request: Request, task_id: int, db: Session = Depends(get_db)):
+async def run_task_endpoint(
+    request: Request, task_id: int, db: Session = Depends(get_db), _guard: None = Depends(_free_text_surface)
+):
     """Kick off graph execution on LangGraph Platform. Blocks until the next
     interrupt or completion, then syncs state back to Postgres."""
     task = crud.get_task(db, task_id)
@@ -343,10 +385,31 @@ async def list_pending_approvals_endpoint(
 # ========== Approve / Reject ==========
 
 
+def _record_decision(db: Session, **kwargs) -> models.Approval:
+    """`crud.record_approval` with the ledger's contract errors mapped to HTTP.
+
+    409 for a stale target or a task with no artifact (the request was well
+    formed; the state it assumed is gone), 404 for a vanished task. The error
+    text names versions only, never content.
+    """
+    try:
+        return crud.record_approval(db, **kwargs)
+    except crud.TaskNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except (crud.StaleArtifactError, crud.ArtifactRequiredError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except crud.LedgerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.post("/tasks/{task_id}/approve", response_model=ApprovalResponse)
 @limiter.limit("30/minute")
 async def approve_task_endpoint(
-    request: Request, task_id: int, approve_data: ApproveRequest, db: Session = Depends(get_db)
+    request: Request,
+    task_id: int,
+    approve_data: ApproveRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     task = crud.get_task(db, task_id)
     if not task:
@@ -357,12 +420,18 @@ async def approve_task_endpoint(
     self_actor = crud.get_self_actor(db)
     reviewer_actor_id = self_actor.id if self_actor else None
 
-    approval = crud.record_approval(
+    # The ledger entry (and, if the operator edited the draft, the new draft
+    # version it binds to) is written before the graph resumes: the approval
+    # names the artifact, so the artifact has to exist first.
+    approval = _record_decision(
         db,
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action="approved",
         comment=approve_data.comment,
+        artifact_version=approve_data.artifact_version,
+        expected_commitment=approve_data.expected_commitment,
+        modified_draft=approve_data.modified_draft,
     )
 
     try:
@@ -386,7 +455,11 @@ async def approve_task_endpoint(
 @app.post("/tasks/{task_id}/reject", response_model=ApprovalResponse)
 @limiter.limit("30/minute")
 async def reject_task_endpoint(
-    request: Request, task_id: int, reject_data: RejectRequest, db: Session = Depends(get_db)
+    request: Request,
+    task_id: int,
+    reject_data: RejectRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     task = crud.get_task(db, task_id)
     if not task:
@@ -400,12 +473,14 @@ async def reject_task_endpoint(
     comment_parts = [reject_data.comment, reject_data.reason]
     combined_comment = " | ".join(p for p in comment_parts if p) or None
 
-    approval = crud.record_approval(
+    approval = _record_decision(
         db,
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action="rejected",
         comment=combined_comment,
+        artifact_version=reject_data.artifact_version,
+        expected_commitment=reject_data.expected_commitment,
     )
 
     try:
@@ -505,6 +580,45 @@ async def remove_task_assignment_endpoint(
     return {"message": "Assignment removed successfully"}
 
 
+# ========== Safe Envelope (content-blind ingestion) ==========
+
+
+@app.post("/envelopes", status_code=201)
+@limiter.limit("60/minute")
+async def ingest_envelope_endpoint(request: Request, db: Session = Depends(get_db)):
+    """Ingest one metadata-only Safe Envelope (schema: docs/schemas/safe-envelope-v1.json).
+
+    The body is read as raw JSON and validated by the shared service, not by a
+    request model: a schema failure must name fields only, and this path must
+    behave identically to the MCP tool. 422 lists the offending field names;
+    409 is never used because re-sending an event_id is idempotent (200).
+    """
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"reason": "not JSON", "fields": ["(envelope)"]}) from None
+    try:
+        event, created = safe_envelope.ingest(db, payload)
+    except safe_envelope.EnvelopeRejected as e:
+        raise HTTPException(status_code=422, detail={"reason": e.reason, "fields": e.fields}) from None
+    body = safe_envelope.event_to_dict(event)
+    body["created"] = created
+    return JSONResponse(status_code=201 if created else 200, content=body)
+
+
+@app.get("/envelopes")
+@limiter.limit("60/minute")
+async def list_envelopes_endpoint(
+    request: Request, limit: int = 100, action: str | None = None, db: Session = Depends(get_db)
+):
+    """Stored Safe Envelopes, newest first. Every field was allowlisted on the way in."""
+    try:
+        events = safe_envelope.list_events(db, limit=limit, action=action)
+    except safe_envelope.EnvelopeRejected as e:
+        raise HTTPException(status_code=400, detail={"reason": e.reason, "fields": e.fields}) from None
+    return [safe_envelope.event_to_dict(e) for e in events]
+
+
 # ========== Coordination Board (read-only; writes go through MCP) ==========
 #
 # The board is how a human sees what the fleet of agents is doing. Agents drive
@@ -572,7 +686,7 @@ async def coordination_git_guard_endpoint(
     try:
         resolved = models.ClaimResourceEnum(resource)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Unknown resource '{resource}'") from e
+        raise HTTPException(status_code=400, detail="Unknown resource") from e
 
     if session_id is not None:
         try:

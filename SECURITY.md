@@ -27,6 +27,16 @@ So the rules are:
 - Change the Postgres password from the documented development default
   (`axonrelay_dev`) anywhere other than a laptop.
 
+**Content-blind mode.** A shared instance can be run with
+`AXONRELAY_SAFE_MODE=1` ([ADR-010](docs/adr-010-safe-envelope.md)). Every
+surface that accepts free text then refuses with a fixed message, and the
+only write path is a versioned, allowlisted envelope of opaque identifiers,
+enums, a source-produced artifact commitment and timestamps
+([schema](docs/schemas/safe-envelope-v1.json)). Rejected values are never
+stored, logged, echoed in errors or sent onward; canary tests enforce that.
+Without the flag the instance is the full-text local PoC and should be treated
+as holding whatever was sent to it.
+
 What the application *does* defend:
 
 - The approval ledger is tamper-evident: a per-task SHA-256 hash chain, verified

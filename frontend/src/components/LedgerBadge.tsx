@@ -27,9 +27,16 @@ export function LedgerBadge({ taskId }: { taskId: number }) {
   const label = verdict.valid
     ? `ledger verified · ${verdict.count} entr${verdict.count === 1 ? "y" : "ies"}`
     : `ledger TAMPERED · broken at #${verdict.broken_at}`;
+  const unbound = verdict.unbound ?? verdict.count - (verdict.artifact_bound ?? 0);
+  const title = [
+    `artifact-bound entries: ${verdict.artifact_bound ?? 0}`,
+    `not artifact-bound (legacy or pre-binding): ${unbound}`,
+    `legacy (pre-hash-chain) rows: ${verdict.legacy}`,
+  ].join("\n");
   return (
-    <span className={cls} title={`legacy (pre-hash-chain) rows: ${verdict.legacy}`}>
+    <span className={cls} title={title}>
       {label}
+      {verdict.valid && unbound > 0 && ` · ${unbound} unbound`}
     </span>
   );
 }

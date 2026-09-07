@@ -26,9 +26,10 @@ from contextlib import contextmanager
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from app import coordination, crud, langgraph_client, models, service, territory
+from app import coordination, crud, langgraph_client, models, safe_envelope, service, territory
 from app.database import SessionLocal
 from app.mcp import http_auth
 from app.mcp.serializers import (
@@ -52,6 +53,18 @@ def _session():
         yield db
     finally:
         db.close()
+
+
+def _free_text_surface() -> None:
+    """Refuse, value-free, when the instance runs in Safe Envelope mode (app/safe_envelope.py).
+
+    Raised as ToolError so the SDK returns the fixed message as the tool
+    result instead of logging a traceback that could carry the arguments.
+    """
+    try:
+        safe_envelope.refuse_free_text_if_safe_mode()
+    except safe_envelope.SafeModeRefused as e:
+        raise ToolError(str(e)) from None
 
 
 def _resolve_status(status: str | None) -> models.TaskStatusEnum | None:
@@ -125,8 +138,11 @@ def verify_task_ledger(task_id: int) -> dict:
     """Verify the tamper-evident approval hash chain for a task.
 
     Returns {"valid": bool, "broken_at": approval id or None, "count": int,
-    "legacy": int}. valid=False means a recorded approval was altered or reordered
-    after the fact; "legacy" counts pre-hash-chain rows that are not covered.
+    "legacy": int, "artifact_bound": int, "unbound": int}. valid=False means a
+    recorded approval was altered or reordered after the fact (any of its
+    artifact-binding fields included); "legacy" counts pre-hash-chain rows that
+    are not covered; "artifact_bound" counts entries that name the exact draft
+    version and commitment they decided on, "unbound" the rest.
     """
     with _session() as db:
         if not crud.get_task(db, task_id):
@@ -147,6 +163,7 @@ async def create_task(
         description: Optional longer description / context.
         assignments: Optional list of {actor_id: int, role: str} dicts.
     """
+    _free_text_surface()
     with _session() as db:
         self_actor = crud.get_self_actor(db)
         creator_actor_id = self_actor.id if self_actor else None
@@ -187,6 +204,7 @@ def _sync_state(db, task: models.Task, result: dict[str, Any]) -> None:
 @mcp.tool()
 async def run_task(task_id: int) -> dict:
     """Kick off graph execution on Platform. Blocks until interrupt or completion."""
+    _free_text_surface()
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
@@ -212,11 +230,19 @@ async def _apply_decision(
     action: str,
     comment: str | None,
     modified_draft: str | None = None,
+    artifact_version: int | None = None,
+    expected_commitment: str | None = None,
 ) -> dict:
     """Record an approve/reject in the ledger and resume the Platform thread.
 
     Shared by the approve_task / reject_task tools and the interactive
     review_pending_task (elicitation) tool so they cannot drift.
+
+    The ledger entry is written first and binds to the exact draft decided on
+    (a modified draft becomes a new version before the entry is recorded). If
+    `artifact_version` / `expected_commitment` no longer match the task's
+    latest draft, nothing is recorded and the call returns
+    status="stale_decision".
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
@@ -228,20 +254,35 @@ async def _apply_decision(
         self_actor = crud.get_self_actor(db)
         reviewer_actor_id = self_actor.id if self_actor else None
 
-        crud.record_approval(
-            db,
-            task_id=task_id,
-            reviewer_actor_id=reviewer_actor_id,
-            action=action,
-            comment=comment,
-        )
+        try:
+            approval = crud.record_approval(
+                db,
+                task_id=task_id,
+                reviewer_actor_id=reviewer_actor_id,
+                action=action,
+                comment=comment,
+                artifact_version=artifact_version,
+                expected_commitment=expected_commitment,
+                modified_draft=modified_draft if action == "approved" else None,
+            )
+        except crud.StaleArtifactError as e:
+            db.rollback()
+            return {"status": "stale_decision", "task_id": task_id, "reason": str(e)}
+        except crud.ArtifactRequiredError as e:
+            db.rollback()
+            return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
+        except crud.LedgerError as e:
+            db.rollback()
+            raise ToolError(str(e)) from None
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
         result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
         _sync_state(db, task, result)
         db.refresh(task)
-        return task_to_dict(task)
+        payload = task_to_dict(task)
+        payload["approval"] = approval_to_dict(approval)
+        return payload
 
 
 @mcp.tool()
@@ -249,9 +290,25 @@ async def approve_task(
     task_id: int,
     comment: str | None = None,
     modified_draft: str | None = None,
+    artifact_version: int | None = None,
+    expected_commitment: str | None = None,
 ) -> dict:
-    """Approve a task that's WAITING_APPROVAL. Optionally include comment / edit."""
-    return await _apply_decision(task_id, action="approved", comment=comment, modified_draft=modified_draft)
+    """Approve a task that's WAITING_APPROVAL. Optionally include comment / edit.
+
+    Pass artifact_version and/or expected_commitment (from get_drafts) to bind
+    the decision to the draft you actually read; if the task moved on, nothing
+    is recorded and status="stale_decision" is returned. A modified_draft is
+    stored as a new draft version and the approval binds to that version.
+    """
+    _free_text_surface()
+    return await _apply_decision(
+        task_id,
+        action="approved",
+        comment=comment,
+        modified_draft=modified_draft,
+        artifact_version=artifact_version,
+        expected_commitment=expected_commitment,
+    )
 
 
 @mcp.tool()
@@ -259,10 +316,23 @@ async def reject_task(
     task_id: int,
     comment: str | None = None,
     reason: str | None = None,
+    artifact_version: int | None = None,
+    expected_commitment: str | None = None,
 ) -> dict:
-    """Reject a task; revision loop continues unless the iteration cap is hit."""
+    """Reject a task; revision loop continues unless the iteration cap is hit.
+
+    artifact_version / expected_commitment work as in approve_task: the
+    rejection is recorded against the draft you read, or not at all.
+    """
+    _free_text_surface()
     combined = " | ".join(p for p in [comment, reason] if p) or None
-    return await _apply_decision(task_id, action="rejected", comment=combined)
+    return await _apply_decision(
+        task_id,
+        action="rejected",
+        comment=combined,
+        artifact_version=artifact_version,
+        expected_commitment=expected_commitment,
+    )
 
 
 class _ApprovalDecision(BaseModel):
@@ -288,19 +358,37 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
     If the task changes between display and decision (the draft no longer matches
     what was shown, or it is no longer waiting), the call returns
     status="stale_decision" and records nothing, so you never approve unseen content.
+    The decision is bound to the draft version and commitment that were shown,
+    and the check is made under the ledger's row lock, so a concurrent writer
+    cannot slip a different draft in between the check and the record. A task
+    with no draft returns status="no_artifact" before asking anything.
     """
+    _free_text_surface()
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
-        title, draft, feedback = task.title, task.current_draft, task.feedback
+        title, feedback = task.title, task.feedback
+        # Show the latest *artifact* — the draft row the decision will bind
+        # to — not the task's current_draft mirror, which PUT /tasks can
+        # rewrite without creating a version. What is shown and what is
+        # recorded must be the same object.
+        drafts = crud.get_drafts(db, task_id)
+        if not drafts:
+            return {
+                "status": "no_artifact",
+                "task_id": task_id,
+                "reason": "Task has no draft to decide on; nothing was shown and nothing is recorded.",
+            }
+        shown = drafts[-1]
+        draft, shown_version, shown_commitment = shown.content, shown.version, shown.commitment
 
     # Elicit outside the DB session — don't pin a session across user interaction.
     message = (
         f"Task #{task_id}: {title}\n\n"
-        f"--- Draft ---\n{draft or '(no draft)'}\n\n"
+        f"--- Draft (v{shown_version}) ---\n{draft}\n\n"
         f"--- Reviewer feedback ---\n{feedback or '(none)'}\n\n"
         "Approve this draft?"
     )
@@ -308,12 +396,13 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
     if result.action != "accept" or not result.data:
         return {"status": "no_decision", "elicitation_action": result.action, "task_id": task_id}
 
-    # Staleness guard: the task may have changed while we awaited the human's
-    # response. Only record a decision against the exact draft that was shown;
-    # otherwise the operator would approve content they never saw.
+    # Staleness guard, part 1: the task may have left WAITING_APPROVAL while we
+    # awaited the human. Part 2 — "is the latest draft still the one shown?" —
+    # is enforced inside record_approval under the task row lock, by passing
+    # the shown version and commitment as the decision's target.
     with _session() as db:
         current = crud.get_task(db, task_id)
-        if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL or current.current_draft != draft:
+        if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL:
             return {
                 "status": "stale_decision",
                 "task_id": task_id,
@@ -327,8 +416,16 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
             action="approved",
             comment=decision.comment or None,
             modified_draft=decision.modified_draft or None,
+            artifact_version=shown_version,
+            expected_commitment=shown_commitment,
         )
-    return await _apply_decision(task_id, action="rejected", comment=decision.comment or None)
+    return await _apply_decision(
+        task_id,
+        action="rejected",
+        comment=decision.comment or None,
+        artifact_version=shown_version,
+        expected_commitment=shown_commitment,
+    )
 
 
 # ========== Agent / Actor Tools ==========
@@ -356,6 +453,7 @@ def create_agent(
     config: dict[str, Any] | None = None,
 ) -> dict:
     """Create an AI agent definition (and its underlying Actor)."""
+    _free_text_surface()
     with _session() as db:
         try:
             agent_type_enum = models.AgentTypeEnum(agent_type)
@@ -377,6 +475,7 @@ def update_agent(
     is_active: bool | None = None,
 ) -> dict:
     """Update an AI agent definition."""
+    _free_text_surface()
     with _session() as db:
         agent_type_enum = None
         if agent_type:
@@ -441,6 +540,7 @@ def register_session(
     collisions can be detected: sibling git worktrees have different clone_paths
     but share one stash stack, and only the git dir identifies that.
     """
+    _free_text_surface()
     resolved_type = models.ActorTypeEnum(actor_type)
     with _session() as db:
         session = coordination.register_session(
@@ -465,6 +565,7 @@ def heartbeat_session(session_id: int, focus: str | None = None, branch: str | N
     ("refactoring app/crud.py", "waiting on review of #44"). A session that goes
     quiet for 30 minutes is shown as stale to everyone else.
     """
+    _free_text_surface()
     with _session() as db:
         session = coordination.heartbeat_session(db, session_id, focus=focus, branch=branch)
         if not session:
@@ -508,6 +609,7 @@ def check_conflicts(repo: str, paths: list[str], session_id: int | None = None, 
     without a wildcard covers everything beneath it ("backend/app" covers
     "backend/app/crud.py").
     """
+    _free_text_surface()
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         conflicts = coordination.find_conflicts(
@@ -542,6 +644,7 @@ def claim_territory(
     The lease expires after ttl_minutes (default 60) so a crashed agent cannot
     hold territory forever. Release it with release_territory when you are done.
     """
+    _free_text_surface()
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         result = coordination.claim_territory(
@@ -597,6 +700,7 @@ def send_relay(
     when you are about to do something others should know about ("rewriting the
     migration chain"), and "handoff" when you are passing work on.
     """
+    _free_text_surface()
     resolved_kind = models.RelayKindEnum(kind)
     with _session() as db:
         relay = coordination.send_relay(
@@ -631,6 +735,7 @@ def ack_relay(relay_id: int, session_id: int, note: str | None = None) -> dict:
     Acking is per recipient: it does not hide a broadcast from anyone else, and
     the receipt records that you saw it.
     """
+    _free_text_surface()
     with _session() as db:
         receipt = coordination.ack_relay(db, relay_id=relay_id, session_id=session_id, note=note)
         return {
@@ -720,6 +825,7 @@ def claim_git_resource(
     Always exclusive, refused on conflict unless force=true, and expiring like a
     path claim.
     """
+    _free_text_surface()
     resolved = models.ClaimResourceEnum(resource)
     with _session() as db:
         result = coordination.claim_resource(
@@ -756,6 +862,40 @@ def board_resource() -> str:
 
 
 # ========== Entry point ==========
+
+
+# ========== Safe Envelope (content-blind ingestion) ==========
+
+
+@mcp.tool()
+def ingest_safe_envelope(envelope: dict[str, Any]) -> dict:
+    """Ingest one metadata-only Safe Envelope (schema: docs/schemas/safe-envelope-v1.json).
+
+    The envelope carries opaque identifiers, an action and outcome from closed
+    lists, a source-produced artifact commitment and timestamps — never a
+    title, body, path or URL; unknown fields are rejected. Rejections name the
+    offending field names only. Re-sending the same event_id is idempotent.
+    Same service as POST /envelopes.
+    """
+    with _session() as db:
+        try:
+            event, created = safe_envelope.ingest(db, envelope)
+        except safe_envelope.EnvelopeRejected as e:
+            raise ToolError(str(e)) from None
+        payload = safe_envelope.event_to_dict(event)
+        payload["created"] = created
+        return payload
+
+
+@mcp.tool()
+def list_safe_events(limit: int = 100, action: str | None = None) -> list[dict]:
+    """Stored Safe Envelopes, newest first (optionally one action)."""
+    with _session() as db:
+        try:
+            events = safe_envelope.list_events(db, limit=limit, action=action)
+        except safe_envelope.EnvelopeRejected as e:
+            raise ToolError(str(e)) from None
+        return [safe_envelope.event_to_dict(e) for e in events]
 
 
 def main() -> None:
