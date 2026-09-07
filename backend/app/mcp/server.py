@@ -26,9 +26,10 @@ from contextlib import contextmanager
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from app import coordination, crud, langgraph_client, ledger, models, service, territory
+from app import coordination, crud, langgraph_client, models, service, territory
 from app.database import SessionLocal
 from app.mcp import http_auth
 from app.mcp.serializers import (
@@ -125,8 +126,11 @@ def verify_task_ledger(task_id: int) -> dict:
     """Verify the tamper-evident approval hash chain for a task.
 
     Returns {"valid": bool, "broken_at": approval id or None, "count": int,
-    "legacy": int}. valid=False means a recorded approval was altered or reordered
-    after the fact; "legacy" counts pre-hash-chain rows that are not covered.
+    "legacy": int, "artifact_bound": int, "unbound": int}. valid=False means a
+    recorded approval was altered or reordered after the fact (any of its
+    artifact-binding fields included); "legacy" counts pre-hash-chain rows that
+    are not covered; "artifact_bound" counts entries that name the exact draft
+    version and commitment they decided on, "unbound" the rest.
     """
     with _session() as db:
         if not crud.get_task(db, task_id):
@@ -248,7 +252,14 @@ async def _apply_decision(
                 modified_draft=modified_draft if action == "approved" else None,
             )
         except crud.StaleArtifactError as e:
+            db.rollback()
             return {"status": "stale_decision", "task_id": task_id, "reason": str(e)}
+        except crud.ArtifactRequiredError as e:
+            db.rollback()
+            return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
+        except crud.LedgerError as e:
+            db.rollback()
+            raise ToolError(str(e)) from None
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
@@ -333,7 +344,8 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
     status="stale_decision" and records nothing, so you never approve unseen content.
     The decision is bound to the draft version and commitment that were shown,
     and the check is made under the ledger's row lock, so a concurrent writer
-    cannot slip a different draft in between the check and the record.
+    cannot slip a different draft in between the check and the record. A task
+    with no draft returns status="no_artifact" before asking anything.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
@@ -341,16 +353,25 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
             raise ValueError(f"Task {task_id} not found")
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
-        title, draft, feedback = task.title, task.current_draft, task.feedback
+        title, feedback = task.title, task.feedback
+        # Show the latest *artifact* — the draft row the decision will bind
+        # to — not the task's current_draft mirror, which PUT /tasks can
+        # rewrite without creating a version. What is shown and what is
+        # recorded must be the same object.
         drafts = crud.get_drafts(db, task_id)
-        shown = drafts[-1] if drafts else None
-        shown_version = shown.version if shown else None
-        shown_commitment = (shown.commitment or ledger.compute_artifact_commitment(shown.content)) if shown else None
+        if not drafts:
+            return {
+                "status": "no_artifact",
+                "task_id": task_id,
+                "reason": "Task has no draft to decide on; nothing was shown and nothing is recorded.",
+            }
+        shown = drafts[-1]
+        draft, shown_version, shown_commitment = shown.content, shown.version, shown.commitment
 
     # Elicit outside the DB session — don't pin a session across user interaction.
     message = (
         f"Task #{task_id}: {title}\n\n"
-        f"--- Draft ---\n{draft or '(no draft)'}\n\n"
+        f"--- Draft (v{shown_version}) ---\n{draft}\n\n"
         f"--- Reviewer feedback ---\n{feedback or '(none)'}\n\n"
         "Approve this draft?"
     )

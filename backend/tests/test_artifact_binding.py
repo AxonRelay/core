@@ -174,11 +174,13 @@ def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(
     assert approval.created_at >= edited.created_at  # the artifact exists before the approval is stamped
 
 
-def test_an_unchanged_modified_draft_does_not_create_a_version(db, self_actor):
+def test_a_modified_draft_is_always_a_new_version_even_when_identical(db, self_actor):
+    """Mirrors the graph, which appends the modified draft to its state unconditionally."""
     task, shown = _task_with_draft(db, "same")
     approval = crud.record_approval(db, task.id, self_actor.id, "approved", modified_draft="same")
-    assert [d.version for d in crud.get_drafts(db, task.id)] == [1]
-    assert approval.artifact_version == shown.version
+    assert [d.version for d in crud.get_drafts(db, task.id)] == [1, 2]
+    assert approval.artifact_version == 2
+    assert approval.artifact_commitment == shown.commitment  # same bytes, same digest, new version
 
 
 def test_a_modified_draft_against_a_stale_target_is_not_stored(db, self_actor):
@@ -189,6 +191,17 @@ def test_a_modified_draft_against_a_stale_target_is_not_stored(db, self_actor):
             db, task.id, self_actor.id, "approved", artifact_version=shown.version, modified_draft="my edit"
         )
     assert [d.content for d in crud.get_drafts(db, task.id)] == ["read", "moved on"]
+
+
+def test_a_stale_decision_on_an_unbacked_draft_persists_nothing(db, self_actor):
+    """The lazy commitment fill-in happens after the checks, so a refusal leaves the row untouched."""
+    task = _task(db)
+    db.add(models.Draft(task_id=task.id, version=1, content="old bytes"))
+    db.commit()
+    with pytest.raises(crud.StaleArtifactError):
+        crud.record_approval(db, task.id, self_actor.id, "approved", expected_commitment="f" * 64)
+    db.rollback()
+    assert crud.get_drafts(db, task.id)[0].commitment is None
 
 
 # ------------------------------------------------------------ tamper-evidence
@@ -218,17 +231,26 @@ def test_altering_any_artifact_binding_field_is_detected(db, self_actor, field, 
     assert verdict["broken_at"] == victim.id
 
 
-def test_downgrading_the_payload_version_marker_is_detected(db, self_actor):
+@pytest.mark.parametrize("relabel", [1, None])
+def test_downgrading_the_payload_version_marker_is_detected(db, self_actor, relabel):
     """A v2 row relabelled as v1 must not verify as v1: the marker is inside the hash."""
     task, _ = _task_with_draft(db)
     victim = crud.record_approval(db, task.id, self_actor.id, "approved", "a")
 
-    victim.hash_version = None
+    victim.hash_version = relabel
     db.commit()
 
     verdict = crud.verify_approval_chain(db, task.id)
     assert verdict["valid"] is False
     assert verdict["broken_at"] == victim.id
+
+
+def test_a_future_payload_version_does_not_flag_v2_rows(db, self_actor, monkeypatch):
+    """Dispatch is on the row's own version, not on equality with the current one."""
+    task, _ = _task_with_draft(db)
+    crud.record_approval(db, task.id, self_actor.id, "approved", "a")
+    monkeypatch.setattr(ledger, "ENTRY_HASH_VERSION", 3)
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
 
 
 def test_the_hash_covers_the_binding(db):
@@ -256,8 +278,12 @@ def test_the_hash_covers_the_binding(db):
 # --------------------------------------------------------------- legacy rows
 
 
-def _legacy_v1_approval(db, task, actor, comment, prev_hash=None):
-    """A row as record_approval wrote it between migrations 004 and 008."""
+def _legacy_v1_approval(db, task, actor, comment, prev_hash=None, hash_version=1):
+    """A row as record_approval wrote it between migrations 004 and 008.
+
+    Migration 009 stamps such rows hash_version=1; a row it never reached
+    (NULL) must verify the same way, so tests cover both.
+    """
     now = datetime.utcnow()
     row = models.Approval(
         task_id=task.id,
@@ -265,6 +291,7 @@ def _legacy_v1_approval(db, task, actor, comment, prev_hash=None):
         action="approved",
         comment=comment,
         created_at=now,
+        hash_version=hash_version,
         prev_hash=prev_hash,
         entry_hash=ledger.compute_entry_hash(
             prev_hash,
@@ -281,13 +308,14 @@ def _legacy_v1_approval(db, task, actor, comment, prev_hash=None):
     return row
 
 
-def test_pre_binding_rows_verify_and_are_reported_as_not_artifact_bound(db, self_actor):
+@pytest.mark.parametrize("hash_version", [1, None], ids=["stamped-by-009", "never-stamped"])
+def test_pre_binding_rows_verify_and_are_reported_as_not_artifact_bound(db, self_actor, hash_version):
     task, _ = _task_with_draft(db)
-    old = _legacy_v1_approval(db, task, self_actor, "before 009")
+    old = _legacy_v1_approval(db, task, self_actor, "before 009", hash_version=hash_version)
     new = crud.record_approval(db, task.id, self_actor.id, "approved", "after 009")
 
     assert old.artifact_bound is False
-    assert old.hash_version is None
+    assert old.hash_version == hash_version
     assert new.prev_hash == old.entry_hash  # one chain across the payload change
     assert crud.verify_approval_chain(db, task.id) == {
         "valid": True,
@@ -360,7 +388,7 @@ def test_rest_and_mcp_responses_expose_the_binding(db, self_actor):
         assert payload["artifact_version"] == 1
         assert payload["artifact_commitment"] == draft.commitment
         assert payload["artifact_commitment_algorithm"] == ledger.COMMITMENT_ALGORITHM
-        assert payload["hash_version"] == 2
+        assert payload["hash_version"] == ledger.ENTRY_HASH_VERSION
         assert payload["entry_hash"] == approval.entry_hash
 
     assert DraftResponse.model_validate(draft).commitment == draft.commitment

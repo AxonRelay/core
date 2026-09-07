@@ -4,6 +4,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app import ledger
+
 # ========== Actor Schemas ==========
 
 
@@ -140,7 +142,7 @@ class _DecisionTarget(BaseModel):
     """
 
     artifact_version: int | None = Field(None, ge=1)
-    expected_commitment: str | None = Field(None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    expected_commitment: str | None = Field(None, pattern=ledger.SHA256_HEX_PATTERN)
 
 
 class ApproveRequest(_DecisionTarget):

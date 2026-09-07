@@ -200,8 +200,9 @@ class Approval(Base):
     prev_hash = Column(String(64))
     entry_hash = Column(String(64))
 
-    # Which payload the row was hashed with: NULL = v1 (event only, migrations
-    # 004–008), 2 = artifact-bound. Verification picks the payload by this.
+    # Which payload the row was hashed with: 1 = event only (migrations
+    # 004–008; 009 stamps those rows), 2 = artifact-bound. NULL only on rows
+    # that were never hashed (pre-004). Verification picks the payload by this.
     hash_version = Column(Integer)
 
     # Artifact binding (migration 009) — all five fields are inside the v2
@@ -218,7 +219,9 @@ class Approval(Base):
     @property
     def artifact_bound(self) -> bool:
         """True when this entry names the exact artifact it approved."""
-        return self.hash_version == 2 and self.artifact_commitment is not None
+        from app import ledger  # ledger has no model imports; local to keep the module graph acyclic
+
+        return (self.hash_version or 1) >= ledger.ARTIFACT_BINDING_SINCE and self.artifact_commitment is not None
 
 
 class ExternalLink(Base):

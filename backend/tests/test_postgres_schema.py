@@ -466,6 +466,20 @@ class TestArtifactBindingMigration:
             conn.execute(
                 text("INSERT INTO drafts (task_id, version, content, created_at) VALUES (1, 1, 'old bytes', now())")
             )
+            # A second task whose unlocked pre-009 add_draft raced itself into
+            # two drafts with the same version number.
+            conn.execute(
+                text(
+                    "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
+                    "VALUES ('legacy-dup', 'dup', 'DRAFT', now(), now())"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO drafts (task_id, version, content, created_at) VALUES "
+                    "(2, 1, 'first', now()), (2, 1, 'raced duplicate', now()), (2, 2, 'later', now())"
+                )
+            )
             created_at = "2026-08-01 12:00:00.000000"
             entry_hash = ledger.compute_entry_hash(
                 None,
@@ -500,9 +514,17 @@ class TestArtifactBindingMigration:
             assert draft.producer_actor_id is None
 
             (approval,) = crud.get_approvals(session, 1)
-            assert approval.hash_version is None
+            assert approval.hash_version == 1  # stamped by 009: hashed with the v1 payload
             assert approval.artifact_bound is False
             assert approval.artifact_commitment is None
+        finally:
+            session.close()
+
+    def test_duplicate_draft_versions_are_renumbered_before_the_constraint(self, legacy_engine):
+        session = sessionmaker(bind=legacy_engine, autoflush=False)()
+        try:
+            drafts = crud.get_drafts(session, 2)
+            assert [(d.version, d.content) for d in drafts] == [(1, "first"), (2, "raced duplicate"), (3, "later")]
         finally:
             session.close()
 

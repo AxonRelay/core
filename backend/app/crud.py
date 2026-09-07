@@ -445,7 +445,7 @@ def record_approval(
       approve "whatever is current".
     * `modified_draft` appends a new draft version (producer = the reviewer)
       **before** the approval is written, and the approval binds to that new
-      version. Identical content does not create a version.
+      version.
 
     created_at is set explicitly here (not via the column default) so the value
     that is hashed is exactly the value persisted.
@@ -470,19 +470,24 @@ def record_approval(
         raise StaleArtifactError(
             f"Task {task_id}: the decision targeted draft v{artifact_version} but the latest is v{shown.version}"
         )
-    if shown.commitment is None:
-        # A row the 009 backfill did not reach (SQLite test schema, or content
-        # added outside the app). Commit to it now, before binding.
-        shown.commitment = ledger.compute_artifact_commitment(shown.content)
-        shown.commitment_algorithm = ledger.COMMITMENT_ALGORITHM
-        db.flush()
-    if expected_commitment is not None and shown.commitment != expected_commitment:
+    # A row the 009 backfill did not reach (SQLite test schema, or content
+    # added outside the app) has no commitment yet; compute it in memory so
+    # the checks below run on it, and persist it only once they pass.
+    shown_commitment = shown.commitment or ledger.compute_artifact_commitment(shown.content)
+    if expected_commitment is not None and shown_commitment != expected_commitment:
         raise StaleArtifactError(
             f"Task {task_id}: draft v{shown.version} no longer has the commitment the decision targeted"
         )
+    if shown.commitment is None:
+        shown.commitment = shown_commitment
+        shown.commitment_algorithm = ledger.COMMITMENT_ALGORITHM
+        db.flush()
 
     target = shown
-    if modified_draft is not None and ledger.compute_artifact_commitment(modified_draft) != shown.commitment:
+    if modified_draft is not None:
+        # Always a new version, even for identical text: the graph appends
+        # the modified draft to its own state unconditionally, and the
+        # projection matches versions by content, so the two stay aligned.
         target = _append_draft(db, task_id, modified_draft, producer_actor_id=reviewer_actor_id)
 
     # Stamped after the artifact exists: the approval is the later event.
@@ -577,7 +582,10 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             continue
         seen_hashed = True
         artifact = None
-        if approval.hash_version == ledger.ENTRY_HASH_VERSION:
+        # Dispatch on the row's own version (NULL/1 = event-only payload), not
+        # on equality with the current version, so a later payload bump does
+        # not turn every older row into a false tamper report.
+        if (approval.hash_version or 1) >= ledger.ARTIFACT_BINDING_SINCE:
             artifact = ledger.ArtifactBinding(
                 ref=approval.artifact_ref,
                 version=approval.artifact_version,
@@ -593,6 +601,7 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             comment=approval.comment,
             created_at=approval.created_at,
             artifact=artifact,
+            version=approval.hash_version,
         )
         if approval.prev_hash != prev_hash or approval.entry_hash != expected:
             return _report(False, approval.id)

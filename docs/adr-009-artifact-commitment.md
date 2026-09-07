@@ -55,8 +55,11 @@ REST は stale / 対象なしを **409**、MCP は `status="stale_decision"` で
 
 ### 4. 旧行は書き換えない
 
-- 004〜008 の行は `hash_version = NULL` のまま v1 payload で検証し、
-  `artifact_bound = false` として返す。改ざんではなく「束縛なし」と報告する
+- 004〜008 の行は migration で `hash_version = 1` を刻み（NULL は「一度も hash されていない」
+  行だけの意味になる）、v1 payload で検証し、`artifact_bound = false` として返す。
+  改ざんではなく「束縛なし」と報告する。検証は行自身の版で payload を選ぶ
+  （`hash_version >= 2` で binding あり）ので、将来 v3 を導入しても v2 行が
+  改ざん扱いにならない
 - 既存 draft の commitment は migration で backfill する（本文があるので決定的）。
   既存 approval への binding は backfill **しない**——事後の束縛は推測になる
 - `verify_task_ledger` は `artifact_bound` / `unbound` の件数を追加で返す
@@ -87,6 +90,20 @@ REST は stale / 対象なしを **409**、MCP は `status="stale_decision"` で
   `hash_version` で旧行を旧 payload として検証する
 - **既存 approval に最新 draft を遡及束縛する**: 当時どの版を見たかは分からない。
   推測を不変フィールドに固定するのは目的に反する
+
+### 6. 既知の挙動: resume 失敗後の再試行
+
+承認は graph の resume **より前**に台帳へ書かれる（artifact が先、承認が後、
+その後に graph）。resume が失敗（Platform 未設定で 503 など）しても台帳の
+エントリと（`modified_draft` があれば）新版はすでに確定している。同じ
+`artifact_version` で再送すると、自分の前回の試行が版を進めているため 409 /
+`stale_decision` になる。これは仕様で、台帳は「判断があった」事実を捨てない。
+再試行は `get_drafts` で最新版を読み直してから行う。旧実装は再試行で承認行が
+二重に記録されていた。
+
+投影（`project_run_state`）は版番号だけでなく本文でも一致判定するので、
+台帳が graph より 1 版先行した状態から graph が次の draft を返しても、
+その draft は次の版として追加され、表示と束縛がずれない。
 
 ## 影響
 
