@@ -95,7 +95,14 @@ class AuthorizationMiddleware:
                 raise ToolError(str(e)) from None
 
         with authz.bind(principal):
-            return await call_next(ctx)
+            try:
+                return await call_next(ctx)
+            except authz.AuthzError as e:
+                # A refusal raised *inside* a tool (an actor claim, a session
+                # that belongs to somebody else) is still an authorization
+                # answer: it reaches the client as a clean message rather than
+                # as an unexpected error with a traceback in the log.
+                raise ToolError(str(e)) from None
 
     @staticmethod
     def _scope_for(method: str, params) -> authz.Scope | None:
@@ -320,7 +327,9 @@ async def _apply_decision(
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
 
-        # The reviewer is the authenticated caller (app/authz.py).
+        # The reviewer is the authenticated caller, and the caller must be
+        # allowed to decide on *this* task (app/authz.py).
+        authz.check_may_approve(db, task_id)
         reviewer_actor_id = authz.acting_actor_id(db)
 
         try:
@@ -341,6 +350,9 @@ async def _apply_decision(
             db.rollback()
             return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
         except crud.LedgerError as e:
+            db.rollback()
+            raise ToolError(str(e)) from None
+        except authz.AuthzError as e:
             db.rollback()
             raise ToolError(str(e)) from None
         resume_payload = {"decision": action, "human_comment": comment}
@@ -645,6 +657,8 @@ def heartbeat_session(session_id: int, focus: str | None = None, branch: str | N
     quiet for 30 minutes is shown as stale to everyone else.
     """
     _free_text_surface()
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     with _session() as db:
         session = coordination.heartbeat_session(db, session_id, focus=focus, branch=branch)
         if not session:
@@ -659,6 +673,8 @@ def end_session(session_id: int) -> dict:
     Call this when you finish, so peers are not waiting on leases you no longer
     need. Claims expire on their own if you never do.
     """
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     with _session() as db:
         result = coordination.end_session(db, session_id)
         if not result:
@@ -689,6 +705,8 @@ def check_conflicts(repo: str, paths: list[str], session_id: int | None = None, 
     "backend/app/crud.py").
     """
     _free_text_surface()
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         conflicts = coordination.find_conflicts(
@@ -724,6 +742,8 @@ def claim_territory(
     hold territory forever. Release it with release_territory when you are done.
     """
     _free_text_surface()
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         result = coordination.claim_territory(
@@ -749,8 +769,13 @@ def release_territory(claim_id: int | None = None, session_id: int | None = None
     if claim_id is None and session_id is None:
         raise ValueError("Pass either claim_id or session_id")
     with _session() as db:
+        authz.check_session_owner(db, session_id)
         if claim_id is not None:
             claim = coordination.release_claim(db, claim_id)
+            if claim is not None:
+                # A claim id names a session too; releasing another Actor's
+                # territory is the same forgery as ending its session.
+                authz.check_session_owner(db, claim.session_id)
             if not claim:
                 raise ValueError(f"Claim {claim_id} not found")
             return {"released": 1, "claim": claim_to_dict(claim)}
@@ -780,6 +805,8 @@ def send_relay(
     migration chain"), and "handoff" when you are passing work on.
     """
     _free_text_surface()
+    with _session() as _db:
+        authz.check_session_owner(_db, from_session_id)
     resolved_kind = models.RelayKindEnum(kind)
     with _session() as db:
         relay = coordination.send_relay(
@@ -803,6 +830,8 @@ def read_inbox(session_id: int, include_acked: bool = False, limit: int = 50) ->
     Check this at the start of a turn, alongside get_board. Messages stay in the
     inbox until you ack_relay them, so nothing is lost if you do not act now.
     """
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     with _session() as db:
         return coordination.read_inbox(db, session_id, include_acked=include_acked, limit=limit)
 
@@ -815,6 +844,8 @@ def ack_relay(relay_id: int, session_id: int, note: str | None = None) -> dict:
     the receipt records that you saw it.
     """
     _free_text_surface()
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     with _session() as db:
         receipt = coordination.ack_relay(db, relay_id=relay_id, session_id=session_id, note=note)
         return {
@@ -905,6 +936,8 @@ def claim_git_resource(
     path claim.
     """
     _free_text_surface()
+    with _session() as _db:
+        authz.check_session_owner(_db, session_id)
     resolved = models.ClaimResourceEnum(resource)
     with _session() as db:
         result = coordination.claim_resource(
