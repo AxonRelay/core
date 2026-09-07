@@ -155,15 +155,30 @@ class Task(Base):
 
 
 class Draft(Base):
-    """Version history of task drafts."""
+    """Version history of task drafts — the artifacts approvals bind to.
+
+    ``(task_id, version)`` is unique so a version number names exactly one
+    artifact. ``commitment`` is the SHA-256 of the content (see
+    app/ledger.py); it is what an approval records, so the ledger can prove
+    which bytes were approved without ever re-reading them.
+    """
 
     __tablename__ = "drafts"
+    __table_args__ = (UniqueConstraint("task_id", "version", name="uq_drafts_task_version"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Artifact commitment (migration 009). NULL only on rows the backfill
+    # could not reach; record_approval fills it in before binding to them.
+    commitment = Column(String(64))
+    commitment_algorithm = Column(String(32))
+    # Producer of this version. Deliberately not a FK: a ledger field must not
+    # be rewritten (SET NULL) because an Actor row was deleted.
+    producer_actor_id = Column(Integer)
 
     task = relationship("Task", back_populates="drafts")
 
@@ -174,7 +189,7 @@ class Approval(Base):
     __tablename__ = "approvals"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     reviewer_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"))
     action = Column(String(20), nullable=False)
     comment = Column(Text)
@@ -185,8 +200,25 @@ class Approval(Base):
     prev_hash = Column(String(64))
     entry_hash = Column(String(64))
 
+    # Which payload the row was hashed with: NULL = v1 (event only, migrations
+    # 004–008), 2 = artifact-bound. Verification picks the payload by this.
+    hash_version = Column(Integer)
+
+    # Artifact binding (migration 009) — all five fields are inside the v2
+    # hash. NULL on legacy rows, which are reported as not artifact-bound.
+    artifact_ref = Column(String(255))
+    artifact_version = Column(Integer)
+    artifact_commitment = Column(String(64))
+    artifact_commitment_algorithm = Column(String(32))
+    producer_actor_id = Column(Integer)  # not a FK, same reason as Draft
+
     task = relationship("Task", back_populates="approvals")
     reviewer = relationship("Actor", back_populates="approvals", foreign_keys=[reviewer_actor_id])
+
+    @property
+    def artifact_bound(self) -> bool:
+        """True when this entry names the exact artifact it approved."""
+        return self.hash_version == 2 and self.artifact_commitment is not None
 
 
 class ExternalLink(Base):

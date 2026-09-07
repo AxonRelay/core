@@ -29,6 +29,7 @@ def test_add_draft_assigns_monotonic_versions(db):
 
 def test_record_approval_is_append_only_and_ordered(db, self_actor):
     task = _task(db)
+    crud.add_draft(db, task_id=task.id, content="draft under review")
 
     crud.record_approval(db, task_id=task.id, reviewer_actor_id=self_actor.id, action="rejected", comment="redo")
     crud.record_approval(db, task_id=task.id, reviewer_actor_id=self_actor.id, action="approved", comment="ok")

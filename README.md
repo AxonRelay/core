@@ -112,8 +112,8 @@ through MCP; the REST API is mostly for reading the ledger from a dashboard.
 |-------|---------|
 | `Actor` | Unified abstraction for humans and AI. A single human Actor (`name="self"`) is the operator; AI actors are 1:1 with `AgentDefinition`. |
 | `TaskAssignment` | Binds an Actor to a Task with a role: `executor` / `reviewer` / `approver` / `observer`. |
-| `Draft` | Versioned history of a task's output. |
-| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp. Tamper-evident via a per-task SHA-256 hash chain (`prev_hash` / `entry_hash`, see [`app/ledger.py`](backend/app/ledger.py)). |
+| `Draft` | Versioned history of a task's output — the **artifacts** approvals bind to. `(task_id, version)` is unique; each version carries a `commitment` (SHA-256 of its bytes) and, when known, the `producer_actor_id`. |
+| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp, **and the artifact it decided on** (`artifact_ref` / `artifact_version` / `artifact_commitment` / producer). Tamper-evident via a per-task SHA-256 hash chain (`prev_hash` / `entry_hash`) that covers the binding too — see [`app/ledger.py`](backend/app/ledger.py) and [ADR-009](docs/adr-009-artifact-commitment.md). |
 | `ExternalLink` | Link to an external artifact (e.g. a future MCP resource URI). |
 
 State machine:
@@ -126,7 +126,21 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 
 The ledger is safe for concurrent writers: `record_approval` locks the task row
 before reading the chain head, so two agents approving the same task cannot fork
-its hash chain.
+its hash chain. The same lock covers the draft append, so an approval that
+carries an edited draft creates the new version first and binds to it.
+
+Three guarantees that are easy to conflate:
+
+- **Tamper-evident events** — an edited or reordered approval, including any of
+  its artifact-binding fields, fails `verify_task_ledger`.
+- **Artifact identity** — each new approval names the exact draft version and
+  content commitment it decided on; a decision made against a superseded draft
+  is refused (`409` / `stale_decision`). Whether the stored draft bytes still
+  match that commitment is a separate check; the ledger never stores external
+  artifact contents. Entries recorded before this binding existed verify as
+  what they are and are reported as `not artifact-bound`.
+- **Regulatory-grade signing, timestamping and non-repudiation** — out of scope;
+  see [docs/regulatory-positioning.md](docs/regulatory-positioning.md).
 
 ---
 
@@ -218,7 +232,7 @@ cp .env.example .env                    # works as-is on a laptop; add LANGGRAPH
 docker compose up -d postgres           # Postgres on 127.0.0.1:5432
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-(cd backend && alembic upgrade head)    # migrations through 008; seeds the "self" Actor
+(cd backend && alembic upgrade head)    # migrations through 009; seeds the "self" Actor
 ```
 
 Or, with the venv active, `make dev` runs the last three and starts the MCP
@@ -273,7 +287,7 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (26 tools / 3 resources), LangGraph Platform client, migrations through 008. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (26 tools / 3 resources), LangGraph Platform client, migrations through 009. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
@@ -291,6 +305,7 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 - [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: presence, territory claims, relays
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — why the coordination layer has no message broker
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — why `gitsafe` stays opt-in instead of shadowing `git` on PATH
+- [docs/adr-009-artifact-commitment.md](docs/adr-009-artifact-commitment.md) — why every approval names the draft version and content commitment it decided on, and what that does not prove
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup (account side only; the backend side is not built yet)
