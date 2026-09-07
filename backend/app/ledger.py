@@ -43,6 +43,12 @@ COMMITMENT_ALGORITHM = "sha256-utf8-v1"
 
 #: Payload version written by ``record_approval`` today.
 ENTRY_HASH_VERSION = 2
+#: First payload version that carries an artifact binding. Verification and
+#: ``Approval.artifact_bound`` compare against this, not against the current
+#: version, so a future v3 does not make every v2 row look tampered.
+ARTIFACT_BINDING_SINCE = 2
+#: Shape of a commitment as it travels over the wire (REST, MCP, envelopes).
+SHA256_HEX_PATTERN = r"^[0-9a-f]{64}$"
 
 
 def compute_artifact_commitment(content: str) -> str:
@@ -80,11 +86,13 @@ def compute_entry_hash(
     comment: str | None,
     created_at: datetime,
     artifact: ArtifactBinding | None = None,
+    version: int | None = None,
 ) -> str:
     """Deterministic hash of one approval, chained to ``prev_hash``.
 
     Without ``artifact`` this is the v1 payload (used to verify rows recorded
-    before migration 009). With it, the payload carries ``"v": 2`` and the
+    before migration 009). With it, the payload carries the version marker
+    (``version``, defaulting to the current ``ENTRY_HASH_VERSION``) and the
     binding, so a v2 row whose ``hash_version`` is flipped back to v1 still
     fails verification — the version marker is inside the hashed bytes.
 
@@ -103,7 +111,10 @@ def compute_entry_hash(
         "created_at": created_at.isoformat(timespec="microseconds"),
     }
     if artifact is not None:
-        payload["v"] = ENTRY_HASH_VERSION
+        # The version marker inside the hash is the *row's* version when
+        # verifying (so an older row is recomputed exactly as it was written)
+        # and the current version when recording.
+        payload["v"] = version or ENTRY_HASH_VERSION
         payload["artifact"] = asdict(artifact)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

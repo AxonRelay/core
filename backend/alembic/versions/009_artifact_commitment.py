@@ -19,12 +19,15 @@ drafts
     ledger field must not change when an Actor row is deleted.
   * uq_drafts_task_version — (task_id, version) is now unique, so the "new
     artifact version before approval" rule cannot be raced into a duplicate.
+    Duplicates the old unlocked add_draft may already have produced are
+    renumbered in id order first, so the constraint can be created.
   * ix_drafts_task_id — every read filters on it.
 
 approvals
-  * hash_version — NULL for rows hashed with the v1 payload (004–008), 2 for
-    rows that include the artifact binding. Verification picks the payload by
-    this column and reports v1 rows as *not artifact-bound*, not as tampered.
+  * hash_version — 1 for rows hashed with the v1 payload (004–008; stamped
+    here), 2 for rows that include the artifact binding, NULL only for rows
+    that were never hashed. Verification picks the payload by this column and
+    reports v1 rows as *not artifact-bound*, not as tampered.
   * artifact_ref / artifact_version / artifact_commitment /
     artifact_commitment_algorithm / producer_actor_id — the binding. All five
     are inside the v2 hash. NULL on legacy rows; **no backfill**, because a
@@ -54,13 +57,31 @@ COMMITMENT_ALGORITHM = "sha256-utf8-v1"
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+
+    # The pre-009 add_draft assigned versions with no lock, so two racing
+    # appends could both take the same number. Renumber such rows in id order
+    # before the unique constraint below can refuse them. Rows that are
+    # already unique keep their numbers.
+    rows = bind.execute(sa.text("SELECT id, task_id, version FROM drafts ORDER BY task_id, version, id")).all()
+    per_task: dict[int, list[tuple[int, int]]] = {}
+    for draft_id, task_id, version in rows:
+        per_task.setdefault(task_id, []).append((draft_id, version))
+    for entries in per_task.values():
+        versions = [v for _, v in entries]
+        if len(set(versions)) == len(versions):
+            continue
+        for new_version, (draft_id, _) in enumerate(entries, start=1):
+            bind.execute(
+                sa.text("UPDATE drafts SET version = :v WHERE id = :i"),
+                {"v": new_version, "i": draft_id},
+            )
+
     op.add_column("drafts", sa.Column("commitment", sa.String(length=64), nullable=True))
     op.add_column("drafts", sa.Column("commitment_algorithm", sa.String(length=32), nullable=True))
     op.add_column("drafts", sa.Column("producer_actor_id", sa.Integer(), nullable=True))
     op.create_index("ix_drafts_task_id", "drafts", ["task_id"])
     op.create_unique_constraint("uq_drafts_task_version", "drafts", ["task_id", "version"])
-
-    bind = op.get_bind()
     rows = bind.execute(sa.text("SELECT id, content FROM drafts WHERE commitment IS NULL")).all()
     for draft_id, content in rows:
         bind.execute(
@@ -79,6 +100,9 @@ def upgrade() -> None:
     op.add_column("approvals", sa.Column("artifact_commitment_algorithm", sa.String(length=32), nullable=True))
     op.add_column("approvals", sa.Column("producer_actor_id", sa.Integer(), nullable=True))
     op.create_index("ix_approvals_task_id", "approvals", ["task_id"])
+    # Rows hashed with the v1 payload say so; NULL is left to mean "never
+    # hashed" (pre-004 rows) and nothing else.
+    bind.execute(sa.text("UPDATE approvals SET hash_version = 1 WHERE entry_hash IS NOT NULL"))
 
 
 def downgrade() -> None:

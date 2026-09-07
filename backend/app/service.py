@@ -25,14 +25,26 @@ def project_run_state(
 
     The Platform thread is the source of truth; Postgres is a projection. This
     is **idempotent**: replaying the same `values` (e.g. a retried request) adds
-    no duplicate draft versions, because each draft is keyed by its 1-based
-    index and only inserted when that version is absent.
+    no duplicate draft versions, because a draft is only inserted when neither
+    its position nor its content is already in the ledger.
     """
     new_drafts = values.get("drafts") or []
-    existing_versions = {d.version for d in crud.get_drafts(db, task.id)}
+    existing = crud.get_drafts(db, task.id)
     for idx, content in enumerate(new_drafts, start=1):
-        if idx not in existing_versions:
-            crud.add_draft(db, task_id=task.id, content=content)
+        # Match by position *and* content. Positions alone are not enough:
+        # record_approval writes a reviewer's modified draft as a new version
+        # before the graph resumes, so if that resume fails the ledger is one
+        # version ahead of the graph and the graph's next draft would land on
+        # an index that already exists here. Same content at the same index
+        # (a replay, or the graph echoing the modified draft) adds nothing;
+        # different content is a draft the ledger has not seen and is
+        # appended as the next version.
+        if idx <= len(existing):
+            if existing[idx - 1].content == content or any(d.content == content for d in existing[idx - 1 :]):
+                continue
+        elif existing and existing[-1].content == content:
+            continue
+        existing.append(crud.add_draft(db, task_id=task.id, content=content))
 
     reviewer_comments = values.get("reviewer_comments") or []
     feedback = reviewer_comments[-1] if reviewer_comments else None
