@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from typing import Any
@@ -29,7 +30,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from app import coordination, crud, langgraph_client, models, safe_envelope, service, territory
+from app import authz, coordination, crud, langgraph_client, models, safe_envelope, service, territory
 from app.database import SessionLocal
 from app.mcp import http_auth
 from app.mcp.serializers import (
@@ -53,6 +54,75 @@ def _session():
         yield db
     finally:
         db.close()
+
+
+class AuthorizationMiddleware:
+    """Resolve the caller and check the scope of every inbound MCP message.
+
+    One middleware instead of a check inside thirty tools: the SDK wraps every
+    request with `(ctx, call_next)`, so the decision happens in one place and a
+    tool cannot be added without one — `authz.TOOL_SCOPES` must name it, and a
+    structural test fails if it does not.
+
+    `ctx.request` is the HTTP request the transport attached; it is `None` on
+    stdio, which is the operator's own process and runs as the loopback
+    principal (ADR-011 records that trust assumption). Headers are read only
+    to look a credential up by digest — never treated as an identity assertion
+    in themselves, and never logged.
+    """
+
+    async def __call__(self, ctx, call_next):
+        method = ctx.method
+        request = getattr(ctx, "request", None)
+        transport_is_local = request is None
+        if not transport_is_local and not authz.require_auth():
+            transport_is_local = True  # enforcement off: same trust as stdio
+
+        # initialize, tools/list, ping and notifications address no resource,
+        # so they resolve a principal but carry no scope.
+        scope = self._scope_for(method, ctx.params)
+
+        with _session() as db:
+            try:
+                principal = authz.resolve(
+                    db,
+                    authorization=(request.headers.get("authorization") if request is not None else None),
+                    transport_is_local=transport_is_local,
+                )
+                if scope is not None:
+                    principal.require(scope)
+            except authz.AuthzError as e:
+                raise ToolError(str(e)) from None
+
+        with authz.bind(principal):
+            return await call_next(ctx)
+
+    @staticmethod
+    def _scope_for(method: str, params) -> authz.Scope | None:
+        """The scope this message needs, or None when it reads and writes nothing."""
+        params = params or {}
+        if method == "tools/call":
+            name = params.get("name")
+            if name in authz.TOOL_SCOPES:
+                return authz.TOOL_SCOPES[name]
+            # An unknown tool is the SDK's METHOD_NOT_FOUND to report, not ours.
+            return None
+        if method == "resources/read":
+            uri = str(params.get("uri", ""))
+            for template, scope in authz.RESOURCE_SCOPES.items():
+                if _uri_matches(template, uri):
+                    return scope
+            return None
+        return None
+
+
+def _uri_matches(template: str, uri: str) -> bool:
+    """Does a concrete resource URI come from this template? ({placeholders} match one segment)."""
+    pattern = "^" + re.sub(r"\{[^}]+\}", "[^/]+", re.escape(template).replace(r"\{", "{").replace(r"\}", "}")) + "$"
+    return re.match(pattern, uri) is not None
+
+
+mcp.middleware.append(AuthorizationMiddleware())
 
 
 def _free_text_surface() -> None:
@@ -104,10 +174,10 @@ def list_tasks(status: str | None = None, limit: int = 50) -> list[dict]:
 def list_pending_approvals() -> list[dict]:
     """List tasks awaiting the operator's approval (the unified inbox)."""
     with _session() as db:
-        self_actor = crud.get_self_actor(db)
-        if not self_actor:
+        actor_id = authz.acting_actor_id(db)
+        if not actor_id:
             return []
-        tasks = crud.list_pending_approvals(db, actor_id=self_actor.id)
+        tasks = crud.list_pending_approvals(db, actor_id=actor_id)
         return [task_to_dict(t) for t in tasks]
 
 
@@ -165,8 +235,7 @@ async def create_task(
     """
     _free_text_surface()
     with _session() as db:
-        self_actor = crud.get_self_actor(db)
-        creator_actor_id = self_actor.id if self_actor else None
+        creator_actor_id = authz.acting_actor_id(db)
 
         thread_id = await langgraph_client.create_thread(
             metadata={"title": title, "creator_actor_id": creator_actor_id}
@@ -251,8 +320,8 @@ async def _apply_decision(
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
 
-        self_actor = crud.get_self_actor(db)
-        reviewer_actor_id = self_actor.id if self_actor else None
+        # The reviewer is the authenticated caller (app/authz.py).
+        reviewer_actor_id = authz.acting_actor_id(db)
 
         try:
             approval = crud.record_approval(
@@ -499,11 +568,18 @@ def update_agent(
 
 @mcp.tool()
 def get_self_actor() -> dict:
-    """Return the operator's human Actor (singleton in personal PoC)."""
+    """The Actor this caller is, decided server-side.
+
+    Under a credential that is the credential's Actor; over stdio, or on an
+    instance that has not turned enforcement on, the operator's human Actor.
+    Never a value the call supplied - ask this when you want to know who the
+    server thinks you are.
+    """
     with _session() as db:
-        actor = crud.get_self_actor(db)
+        actor_id = authz.acting_actor_id(db)
+        actor = crud.get_actor(db, actor_id) if actor_id else None
         if not actor:
-            raise ValueError("Self actor is not seeded; run migration 003")
+            raise ToolError("No actor is bound to this caller; seed the operator actor (migration 003)")
         return actor_to_dict(actor)
 
 
@@ -541,6 +617,9 @@ def register_session(
     but share one stash stack, and only the git dir identifies that.
     """
     _free_text_surface()
+    # A credential decides which Actor this is; a differing actor_name is a
+    # request to act as somebody else and is refused, not quietly ignored.
+    authz.check_claimed_actor(actor_name)
     resolved_type = models.ActorTypeEnum(actor_type)
     with _session() as db:
         session = coordination.register_session(
