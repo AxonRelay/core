@@ -83,6 +83,15 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
 | `get_self_actor()` | オペレータ Human Actor |
 
+### Safe Envelope（content-blind 取り込み）
+
+`AXONRELAY_SAFE_MODE=1` のインスタンスでは上の書き込み系 tool と調整レイヤーの書き込み系 tool は固定文言で拒否され、以下だけが書き込み経路になる（[ADR-010](./adr-010-safe-envelope.md)、[schema](./schemas/safe-envelope-v1.json)）。
+
+| Tool | 用途 |
+|---|---|
+| `ingest_safe_envelope(envelope)` | metadata-only の envelope を 1 件取り込む。opaque id・action/outcome enum・producer 算出の artifact commitment・timestamp のみ。未知フィールドは拒否、拒否理由はフィールド名だけ。同じ `event_id` の再送は冪等 |
+| `list_safe_events(limit?, action?)` | 取り込み済み envelope を新しい順に返す |
+
 ### 調整レイヤー (Phase 3)
 
 複数デバイス・複数リポジトリ・同一リポジトリの複数 clone で、複数のエージェントが並行作業するための tool 群。設計は [coordination-spec.md](./coordination-spec.md)。

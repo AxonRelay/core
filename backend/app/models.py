@@ -316,6 +316,28 @@ class RelayKindEnum(enum.StrEnum):
     WARNING = "warning"
 
 
+class SafeActionEnum(enum.StrEnum):
+    """What a Safe Envelope reports happened. Closed set; free text has no slot."""
+
+    SESSION_START = "session_start"
+    SESSION_HEARTBEAT = "session_heartbeat"
+    SESSION_END = "session_end"
+    CLAIM_REQUEST = "claim_request"
+    CLAIM_RELEASE = "claim_release"
+    ARTIFACT_PRODUCED = "artifact_produced"
+    DECISION_APPROVE = "decision_approve"
+    DECISION_REJECT = "decision_reject"
+    RELAY_NOTICE = "relay_notice"
+    RELAY_ACK = "relay_ack"
+
+
+class SafeOutcomeEnum(enum.StrEnum):
+    SUCCESS = "success"
+    REFUSED = "refused"
+    CONFLICT = "conflict"
+    ERROR = "error"
+
+
 class Workspace(Base):
     """One checkout of one repository on one machine.
 
@@ -468,3 +490,38 @@ class RelayReceipt(Base):
 
     relay = relationship("Relay", back_populates="receipts")
     session = relationship("Session")
+
+
+class SafeEvent(Base):
+    """One ingested Safe Envelope (app/safe_envelope.py). Append-only, metadata only.
+
+    Every column is a bounded identifier, an enum, a digest or a timestamp. The
+    table has no text column by design: a producer that wanted to send a
+    title, a body or a path has no field to put it in, and the schema rejects
+    unknown fields before anything reaches this row.
+    """
+
+    __tablename__ = "safe_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schema_version = Column(Integer, nullable=False)
+    policy_version = Column(String(32), nullable=False)
+    identifier_policy = Column(String(16), nullable=False)
+
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    actor_ref = Column(String(128), nullable=False, index=True)
+    repository_ref = Column(String(201), nullable=False, index=True)
+    workspace_ref = Column(String(128))
+    session_ref = Column(String(128), index=True)
+
+    action = Column(Enum(SafeActionEnum), nullable=False, index=True)
+    outcome = Column(Enum(SafeOutcomeEnum), nullable=False)
+
+    artifact_ref = Column(String(128))
+    artifact_version = Column(Integer)
+    artifact_commitment = Column(String(64))
+    artifact_commitment_algorithm = Column(String(32))
+
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    received_at = Column(DateTime, nullable=False)
+    producer_signature = Column(String(1024))
