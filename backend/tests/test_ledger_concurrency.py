@@ -27,6 +27,8 @@ def _task(db, title="concurrent"):
     db.add(task)
     db.commit()
     db.refresh(task)
+    # Every approval binds to an artifact, so the task under test has one draft.
+    crud.add_draft(db, task_id=task.id, content=f"draft for {title}")
     return task
 
 
@@ -60,6 +62,8 @@ def test_approvals_on_different_tasks_are_independent_chains(db, self_actor):
         "broken_at": None,
         "count": 2,
         "legacy": 0,
+        "artifact_bound": 2,
+        "unbound": 0,
     }
     assert crud.verify_approval_chain(db, task_b.id)["valid"] is True
 
@@ -74,6 +78,13 @@ def test_a_forked_chain_is_reported_as_invalid(db, self_actor):
     root = crud.record_approval(db, task.id, self_actor.id, "approved", "root")
 
     now = datetime.utcnow()
+    binding = ledger.ArtifactBinding(
+        ref=root.artifact_ref,
+        version=root.artifact_version,
+        commitment=root.artifact_commitment,
+        commitment_algorithm=root.artifact_commitment_algorithm,
+        producer_actor_id=root.producer_actor_id,
+    )
     fork = models.Approval(
         task_id=task.id,
         reviewer_actor_id=self_actor.id,
@@ -89,7 +100,14 @@ def test_a_forked_chain_is_reported_as_invalid(db, self_actor):
             action="rejected",
             comment="racing writer",
             created_at=now,
+            artifact=binding,
         ),
+        hash_version=ledger.ENTRY_HASH_VERSION,
+        artifact_ref=binding.ref,
+        artifact_version=binding.version,
+        artifact_commitment=binding.commitment,
+        artifact_commitment_algorithm=binding.commitment_algorithm,
+        producer_actor_id=binding.producer_actor_id,
     )
     db.add(fork)
     db.commit()

@@ -343,6 +343,23 @@ async def list_pending_approvals_endpoint(
 # ========== Approve / Reject ==========
 
 
+def _record_decision(db: Session, **kwargs) -> models.Approval:
+    """`crud.record_approval` with the ledger's contract errors mapped to HTTP.
+
+    409 for a stale target or a task with no artifact (the request was well
+    formed; the state it assumed is gone), 404 for a vanished task. The error
+    text names versions only, never content.
+    """
+    try:
+        return crud.record_approval(db, **kwargs)
+    except crud.TaskNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except (crud.StaleArtifactError, crud.ArtifactRequiredError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except crud.LedgerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.post("/tasks/{task_id}/approve", response_model=ApprovalResponse)
 @limiter.limit("30/minute")
 async def approve_task_endpoint(
@@ -357,12 +374,18 @@ async def approve_task_endpoint(
     self_actor = crud.get_self_actor(db)
     reviewer_actor_id = self_actor.id if self_actor else None
 
-    approval = crud.record_approval(
+    # The ledger entry (and, if the operator edited the draft, the new draft
+    # version it binds to) is written before the graph resumes: the approval
+    # names the artifact, so the artifact has to exist first.
+    approval = _record_decision(
         db,
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action="approved",
         comment=approve_data.comment,
+        artifact_version=approve_data.artifact_version,
+        expected_commitment=approve_data.expected_commitment,
+        modified_draft=approve_data.modified_draft,
     )
 
     try:
@@ -400,12 +423,14 @@ async def reject_task_endpoint(
     comment_parts = [reject_data.comment, reject_data.reason]
     combined_comment = " | ".join(p for p in comment_parts if p) or None
 
-    approval = crud.record_approval(
+    approval = _record_decision(
         db,
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action="rejected",
         comment=combined_comment,
+        artifact_version=reject_data.artifact_version,
+        expected_commitment=reject_data.expected_commitment,
     )
 
     try:
