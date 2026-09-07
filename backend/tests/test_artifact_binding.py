@@ -491,3 +491,45 @@ def test_the_decision_key_is_outside_the_hash(db, self_actor):
     )
     assert keyed.entry_hash == expected
     assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+
+def test_two_reviewers_reaching_the_same_verdict_are_two_entries(db, self_actor):
+    """The decider is part of a decision's identity, not just the decision.
+
+    A task can carry more than one authorised approver. If the key named only
+    the draft and the verdict, the second reviewer's decision would collide
+    with the first, go unrecorded, and its caller would be handed somebody
+    else's approval — in a ledger whose subject is who approved what.
+    """
+    from app.mcp.server import _scope_to_reviewer
+
+    task, draft = _task_with_draft(db)
+    reviewer_b = models.Actor(type=models.ActorTypeEnum.HUMAN, name="second reviewer")
+    db.add(reviewer_b)
+    db.commit()
+
+    round_key = "same draft, same verdict, same words"
+    assert _scope_to_reviewer(round_key, self_actor.id) != _scope_to_reviewer(round_key, reviewer_b.id)
+
+    first = crud.record_approval(
+        db, task.id, self_actor.id, "rejected", decision_key=_scope_to_reviewer(round_key, self_actor.id)
+    )
+    second = crud.record_approval(
+        db, task.id, reviewer_b.id, "rejected", decision_key=_scope_to_reviewer(round_key, reviewer_b.id)
+    )
+    assert second.id != first.id
+    assert [a.reviewer_actor_id for a in crud.get_approvals(db, task.id)] == [self_actor.id, reviewer_b.id]
+    assert second.prev_hash == first.entry_hash
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+
+def test_the_same_reviewer_replaying_still_collapses(db, self_actor):
+    """Scoping by reviewer must not weaken the retry protection it sits on."""
+    from app.mcp.server import _scope_to_reviewer
+
+    task, draft = _task_with_draft(db)
+    key = _scope_to_reviewer("one round", self_actor.id)
+    first = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key=key)
+    again = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key=key)
+    assert again.id == first.id
+    assert len(crud.get_approvals(db, task.id)) == 1

@@ -63,6 +63,31 @@ REQUEST_STATE_KEY_ENV = "AXONRELAY_REQUEST_STATE_KEY"
 REQUEST_STATE_TTL_SECONDS = 900.0
 
 
+def _request_state_principal(ctx) -> str | None:
+    """Who a resumable handle belongs to, for the SDK's seal.
+
+    The SDK's default binding reads *its* OAuth context, which AxonRelay never
+    populates - it resolves callers itself (app/authz.py, ADR-011) - so left
+    alone every handle is unbound and one credential could finish a round that
+    was started, and had its draft displayed, under another.
+
+    The credential is identified by a digest of the presented Authorization
+    header: stable across the rounds of one call, different for a different
+    caller, and never the plaintext. It is a binding value, not a lookup key -
+    it is never compared against a stored credential digest.
+
+    `None` on stdio and on an HTTP call that presents nothing, which is the
+    same trust assumption the rest of the server makes about those callers: one
+    operator, one process. The SDK rejects a handle whose binding appears or
+    disappears between rounds, so the two cases cannot be mixed.
+    """
+    request = getattr(ctx, "request", None)
+    header = request.headers.get("authorization") if request is not None else None
+    if not header:
+        return None
+    return hashlib.sha256(header.encode()).hexdigest()
+
+
 def _request_state_security() -> RequestStateSecurity:
     """Key the sealed `requestState` handle that carries a half-finished approval.
 
@@ -79,9 +104,15 @@ def _request_state_security() -> RequestStateSecurity:
     """
     key = os.environ.get(REQUEST_STATE_KEY_ENV, "").strip()
     if not key:
-        return RequestStateSecurity.ephemeral(ttl=REQUEST_STATE_TTL_SECONDS)
+        # `RequestStateSecurity.ephemeral()` would be the shorthand, but it
+        # takes no `bind_principal` and would silently install the SDK's OAuth
+        # default - the very binding that is inert here. Same process-local
+        # key, stated explicitly.
+        return RequestStateSecurity(
+            keys=[os.urandom(32)], ttl=REQUEST_STATE_TTL_SECONDS, bind_principal=_request_state_principal
+        )
     try:
-        return RequestStateSecurity(keys=[key], ttl=REQUEST_STATE_TTL_SECONDS)
+        return RequestStateSecurity(keys=[key], ttl=REQUEST_STATE_TTL_SECONDS, bind_principal=_request_state_principal)
     except ValueError as e:
         # Refused at startup and by name. A weak key here does not fail
         # visibly later: it seals handles that carry a pending approval, and
@@ -383,59 +414,78 @@ async def _apply_decision(
 
     A `decision_key` makes the write idempotent: a replayed round finds its own
     entry, returns the same payload the first round did with `replayed: true`
-    added, and neither appends to the ledger nor resumes the graph again.
+    added, and neither appends to the ledger nor resumes the graph again. The
+    key is scoped to the reviewer here, where the authenticated caller is
+    known - see `_scope_to_reviewer`. A replay whose task never left
+    WAITING_APPROVAL re-drives the resume rather than reporting success: the
+    ledger entry alone is not evidence that the graph got the decision.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
-        # Idempotency is checked before the status gate on purpose: the replay
-        # of a decision arrives *after* that decision moved the task out of
-        # WAITING_APPROVAL, so the gate would refuse it with an error rather
-        # than answer with what was recorded.
-        if decision_key is not None:
-            already = crud.find_decision(db, task_id, decision_key)
-            if already is not None:
-                # Shaped like the first round's answer, because that is what it
-                # is: `status` stays the task's own status rather than becoming
-                # an outcome word, and `replayed` is what says nothing new
-                # happened.
-                payload = task_to_dict(task)
-                payload["approval"] = approval_to_dict(already)
-                payload["replayed"] = True
-                return payload
-        if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
+
+        # Authorization first, before this call can learn anything or return
+        # anything: the replay path answers with a recorded decision, and a
+        # caller who may not decide on this task should not reach it either.
+        authz.check_may_approve(db, task_id)
+        # The recorded reviewer is the authenticated caller, never a parameter.
+        reviewer_actor_id = authz.acting_actor_id(db)
+        scoped_key = _scope_to_reviewer(decision_key, reviewer_actor_id)
+
+        already = crud.find_decision(db, task_id, scoped_key) if scoped_key is not None else None
+        if already is not None and task.status != models.TaskStatusEnum.WAITING_APPROVAL:
+            # A completed replay: the first attempt recorded *and* got the
+            # graph moving, so there is nothing left to do. Shaped like the
+            # first round's answer, because that is what it is — `status`
+            # stays the task's own status rather than becoming an outcome
+            # word, and `replayed` is what says nothing new happened.
+            payload = task_to_dict(task)
+            payload["approval"] = approval_to_dict(already)
+            payload["replayed"] = True
+            return payload
+
+        if already is None and task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
 
-        # The reviewer is the authenticated caller, and the caller must be
-        # allowed to decide on *this* task (app/authz.py).
-        authz.check_may_approve(db, task_id)
-        reviewer_actor_id = authz.acting_actor_id(db)
+        if already is not None:
+            # Recorded, but the task never left WAITING_APPROVAL — the resume
+            # below did not land the first time (a Platform timeout after the
+            # ledger commit is the ordinary way to get here; app/service.py's
+            # projection is written for exactly that gap). Retrying must
+            # therefore re-drive the resume, or one dropped response parks the
+            # task forever with a decision recorded against it. The residual
+            # ambiguity is a revision loop that comes straight back to
+            # WAITING_APPROVAL on the same draft: that is indistinguishable
+            # from a failed resume, and re-driving it re-sends the same
+            # decision about the same draft.
+            approval = already
+        else:
+            try:
+                approval = crud.record_approval(
+                    db,
+                    task_id=task_id,
+                    reviewer_actor_id=reviewer_actor_id,
+                    action=action,
+                    comment=comment,
+                    artifact_version=artifact_version,
+                    expected_commitment=expected_commitment,
+                    modified_draft=modified_draft if action == "approved" else None,
+                    decision_key=scoped_key,
+                )
+            except crud.StaleArtifactError as e:
+                db.rollback()
+                return {"status": "stale_decision", "task_id": task_id, "reason": str(e)}
+            except crud.ArtifactRequiredError as e:
+                db.rollback()
+                return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
+            except crud.LedgerError as e:
+                db.rollback()
+                raise ToolError(str(e)) from None
+            except authz.AuthzError as e:
+                db.rollback()
+                raise ToolError(str(e)) from None
 
-        try:
-            approval = crud.record_approval(
-                db,
-                task_id=task_id,
-                reviewer_actor_id=reviewer_actor_id,
-                action=action,
-                comment=comment,
-                artifact_version=artifact_version,
-                expected_commitment=expected_commitment,
-                modified_draft=modified_draft if action == "approved" else None,
-                decision_key=decision_key,
-            )
-        except crud.StaleArtifactError as e:
-            db.rollback()
-            return {"status": "stale_decision", "task_id": task_id, "reason": str(e)}
-        except crud.ArtifactRequiredError as e:
-            db.rollback()
-            return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
-        except crud.LedgerError as e:
-            db.rollback()
-            raise ToolError(str(e)) from None
-        except authz.AuthzError as e:
-            db.rollback()
-            raise ToolError(str(e)) from None
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
@@ -444,6 +494,8 @@ async def _apply_decision(
         db.refresh(task)
         payload = task_to_dict(task)
         payload["approval"] = approval_to_dict(approval)
+        if already is not None:
+            payload["replayed"] = True
         return payload
 
 
@@ -554,6 +606,14 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
             # A task id that names nothing is the caller's mistake in every
             # round, so it stays an error rather than becoming a status.
             raise ValueError(f"Task {task_id} not found")
+        # Refuse before the draft is rendered, not after the answer comes back.
+        # A caller who may not decide on this task has no business being shown
+        # its draft as a question - and finding out at record time means the
+        # content already crossed the wire. (`get_drafts` still serves the same
+        # content to a `ledger:read` credential; this closes the narrower gap
+        # where `ledger:write` alone put it in front of a non-approver, and it
+        # fails fast for everyone else.)
+        authz.check_may_approve(db, task_id)
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             return _ShownArtifact(
                 task_id=task_id,
@@ -624,9 +684,16 @@ def _decision_key(shown: _ShownArtifact, decision: _ApprovalDecision) -> str:
     round produce the same name and the ledger reject the second append
     (app/crud.py, migration 013).
 
-    It deliberately carries no nonce and no request id: two rounds that agree
-    on the artifact, the verdict, the comment and the edit *are* the same
-    decision, and a ledger gains nothing by recording it twice.
+    It deliberately carries no nonce and no request id: a nonce would make a
+    replay look new, which is the whole failure being prevented.
+
+    This half names the *decision*; `_scope_to_reviewer` adds the *decider*,
+    because a task can have more than one authorised approver and two people
+    reaching the same verdict on the same draft are two ledger entries, not one.
+    The residual case this cannot separate is the same reviewer recording a
+    byte-identical decision twice on the same draft version — which needs the
+    task to return to WAITING_APPROVAL without a new draft, and which nothing
+    in the payload distinguishes from a retry.
     """
     payload = json.dumps(
         {
@@ -635,12 +702,29 @@ def _decision_key(shown: _ShownArtifact, decision: _ApprovalDecision) -> str:
             "commitment": shown.commitment,
             "approve": decision.approve,
             "comment": decision.comment,
-            "modified_draft": decision.modified_draft,
+            # Only when approving: `_apply_decision` discards an edit on a
+            # rejection, so counting it here would give two identical
+            # rejections two different names and let both be recorded.
+            "modified_draft": decision.modified_draft if decision.approve else "",
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _scope_to_reviewer(decision_key: str | None, reviewer_actor_id: int | None) -> str | None:
+    """Bind a decision key to the actor it will be recorded against.
+
+    Without this, "same draft, same verdict, same words" from a *different*
+    authorised approver collides with the first reviewer's entry: the second
+    decision is never recorded and its caller is handed the first reviewer's
+    approval. In a ledger whose subject is who approved what, that is the worst
+    possible way to be idempotent.
+    """
+    if decision_key is None:
+        return None
+    return hashlib.sha256(f"{decision_key}:{reviewer_actor_id}".encode()).hexdigest()
 
 
 @mcp.tool()
@@ -676,7 +760,14 @@ async def review_pending_task(
         return {
             "status": "stale_decision",
             "task_id": task_id,
-            "reason": f"{shown.reason} No decision recorded. Re-run review_pending_task when it is.",
+            # Careful not to overclaim: "this round recorded nothing" is true,
+            # "nothing was recorded" is not - replaying an answered round lands
+            # here once the first round's decision has moved the task on.
+            "reason": (
+                f"{shown.reason} This call recorded nothing and nothing was shown. "
+                "If you already answered, that decision stands - read it with get_task or "
+                "verify_task_ledger rather than deciding again."
+            ),
         }
     if shown.state == "no_artifact":
         return {"status": "no_artifact", "task_id": task_id, "reason": shown.reason}

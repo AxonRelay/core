@@ -39,7 +39,6 @@ What is pinned:
 import asyncio
 import contextlib
 import json
-import socket
 import threading
 import time
 
@@ -78,12 +77,24 @@ def waiting_task(mcp_db, self_actor):
 
 @pytest.fixture
 def no_platform(monkeypatch):
-    """Resuming the graph is out of scope here; record what it was asked to do."""
+    """A Platform stub that actually processes the decision.
+
+    An approval finishes the run; a rejection comes back parked on a revised
+    draft. Returning a bare `{}` would be simpler and wrong: the projection
+    would leave every task in WAITING_APPROVAL, which is the exact state the
+    retry-repair path keys on, so the replay tests would silently be asserting
+    the repair instead of the ordinary path.
+    """
     resumes = []
 
     async def _resume(thread_id, payload):
         resumes.append((thread_id, payload))
-        return {}
+        if payload["decision"] == "approved":
+            drafts = [DRAFT]
+            if payload.get("modified_draft"):
+                drafts.append(payload["modified_draft"])
+            return {"values": {"drafts": drafts, "final_output": "shipped"}}
+        return {"next": ["human_approval"], "values": {"drafts": [DRAFT, "revised after rejection"]}}
 
     monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
     return resumes
@@ -109,23 +120,26 @@ def http_url():
     deadlocks on exactly the flow these tests exist to check. It is also the
     shape `python -m app.mcp.server --http` actually runs.
     """
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-
     app = mcp_server.mcp.streamable_http_app(streamable_http_path=HTTP_PATH, host="127.0.0.1")
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    # port=0 lets uvicorn bind whatever is free and report it. Picking a port
+    # with a probe socket first would leave a window in which something else
+    # can take it, and the failure would look like a bug in the server.
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
     while not server.started and time.monotonic() < deadline:
         time.sleep(0.01)
     assert server.started, "the Streamable HTTP server did not come up"
+    port = server.servers[0].sockets[0].getsockname()[1]
     try:
         yield f"http://127.0.0.1:{port}{HTTP_PATH}"
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+        # A daemon thread that outlives the fixture keeps serving this
+        # process's shared server object into later tests.
+        assert not thread.is_alive(), "the Streamable HTTP server did not shut down"
 
 
 @pytest.fixture
@@ -373,9 +387,10 @@ def test_replaying_an_answered_round_records_one_decision(connect, waiting_task,
     """A retried round is the same decision, not a second one.
 
     The 2026-07-28 answer round replays the whole `tools/call`, so a client
-    that retries after a dropped response runs the tool body again. Without
-    the decision key (migration 013) that is a duplicate ledger entry and a
-    duplicate resume of the graph.
+    that retries after a dropped response runs the tool body again. Once the
+    first round has carried the task out of WAITING_APPROVAL the pinning
+    resolver refuses before the body runs at all; the answer says so without
+    claiming that nothing was ever recorded.
     """
 
     async def go():
@@ -387,27 +402,57 @@ def test_replaying_an_answered_round_records_one_decision(connect, waiting_task,
 
     first, replay = asyncio.run(go())
     assert first["approval"]["action"] == "approved"
-    assert replay["replayed"] is True
-    assert "replayed" not in first
-    assert replay["approval"]["id"] == first["approval"]["id"]
-    assert replay["approval"]["entry_hash"] == first["approval"]["entry_hash"]
-    assert replay["status"] == first["status"], "the task's own status is not an outcome word"
+    assert replay["status"] == "stale_decision"
+    assert "that decision stands" in replay["reason"], "a replay must not be told its decision was lost"
 
-    approvals = crud.get_approvals(mcp_db, waiting_task.id)
-    assert len(approvals) == 1
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
     assert [d.version for d in crud.get_drafts(mcp_db, waiting_task.id)] == [1]
     assert len(no_platform) == 1, "the graph must not be resumed twice for one decision"
+
+
+def test_a_retry_after_a_failed_resume_repairs_it_without_a_second_entry(connect, waiting_task, mcp_db, monkeypatch):
+    """The ledger entry alone is not evidence that the graph got the decision.
+
+    `record_approval` commits, then the Platform call fails. The task is still
+    parked. A client retry has to re-drive the resume - if the decision key
+    short-circuited on the recorded entry, the task would stay parked forever
+    with an approval standing against it - and it must not append a second
+    entry while doing so.
+    """
+    attempts = []
+
+    async def _resume(thread_id, payload):
+        attempts.append(payload)
+        if len(attempts) == 1:
+            raise TimeoutError("Platform did not answer")
+        return {"values": {"drafts": [DRAFT], "final_output": "shipped"}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        async with connect(elicitation_callback=_unused_callback) as session:
+            asked = await _first_round(session, waiting_task.id)
+            answer = _accept(approve=True, comment="ok")
+            failed = await _answer(session, waiting_task.id, asked, answer)
+            assert failed.is_error, "a Platform failure must not read as a successful decision"
+            # The entry is committed and the task is still parked.
+            assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
+            assert crud.get_task(mcp_db, waiting_task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+            return _payload(await _answer(session, waiting_task.id, asked, answer))
+
+    repaired = asyncio.run(go())
+    assert repaired["replayed"] is True
+    assert len(attempts) == 2, "the retry must re-drive the resume the first attempt lost"
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1, "and must not append a second entry"
+    assert str(crud.get_task(mcp_db, waiting_task.id).status) == str(models.TaskStatusEnum.COMPLETED)
 
 
 def test_a_replayed_edit_does_not_append_a_second_draft_version(connect, waiting_task, no_platform, mcp_db):
     """An approval carrying an edit is the case a naive retry corrupts worst.
 
-    The edit becomes draft v2 before the approval binds to it, so a replay of
-    that round arrives at a task whose latest artifact is no longer the one the
-    question was rendered from. The framework therefore re-asks - about v2, the
-    reviewer's own edit - rather than replaying the decision. Either way the
-    invariant holds: one approval, one new draft version, and nothing recorded
-    that the reviewer did not just look at.
+    The edit becomes draft v2 before the approval binds to it, so a naive retry
+    would append both a second approval and a third draft version. Neither
+    happens, and the graph is resumed once.
     """
 
     async def go():
@@ -416,12 +461,11 @@ def test_a_replayed_edit_does_not_append_a_second_draft_version(connect, waiting
             answer = _accept(approve=True, modified_draft="edited by the reviewer")
             first = await _answer(session, waiting_task.id, asked, answer)
             replay = await _answer(session, waiting_task.id, asked, answer)
-            return _payload(first), replay
+            return _payload(first), _payload(replay)
 
     first, replay = asyncio.run(go())
     assert first["approval"]["artifact_version"] == 2
-    assert isinstance(replay, types.InputRequiredResult), "a replay must not re-apply an edit unseen"
-    assert "edited by the reviewer" in next(iter(replay.input_requests.values())).params.message
+    assert replay["status"] == "stale_decision"
     assert [d.version for d in crud.get_drafts(mcp_db, waiting_task.id)] == [1, 2]
     assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
     assert len(no_platform) == 1
@@ -630,6 +674,75 @@ def test_a_task_with_no_draft_is_answered_without_asking_anything(connect, mcp_d
     assert not isinstance(result, types.InputRequiredResult)
     assert _payload(result)["status"] == "no_artifact"
     assert asked == []
+
+
+# ------------------------------------------------- authorization and the handle
+
+
+def test_a_caller_who_may_not_decide_is_never_shown_the_draft(connect, waiting_task, mcp_db, monkeypatch):
+    """The refusal happens before the draft is rendered, not after the answer.
+
+    Being told "you may not approve this" once the content has already been
+    displayed as a question is not a refusal - the disclosure already
+    happened, on whichever interaction model was in use.
+    """
+    from app import authz
+
+    refused = []
+
+    def _refuse(db, task_id):
+        refused.append(task_id)
+        raise authz.AuthzError("this credential may not decide on that task")
+
+    monkeypatch.setattr(authz, "check_may_approve", _refuse)
+    shown = []
+
+    async def spy(ctx, params):
+        shown.append(params.message)
+        return _accept(approve=True)
+
+    async def go():
+        async with connect(elicitation_callback=spy) as session:
+            return await session.call_tool(
+                "review_pending_task", {"task_id": waiting_task.id}, allow_input_required=True
+            )
+
+    result = asyncio.run(go())
+    assert result.is_error
+    assert not isinstance(result, types.InputRequiredResult), "nothing may be asked of a caller who cannot decide"
+    assert shown == [], "the draft must not reach the wire"
+    assert DRAFT not in "".join(c.text for c in result.content)
+    assert refused == [waiting_task.id]
+    assert crud.get_approvals(mcp_db, waiting_task.id) == []
+
+
+def test_the_handle_is_bound_to_the_caller_that_started_the_round():
+    """A handle minted for one credential must not be usable by another.
+
+    The SDK's default binding reads its own OAuth context, which this server
+    never populates, so without an explicit `bind_principal` every handle would
+    be transferable between authenticated callers.
+    """
+
+    class _Ctx:
+        def __init__(self, header):
+            self.request = None if header is None else _Req(header)
+
+    class _Req:
+        def __init__(self, header):
+            self.headers = {"authorization": header}
+
+    security = mcp_server._request_state_security()
+    assert security.bind_principal is mcp_server._request_state_principal
+
+    a = mcp_server._request_state_principal(_Ctx("Bearer aaa"))
+    b = mcp_server._request_state_principal(_Ctx("Bearer bbb"))
+    assert a is not None and b is not None and a != b
+    assert mcp_server._request_state_principal(_Ctx("Bearer aaa")) == a, "stable across the rounds of one call"
+    assert "aaa" not in a, "the binding value must not carry the credential"
+    # stdio, and an HTTP call presenting nothing, are the loopback assumption.
+    assert mcp_server._request_state_principal(_Ctx(None)) is None
+    assert mcp_server._request_state_principal(_Ctx("")) is None
 
 
 # ------------------------------------------------------------------ helpers
