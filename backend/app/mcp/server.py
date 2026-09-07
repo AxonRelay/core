@@ -19,20 +19,30 @@ the transport must stay on a private network.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 from contextlib import contextmanager
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    Context,
+    Elicit,
+    ElicitationResult,
+    MCPServer,
+    Resolve,
+)
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.request_state import RequestStateSecurity
 from pydantic import BaseModel, Field
 
 from app import authz, coordination, crud, langgraph_client, models, safe_envelope, service, territory
 from app.database import SessionLocal
-from app.mcp import http_auth
+from app.mcp import compat, http_auth
 from app.mcp.serializers import (
     actor_to_dict,
     agent_definition_to_dict,
@@ -44,7 +54,42 @@ from app.mcp.serializers import (
     task_to_dict,
 )
 
-mcp = MCPServer("axonrelay")
+REQUEST_STATE_KEY_ENV = "AXONRELAY_REQUEST_STATE_KEY"
+
+# How long a half-finished approval may sit before the operator has to start
+# over. It is a human reading a draft, not a machine round trip, so minutes
+# rather than seconds; long enough to survive a reconnect, short enough that a
+# leaked handle is not a standing offer.
+REQUEST_STATE_TTL_SECONDS = 900.0
+
+
+def _request_state_security() -> RequestStateSecurity:
+    """Key the sealed `requestState` handle that carries a half-finished approval.
+
+    From 2026-07-28 an unanswered question comes back to the client as an
+    opaque handle and returns on the next `tools/call` (app/mcp/compat.py).
+    The SDK treats an inbound handle as attacker-controlled and only accepts
+    one it minted, so the key decides *which* processes can resume a decision.
+
+    Set AXONRELAY_REQUEST_STATE_KEY to share that across restarts and across
+    workers behind one Streamable HTTP endpoint. Left unset, the key is
+    process-local and a restart mid-approval makes the client ask again -
+    the safe failure, and the right default for the stdio server, which is one
+    process that dies with its client anyway.
+    """
+    key = os.environ.get(REQUEST_STATE_KEY_ENV, "").strip()
+    if not key:
+        return RequestStateSecurity.ephemeral(ttl=REQUEST_STATE_TTL_SECONDS)
+    try:
+        return RequestStateSecurity(keys=[key], ttl=REQUEST_STATE_TTL_SECONDS)
+    except ValueError as e:
+        # Refused at startup and by name. A weak key here does not fail
+        # visibly later: it seals handles that carry a pending approval, and
+        # the whole point of sealing them is that a caller cannot mint one.
+        raise ValueError(f"{REQUEST_STATE_KEY_ENV} is not usable: {e}") from None
+
+
+mcp = MCPServer("axonrelay", request_state_security=_request_state_security())
 
 
 @contextmanager
@@ -323,6 +368,7 @@ async def _apply_decision(
     modified_draft: str | None = None,
     artifact_version: int | None = None,
     expected_commitment: str | None = None,
+    decision_key: str | None = None,
 ) -> dict:
     """Record an approve/reject in the ledger and resume the Platform thread.
 
@@ -334,11 +380,30 @@ async def _apply_decision(
     `artifact_version` / `expected_commitment` no longer match the task's
     latest draft, nothing is recorded and the call returns
     status="stale_decision".
+
+    A `decision_key` makes the write idempotent: a replayed round finds its own
+    entry, returns the same payload the first round did with `replayed: true`
+    added, and neither appends to the ledger nor resumes the graph again.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
+        # Idempotency is checked before the status gate on purpose: the replay
+        # of a decision arrives *after* that decision moved the task out of
+        # WAITING_APPROVAL, so the gate would refuse it with an error rather
+        # than answer with what was recorded.
+        if decision_key is not None:
+            already = crud.find_decision(db, task_id, decision_key)
+            if already is not None:
+                # Shaped like the first round's answer, because that is what it
+                # is: `status` stays the task's own status rather than becoming
+                # an outcome word, and `replayed` is what says nothing new
+                # happened.
+                payload = task_to_dict(task)
+                payload["approval"] = approval_to_dict(already)
+                payload["replayed"] = True
+                return payload
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
 
@@ -357,6 +422,7 @@ async def _apply_decision(
                 artifact_version=artifact_version,
                 expected_commitment=expected_commitment,
                 modified_draft=modified_draft if action == "approved" else None,
+                decision_key=decision_key,
             )
         except crud.StaleArtifactError as e:
             db.rollback()
@@ -442,60 +508,201 @@ class _ApprovalDecision(BaseModel):
     )
 
 
-@mcp.tool()
-async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
-    """Interactively review a WAITING_APPROVAL task.
+class _ShownArtifact(BaseModel):
+    """The exact draft `review_pending_task` puts in front of the reviewer.
 
-    Shows the current draft and reviewer feedback, then asks for your decision
-    through the MCP client's native elicitation prompt, records it in the
-    tamper-evident ledger, and resumes the graph. Clients that do not support
-    elicitation should use approve_task / reject_task directly instead.
+    Resolved once per round and shared by the question and the tool body, so
+    "what was displayed" and "what the decision binds to" are one object rather
+    than two reads that a concurrent writer can separate.
 
-    If the task changes between display and decision (the draft no longer matches
-    what was shown, or it is no longer waiting), the call returns
-    status="stale_decision" and records nothing, so you never approve unseen content.
-    The decision is bound to the draft version and commitment that were shown,
-    and the check is made under the ledger's row lock, so a concurrent writer
-    cannot slip a different draft in between the check and the record. A task
-    with no draft returns status="no_artifact" before asking anything.
+    `state` says whether there is anything to ask about:
+
+    * `ready` - `version` / `commitment` / `content` name the pinned draft;
+    * `no_artifact` - the task is waiting, but has no draft to decide on;
+    * `not_waiting` - the task is not (or is no longer) WAITING_APPROVAL.
+
+    The last one is a state and not an exception because it is the ordinary
+    outcome of a race, and it can happen on *any* round: from 2026-07-28 this
+    resolver re-runs when the reviewer answers, so a task that moved on while
+    they were reading would otherwise turn the answer into a crash.
+    """
+
+    task_id: int
+    state: Literal["ready", "no_artifact", "not_waiting"] = "ready"
+    reason: str = ""
+    title: str = ""
+    feedback: str | None = None
+    version: int | None = None
+    commitment: str | None = None
+    content: str | None = None
+
+
+def _shown_artifact(task_id: int) -> _ShownArtifact:
+    """Pin the draft under review before anything is shown or asked.
+
+    A resolver rather than the first lines of the tool body: from 2026-07-28
+    the framework needs the question *before* it runs the body, and the
+    question must be rendered from the same object the decision later binds
+    to. The Safe Envelope guard runs here for the same reason - it has to
+    refuse before a draft reaches the wire, and on that path the wire is the
+    elicitation, not the tool result.
     """
     _free_text_surface()
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
+            # A task id that names nothing is the caller's mistake in every
+            # round, so it stays an error rather than becoming a status.
             raise ValueError(f"Task {task_id} not found")
         if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
-            raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
-        title, feedback = task.title, task.feedback
-        # Show the latest *artifact* — the draft row the decision will bind
-        # to — not the task's current_draft mirror, which PUT /tasks can
-        # rewrite without creating a version. What is shown and what is
-        # recorded must be the same object.
+            return _ShownArtifact(
+                task_id=task_id,
+                state="not_waiting",
+                reason=f"Task {task_id} is not waiting for approval (status={task.status}).",
+            )
+        # The latest *artifact* — the draft row the decision will bind to — not
+        # the task's current_draft mirror, which PUT /tasks can rewrite without
+        # creating a version. What is shown and what is recorded must be the
+        # same object.
         drafts = crud.get_drafts(db, task_id)
         if not drafts:
-            return {
-                "status": "no_artifact",
-                "task_id": task_id,
-                "reason": "Task has no draft to decide on; nothing was shown and nothing is recorded.",
-            }
+            return _ShownArtifact(
+                task_id=task_id,
+                state="no_artifact",
+                reason="Task has no draft to decide on; nothing was shown and nothing is recorded.",
+                title=task.title,
+                feedback=task.feedback,
+            )
         shown = drafts[-1]
-        draft, shown_version, shown_commitment = shown.content, shown.version, shown.commitment
+        return _ShownArtifact(
+            task_id=task_id,
+            title=task.title,
+            feedback=task.feedback,
+            version=shown.version,
+            commitment=shown.commitment,
+            content=shown.content,
+        )
 
-    # Elicit outside the DB session — don't pin a session across user interaction.
+
+def _ask_approval(
+    shown: Annotated[_ShownArtifact, Resolve(_shown_artifact)],
+    ctx: Context[None, None],
+) -> Elicit[_ApprovalDecision] | ElicitationResult[_ApprovalDecision]:
+    """Ask the reviewer, or hand back "not asked" without touching the wire.
+
+    Returning `Elicit` lets the SDK choose the interaction model the negotiated
+    revision requires — a standalone `elicitation/create` up to 2025-11-25, an
+    `InputRequiredResult` plus `requestState` from 2026-07-28 — so one code
+    path serves both (app/mcp/compat.py).
+
+    The two silent arms are the cases where asking would be wrong rather than
+    unanswered: nothing to show, and a client that never declared it can answer
+    a form. Both return a cancel the body reinterprets, having re-derived the
+    reason itself; that is cheaper than a protocol error the client has to
+    translate back into "use approve_task instead".
+    """
+    if shown.state != "ready":
+        return CancelledElicitation()
+    if not compat.client_can_elicit(ctx.client_capabilities):
+        return CancelledElicitation()
     message = (
-        f"Task #{task_id}: {title}\n\n"
-        f"--- Draft (v{shown_version}) ---\n{draft}\n\n"
-        f"--- Reviewer feedback ---\n{feedback or '(none)'}\n\n"
+        f"Task #{shown.task_id}: {shown.title}\n\n"
+        f"--- Draft (v{shown.version}) ---\n{shown.content}\n\n"
+        f"--- Reviewer feedback ---\n{shown.feedback or '(none)'}\n\n"
         "Approve this draft?"
     )
-    result = await ctx.elicit(message=message, schema=_ApprovalDecision)
-    if result.action != "accept" or not result.data:
-        return {"status": "no_decision", "elicitation_action": result.action, "task_id": task_id}
+    return Elicit(message, _ApprovalDecision)
 
-    # Staleness guard, part 1: the task may have left WAITING_APPROVAL while we
+
+def _decision_key(shown: _ShownArtifact, decision: _ApprovalDecision) -> str:
+    """A stable name for *this* decision on *this* draft.
+
+    A 2026-07-28 answer round replays the whole `tools/call`, so the body can
+    run more than once for one human decision — a client retry after a dropped
+    response is the ordinary case, not the exotic one. The key is derived from
+    what was decided and what it was decided on, which makes every replay of a
+    round produce the same name and the ledger reject the second append
+    (app/crud.py, migration 013).
+
+    It deliberately carries no nonce and no request id: two rounds that agree
+    on the artifact, the verdict, the comment and the edit *are* the same
+    decision, and a ledger gains nothing by recording it twice.
+    """
+    payload = json.dumps(
+        {
+            "task_id": shown.task_id,
+            "version": shown.version,
+            "commitment": shown.commitment,
+            "approve": decision.approve,
+            "comment": decision.comment,
+            "modified_draft": decision.modified_draft,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+@mcp.tool()
+async def review_pending_task(
+    task_id: int,
+    shown: Annotated[_ShownArtifact, Resolve(_shown_artifact)],
+    decision: Annotated[ElicitationResult[_ApprovalDecision], Resolve(_ask_approval)],
+    ctx: Context[None, None],
+) -> dict:
+    """Interactively review a WAITING_APPROVAL task.
+
+    Shows the current draft and reviewer feedback, asks for your decision
+    through the MCP client's native elicitation prompt, records it in the
+    tamper-evident ledger, and resumes the graph.
+
+    The question travels in whichever shape the negotiated protocol revision
+    uses: held open on the connection up to 2025-11-25, or returned as an
+    input-required round with a resumable handle from 2026-07-28, where a
+    dropped connection costs a retry rather than the decision. Read
+    `axonrelay://compat` for the matrix. A client that cannot answer a form
+    gets status="elicitation_unsupported" and the names of the direct tools.
+
+    The decision is bound to the draft version and commitment that were shown.
+    If the draft changes while you are reading it, the answer is discarded and
+    the question is asked again against the new draft, so you never approve
+    unseen content; if the task leaves WAITING_APPROVAL, the call returns
+    status="stale_decision" and records nothing. A task with no draft returns
+    status="no_artifact" before asking anything. Replaying an answered round
+    returns the decision it already recorded, marked `replayed: true`, instead
+    of appending a second one.
+    """
+    if shown.state == "not_waiting":
+        return {
+            "status": "stale_decision",
+            "task_id": task_id,
+            "reason": f"{shown.reason} No decision recorded. Re-run review_pending_task when it is.",
+        }
+    if shown.state == "no_artifact":
+        return {"status": "no_artifact", "task_id": task_id, "reason": shown.reason}
+    if not compat.client_can_elicit(ctx.client_capabilities):
+        return {
+            "status": "elicitation_unsupported",
+            "task_id": task_id,
+            "reason": (
+                "This client did not declare form elicitation, so nothing was shown and nothing is recorded. "
+                f"Read the draft with get_drafts and decide with {' / '.join(compat.FALLBACK_TOOLS)}, "
+                "passing artifact_version and expected_commitment to bind the decision to what you read."
+            ),
+            "fallback_tools": list(compat.FALLBACK_TOOLS),
+            "artifact_version": shown.version,
+            "expected_commitment": shown.commitment,
+        }
+    if not isinstance(decision, AcceptedElicitation):
+        return {"status": "no_decision", "elicitation_action": decision.action, "task_id": task_id}
+
+    answer = decision.data
+    # Staleness, part 1: the task may have left WAITING_APPROVAL while we
     # awaited the human. Part 2 — "is the latest draft still the one shown?" —
     # is enforced inside record_approval under the task row lock, by passing
-    # the shown version and commitment as the decision's target.
+    # the shown version and commitment as the decision's target. A draft that
+    # changed between rounds never reaches here at all: the question renders
+    # from `shown`, so the framework sees a different question and re-asks it.
     with _session() as db:
         current = crud.get_task(db, task_id)
         if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL:
@@ -505,22 +712,14 @@ async def review_pending_task(task_id: int, ctx: Context[None, None]) -> dict:
                 "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
             }
 
-    decision = result.data
-    if decision.approve:
-        return await _apply_decision(
-            task_id,
-            action="approved",
-            comment=decision.comment or None,
-            modified_draft=decision.modified_draft or None,
-            artifact_version=shown_version,
-            expected_commitment=shown_commitment,
-        )
     return await _apply_decision(
         task_id,
-        action="rejected",
-        comment=decision.comment or None,
-        artifact_version=shown_version,
-        expected_commitment=shown_commitment,
+        action="approved" if answer.approve else "rejected",
+        comment=answer.comment or None,
+        modified_draft=(answer.modified_draft or None) if answer.approve else None,
+        artifact_version=shown.version,
+        expected_commitment=shown.commitment,
+        decision_key=_decision_key(shown, answer),
     )
 
 
@@ -999,6 +1198,18 @@ def check_git_resource(session_id: int, resource: str) -> dict:
     resolved = models.ClaimResourceEnum(resource)
     with _session() as db:
         return coordination.guard_git_operation(db, session_id=session_id, resource=resolved)
+
+
+@mcp.resource("axonrelay://compat")
+def compat_resource() -> str:
+    """The MCP protocol revisions, SDK line and clients this server is tested against.
+
+    Served as a resource so a client can read the claim instead of inferring
+    it: which revisions negotiate, where interactive approval switches from a
+    held connection to a resumable input-required round, and which tools to
+    fall back to when it cannot answer a question at all.
+    """
+    return json.dumps(compat.matrix(), indent=2, sort_keys=True)
 
 
 @mcp.resource("axonrelay://board")

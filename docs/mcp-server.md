@@ -76,12 +76,43 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `run_task(task_id)` | Platform 上で graph 実行 → 承認待ちまで |
 | `approve_task(task_id, comment?, modified_draft?, artifact_version?, expected_commitment?)` | 承認（任意で edit）。`artifact_version` / `expected_commitment` を渡すと**読んだ版に束縛**され、task が先に進んでいれば何も記録せず `status="stale_decision"` を返す。`modified_draft` は新しい draft 版として保存され、承認はその版に束縛される。戻り値に `approval`（束縛と hash を含む）を同梱 |
 | `reject_task(task_id, comment?, reason?, artifact_version?, expected_commitment?)` | 差戻し（revision loop）。束縛引数の意味は `approve_task` と同じ |
-| `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。表示した draft の版と commitment に判断を束縛するので、待っている間に draft が差し替わると `stale_decision` になる。elicitation 非対応クライアントは `approve_task`/`reject_task` を使う |
+| `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。問いの運び方は交渉した改訂に従う（下の[互換性マトリクス](#mcp-互換性マトリクス)）。表示した draft の版と commitment に判断を束縛するので、待っている間に draft が差し替わると**もう一度尋ねられる**（新しい draft について）。task が承認待ちを離れていれば `stale_decision`。form elicitation 非対応のクライアントには何も尋ねず、`status="elicitation_unsupported"` と束縛引数つきで `approve_task`/`reject_task` を案内する |
 | `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy, artifact_bound, unbound}`。`legacy` は hash chain 導入前の行数、`artifact_bound` は判断対象の draft 版と commitment を名指しする行数、`unbound` はそれ以外。[ADR-009](./adr-009-artifact-commitment.md)） |
 | `list_agents(agent_type?, is_active?)` | AI Actor 一覧 |
 | `create_agent(name, agent_type, ...)` | AI Actor 定義 |
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
 | `get_self_actor()` | オペレータ Human Actor |
+
+## MCP 互換性マトリクス
+
+`backend/app/mcp/compat.py` が原本で、`axonrelay://compat` として配信される。
+テストが SDK の対応版集合と突き合わせるので、この表と実装はずれない
+（[ADR-013](./adr-013-mcp-2026-interaction.md)）。
+
+| 仕様改訂 | 承認の問いの運び方 |
+|---|---|
+| `2024-11-05` / `2025-03-26` | elicitation なし。承認は `approve_task` / `reject_task` |
+| `2025-06-18` / `2025-11-25` | `tools/call` の中で単発の `elicitation/create`。接続を開いたまま待つ |
+| `2026-07-28` | 多ラウンド `tools/call`。`InputRequiredResult` + `requestState` を返し、再接続しても再開できる |
+
+- **Python SDK**: `mcp>=2.1,<3`（`backend/requirements.txt` と同一。上限は手で動かす）
+- **検証済みクライアント**: Claude Code（stdio / `.mcp.json`、form elicitation）、
+  SDK 自身の `ClientSession`（stdio と Streamable HTTP の両方で、両モデルを CI で）
+- **fallback**: `approve_task` / `reject_task`。`artifact_version` /
+  `expected_commitment` を明示に取るので、対話ラウンドなしで同じ束縛が得られる
+
+### 再開ハンドル（2026-07-28）
+
+未完了の承認は `requestState` として封をしてクライアントに返り、次の `tools/call`
+で戻ってくる。SDK は自分が発行したものだけを受け入れる。
+
+- 既定の鍵はプロセスローカル。再起動をまたぐと問い直しになる（stdio ではこれが正しい）
+- `AXONRELAY_REQUEST_STATE_KEY`（32 バイト以上）を設定すると、Streamable HTTP の
+  複数ワーカーと再起動をまたいで再開できる。弱い鍵は起動時に名指しで拒否される
+- TTL は 15 分
+- 同じラウンドの再送は台帳側で吸収される（migration 013）。承認も、編集が作る
+  はずだった draft 版も二重には入らない。再送の応答は 1 回目と同じ payload に
+  `replayed: true` が付いたもの
 
 ### 呼び出し元 identity と scope（任意）
 
@@ -145,6 +176,7 @@ Actor 名も `actor_ref` に置き換わり、これは MCP と REST の両方�
 | URI | 内容 |
 |---|---|
 | `axonrelay://board` | 調整ボードのスナップショット（稼働セッション / claim / 未 ack relay）。tool call を消費せず ambient context に置ける |
+| `axonrelay://compat` | 対応する MCP 仕様改訂・SDK 版・検証済みクライアント・fallback tool（下の[互換性マトリクス](#mcp-互換性マトリクス)と同じ内容を JSON で） |
 | `axonrelay://tasks/{task_id}` | Markdown 形式のタスク詳細（LLM コンテキスト用） |
 | `axonrelay://tasks/{task_id}/drafts/{version}` | 特定バージョンのドラフト |
 
