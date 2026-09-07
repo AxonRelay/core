@@ -21,6 +21,7 @@ real database and runs in CI against postgres:16.
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app import models
 from app.database import Base
@@ -28,7 +29,10 @@ from app.database import Base
 
 @pytest.fixture
 def db():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    # One shared connection for the whole test: an in-memory SQLite database is
+    # per-connection, and the REST TestClient serves requests on another
+    # thread, which would otherwise see an empty database of its own.
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
 
     @event.listens_for(engine, "connect")
     def _enable_sqlite_fk(dbapi_connection, _record):
@@ -54,3 +58,44 @@ def self_actor(db):
     db.commit()
     db.refresh(actor)
     return actor
+
+
+@pytest.fixture
+def client(db):
+    """The REST API wired to the in-memory test database.
+
+    `app.main` binds its `get_db` dependency to the real engine at import; this
+    overrides it for the duration of the test so requests hit the same SQLite
+    session the test inspects.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.database import get_db
+    from app.main import app
+
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def mcp_db(db, monkeypatch):
+    """Point the MCP tools at the in-memory test database.
+
+    The tools open their own `SessionLocal()` through `server._session()`,
+    which bypasses the `db` fixture; this swaps that contextmanager for one
+    that yields the test session, so a tool call and the test see one database.
+    """
+    from contextlib import contextmanager
+
+    from app.mcp import server
+
+    @contextmanager
+    def _test_session():
+        yield db
+
+    monkeypatch.setattr(server, "_session", _test_session)
+    return db

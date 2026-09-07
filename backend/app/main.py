@@ -11,12 +11,14 @@ human Actor (name="self") represents the operator.
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from app import coordination, crud, langgraph_client, models, service
+from app import authz, coordination, crud, disclosure, langgraph_client, models, safe_envelope, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.ratelimit import client_key
@@ -45,7 +47,36 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AxonRelay API", lifespan=lifespan)
+async def _authorize(request: Request, db: Session = Depends(get_db)):
+    """Resolve the caller and check this route's scope (app/authz.py).
+
+    Registered as an application-wide dependency, so a route cannot be added
+    without a decision: its (method, path) must appear in `authz.ROUTE_SCOPES`
+    or `authz.PUBLIC_ROUTES`, and a structural test fails otherwise. The
+    principal is bound for the duration of the request so the surfaces that
+    record an Actor can read it without threading it through every call.
+
+    Async on purpose: FastAPI runs a *sync* generator dependency in a worker
+    thread, which gets its own copy of the context, so a ContextVar set there
+    would never reach the endpoint (and could not be reset afterwards).
+    """
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    key = (request.method, path)
+    if key in authz.PUBLIC_ROUTES:
+        yield None
+        return
+    if key not in authz.ROUTE_SCOPES:  # pragma: no cover - the structural test forbids it
+        raise HTTPException(status_code=500, detail="This route has no authorization decision")
+    principal = authz.resolve(db, authorization=request.headers.get("authorization"), transport_is_local=False)
+    scope = authz.ROUTE_SCOPES[key]
+    if scope is not None:
+        principal.require(scope)
+    with authz.bind(principal):
+        yield principal
+
+
+app = FastAPI(title="AxonRelay API", lifespan=lifespan, dependencies=[Depends(_authorize)])
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
@@ -59,16 +90,84 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type"],
+    # Authorization is needed once AXONRELAY_REQUIRE_AUTH is on; without it the
+    # browser preflight fails and the dashboard has no way to present a credential.
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _value_free_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 without the rejected input.
+
+    FastAPI's default body echoes `input` (the submitted value) and `ctx` for
+    every error. A rejected value may be exactly what a caller must not have
+    sent to a shared instance, so the body names the location and error type
+    and nothing else. Same policy as the Safe Envelope service.
+    """
+    detail = [{"loc": list(err.get("loc", ())), "type": err.get("type", "value_error")} for err in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.exception_handler(authz.Unauthenticated)
+async def _unauthenticated(request: Request, exc: authz.Unauthenticated) -> JSONResponse:
+    """401 naming what is missing, never what was presented or what is behind the door."""
+    return JSONResponse(
+        status_code=401,
+        content={"detail": str(exc)},
+        headers={"WWW-Authenticate": 'Bearer realm="axonrelay"'},
+    )
+
+
+@app.exception_handler(authz.Forbidden)
+async def _forbidden(request: Request, exc: authz.Forbidden) -> JSONResponse:
+    """403 naming the scope required. Nothing about the resource, which the caller may not know exists."""
+    return JSONResponse(status_code=403, content={"detail": str(exc), "required_scope": exc.scope.value})
+
+
+@app.exception_handler(authz.AuthzError)
+async def _authz_refused(request: Request, exc: authz.AuthzError) -> JSONResponse:
+    """403 for a refusal raised inside an endpoint (an actor claim, another Actor's session).
+
+    The Unauthenticated / Forbidden handlers take precedence for their own
+    types; this catches the rest of the family so a refusal never leaves as a 500.
+    """
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
+@app.exception_handler(safe_envelope.SafeModeRefused)
+async def _safe_mode_refused(request: Request, exc: safe_envelope.SafeModeRefused) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": safe_envelope.SAFE_MODE_REFUSAL})
+
+
+def _free_text_surface() -> None:
+    """Dependency for every endpoint that accepts arbitrary text (see app/safe_envelope.py)."""
+    safe_envelope.refuse_free_text_if_safe_mode()
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "AxonRelay"}
+    return {
+        "status": "ok",
+        "service": "AxonRelay",
+        "safe_mode": safe_envelope.safe_mode(),
+        "auth_required": authz.require_auth(),
+    }
 
 
 # ========== Actor Endpoints ==========
+
+
+def _actor_response(actor: models.Actor | None) -> dict | None:
+    """An Actor for a REST response, through the same policy the MCP surface uses.
+
+    Without this the two surfaces disagree: a safe-mode board hands out an
+    opaque `actor_ref`, and one call to `/actors/{id}` with the `actor_id`
+    beside it would turn that reference back into a name.
+    """
+    if actor is None:
+        return None
+    return {**disclosure.actor_view(actor), "created_at": actor.created_at}
 
 
 @app.get("/actors", response_model=list[ActorResponse])
@@ -80,7 +179,24 @@ async def list_actors(request: Request, type: str | None = None, db: Session = D
             actor_type = models.ActorTypeEnum(type)
         except ValueError as e:
             raise HTTPException(status_code=400, detail="Invalid actor type. Must be 'human' or 'ai'") from e
-    return crud.get_actors(db, actor_type=actor_type)
+    return [_actor_response(a) for a in crud.get_actors(db, actor_type=actor_type)]
+
+
+@app.get("/actors/me", response_model=ActorResponse)
+@limiter.limit("60/minute")
+async def get_self(request: Request, db: Session = Depends(get_db)):
+    """The Actor this caller is, decided server-side.
+
+    Under a credential that is the credential's Actor; otherwise (loopback,
+    or an instance that has not turned enforcement on) the operator's human
+    Actor. Never a value the request supplied - this is the endpoint a client
+    asks when it wants to know who the server thinks it is.
+    """
+    actor_id = authz.acting_actor_id(db)
+    actor = crud.get_actor(db, actor_id) if actor_id else None
+    if not actor:
+        raise HTTPException(status_code=404, detail="Self actor not seeded")
+    return _actor_response(actor)
 
 
 @app.get("/actors/{actor_id}", response_model=ActorResponse)
@@ -89,17 +205,7 @@ async def get_actor(request: Request, actor_id: int, db: Session = Depends(get_d
     actor = crud.get_actor(db, actor_id)
     if not actor:
         raise HTTPException(status_code=404, detail="Actor not found")
-    return actor
-
-
-@app.get("/actors/me", response_model=ActorResponse)
-@limiter.limit("60/minute")
-async def get_self(request: Request, db: Session = Depends(get_db)):
-    """Get the single human actor representing the operator."""
-    actor = crud.get_self_actor(db)
-    if not actor:
-        raise HTTPException(status_code=404, detail="Self actor not seeded")
-    return actor
+    return _actor_response(actor)
 
 
 # ========== Agent Definition Endpoints ==========
@@ -124,7 +230,12 @@ async def list_agents(
 
 @app.post("/agents", response_model=AgentDefinitionResponse)
 @limiter.limit("30/minute")
-async def create_agent(request: Request, agent_data: AgentDefinitionCreateRequest, db: Session = Depends(get_db)):
+async def create_agent(
+    request: Request,
+    agent_data: AgentDefinitionCreateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
+):
     try:
         agent_type = models.AgentTypeEnum(agent_data.agent_type)
     except ValueError as e:
@@ -154,6 +265,7 @@ async def update_agent(
     agent_id: int,
     agent_data: AgentDefinitionUpdateRequest,
     db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     agent_type = None
     if agent_data.agent_type:
@@ -207,9 +319,13 @@ async def list_tasks_endpoint(
 
 @app.post("/tasks", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("30/minute")
-async def create_task_endpoint(request: Request, task_data: TaskCreateRequest, db: Session = Depends(get_db)):
-    self_actor = crud.get_self_actor(db)
-    creator_actor_id = self_actor.id if self_actor else None
+async def create_task_endpoint(
+    request: Request,
+    task_data: TaskCreateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
+):
+    creator_actor_id = authz.acting_actor_id(db)
 
     try:
         thread_id = await langgraph_client.create_thread(
@@ -253,7 +369,11 @@ async def get_task_endpoint(request: Request, task_id: int, db: Session = Depend
 @app.put("/tasks/{task_id}", response_model=TaskResponse)
 @limiter.limit("30/minute")
 async def update_task_endpoint(
-    request: Request, task_id: int, task_data: TaskUpdateRequest, db: Session = Depends(get_db)
+    request: Request,
+    task_id: int,
+    task_data: TaskUpdateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     status_enum = None
     if task_data.status:
@@ -297,7 +417,9 @@ def _sync_state_to_db(db: Session, task: models.Task, values: dict, waiting_for_
 
 @app.post("/tasks/{task_id}/run", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("10/minute")
-async def run_task_endpoint(request: Request, task_id: int, db: Session = Depends(get_db)):
+async def run_task_endpoint(
+    request: Request, task_id: int, db: Session = Depends(get_db), _guard: None = Depends(_free_text_surface)
+):
     """Kick off graph execution on LangGraph Platform. Blocks until the next
     interrupt or completion, then syncs state back to Postgres."""
     task = crud.get_task(db, task_id)
@@ -333,20 +455,42 @@ async def run_task_endpoint(request: Request, task_id: int, db: Session = Depend
 async def list_pending_approvals_endpoint(
     request: Request, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)
 ):
-    """Unified pending approval inbox for the operator (single human actor)."""
-    self_actor = crud.get_self_actor(db)
-    if not self_actor:
+    """The caller's pending-approval inbox — the tasks assigned to *this* Actor to approve."""
+    actor_id = authz.acting_actor_id(db)
+    if not actor_id:
         return []
-    return crud.list_pending_approvals(db, actor_id=self_actor.id, skip=skip, limit=limit)
+    return crud.list_pending_approvals(db, actor_id=actor_id, skip=skip, limit=limit)
 
 
 # ========== Approve / Reject ==========
 
 
+def _record_decision(db: Session, **kwargs) -> models.Approval:
+    """`crud.record_approval` with the ledger's contract errors mapped to HTTP.
+
+    409 for a stale target or a task with no artifact (the request was well
+    formed; the state it assumed is gone), 404 for a vanished task. The error
+    text names versions only, never content.
+    """
+    authz.check_may_approve(db, kwargs["task_id"])
+    try:
+        return crud.record_approval(db, **kwargs)
+    except crud.TaskNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except (crud.StaleArtifactError, crud.ArtifactRequiredError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except crud.LedgerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.post("/tasks/{task_id}/approve", response_model=ApprovalResponse)
 @limiter.limit("30/minute")
 async def approve_task_endpoint(
-    request: Request, task_id: int, approve_data: ApproveRequest, db: Session = Depends(get_db)
+    request: Request,
+    task_id: int,
+    approve_data: ApproveRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     task = crud.get_task(db, task_id)
     if not task:
@@ -354,15 +498,22 @@ async def approve_task_endpoint(
     if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
         raise HTTPException(status_code=400, detail="Task is not waiting for approval")
 
-    self_actor = crud.get_self_actor(db)
-    reviewer_actor_id = self_actor.id if self_actor else None
+    # The reviewer is the authenticated caller (app/authz.py), so an approval
+    # cannot be attributed to somebody else by any request parameter.
+    reviewer_actor_id = authz.acting_actor_id(db)
 
-    approval = crud.record_approval(
+    # The ledger entry (and, if the operator edited the draft, the new draft
+    # version it binds to) is written before the graph resumes: the approval
+    # names the artifact, so the artifact has to exist first.
+    approval = _record_decision(
         db,
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action="approved",
         comment=approve_data.comment,
+        artifact_version=approve_data.artifact_version,
+        expected_commitment=approve_data.expected_commitment,
+        modified_draft=approve_data.modified_draft,
     )
 
     try:
@@ -386,7 +537,11 @@ async def approve_task_endpoint(
 @app.post("/tasks/{task_id}/reject", response_model=ApprovalResponse)
 @limiter.limit("30/minute")
 async def reject_task_endpoint(
-    request: Request, task_id: int, reject_data: RejectRequest, db: Session = Depends(get_db)
+    request: Request,
+    task_id: int,
+    reject_data: RejectRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
 ):
     task = crud.get_task(db, task_id)
     if not task:
@@ -394,18 +549,21 @@ async def reject_task_endpoint(
     if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
         raise HTTPException(status_code=400, detail="Task is not waiting for approval")
 
-    self_actor = crud.get_self_actor(db)
-    reviewer_actor_id = self_actor.id if self_actor else None
+    # The reviewer is the authenticated caller (app/authz.py), so an approval
+    # cannot be attributed to somebody else by any request parameter.
+    reviewer_actor_id = authz.acting_actor_id(db)
 
     comment_parts = [reject_data.comment, reject_data.reason]
     combined_comment = " | ".join(p for p in comment_parts if p) or None
 
-    approval = crud.record_approval(
+    approval = _record_decision(
         db,
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action="rejected",
         comment=combined_comment,
+        artifact_version=reject_data.artifact_version,
+        expected_commitment=reject_data.expected_commitment,
     )
 
     try:
@@ -505,6 +663,45 @@ async def remove_task_assignment_endpoint(
     return {"message": "Assignment removed successfully"}
 
 
+# ========== Safe Envelope (content-blind ingestion) ==========
+
+
+@app.post("/envelopes", status_code=201)
+@limiter.limit("60/minute")
+async def ingest_envelope_endpoint(request: Request, db: Session = Depends(get_db)):
+    """Ingest one metadata-only Safe Envelope (schema: docs/schemas/safe-envelope-v1.json).
+
+    The body is read as raw JSON and validated by the shared service, not by a
+    request model: a schema failure must name fields only, and this path must
+    behave identically to the MCP tool. 422 lists the offending field names;
+    409 is never used because re-sending an event_id is idempotent (200).
+    """
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"reason": "not JSON", "fields": ["(envelope)"]}) from None
+    try:
+        event, created = safe_envelope.ingest(db, payload)
+    except safe_envelope.EnvelopeRejected as e:
+        raise HTTPException(status_code=422, detail={"reason": e.reason, "fields": e.fields}) from None
+    body = safe_envelope.event_to_dict(event)
+    body["created"] = created
+    return JSONResponse(status_code=201 if created else 200, content=body)
+
+
+@app.get("/envelopes")
+@limiter.limit("60/minute")
+async def list_envelopes_endpoint(
+    request: Request, limit: int = 100, action: str | None = None, db: Session = Depends(get_db)
+):
+    """Stored Safe Envelopes, newest first. Every field was allowlisted on the way in."""
+    try:
+        events = safe_envelope.list_events(db, limit=limit, action=action)
+    except safe_envelope.EnvelopeRejected as e:
+        raise HTTPException(status_code=400, detail={"reason": e.reason, "fields": e.fields}) from None
+    return [safe_envelope.event_to_dict(e) for e in events]
+
+
 # ========== Coordination Board (read-only; writes go through MCP) ==========
 #
 # The board is how a human sees what the fleet of agents is doing. Agents drive
@@ -572,7 +769,7 @@ async def coordination_git_guard_endpoint(
     try:
         resolved = models.ClaimResourceEnum(resource)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Unknown resource '{resource}'") from e
+        raise HTTPException(status_code=400, detail="Unknown resource") from e
 
     if session_id is not None:
         try:
@@ -596,6 +793,9 @@ async def coordination_inbox_endpoint(
     db: Session = Depends(get_db),
 ):
     """A session's relay inbox. Reading here marks the relays read, as MCP does."""
+    # Reading writes RelayReceipts, so reading somebody else's inbox would
+    # silently mark their relays as seen. The read scope does not cover that.
+    authz.check_session_owner(db, session_id)
     try:
         return coordination.read_inbox(db, session_id, include_acked=include_acked)
     except ValueError as e:

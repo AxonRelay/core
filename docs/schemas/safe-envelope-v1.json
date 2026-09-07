@@ -1,0 +1,197 @@
+{
+  "$defs": {
+    "SafeActionEnum": {
+      "description": "What a Safe Envelope reports happened. Closed set; free text has no slot.",
+      "enum": [
+        "session_start",
+        "session_heartbeat",
+        "session_end",
+        "claim_request",
+        "claim_release",
+        "artifact_produced",
+        "decision_approve",
+        "decision_reject",
+        "relay_notice",
+        "relay_ack"
+      ],
+      "title": "SafeActionEnum",
+      "type": "string"
+    },
+    "SafeOutcomeEnum": {
+      "enum": [
+        "success",
+        "refused",
+        "conflict",
+        "error"
+      ],
+      "title": "SafeOutcomeEnum",
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/AxonRelay/core/docs/schemas/safe-envelope-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Version 1 of the metadata-only event envelope. Unknown fields are rejected.",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/SafeActionEnum"
+    },
+    "actor_id": {
+      "description": "Opaque identifier of the acting agent or person.",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$",
+      "title": "Actor Id",
+      "type": "string"
+    },
+    "artifact_commitment": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Source-produced digest of the artifact. The core never sees the bytes.",
+      "title": "Artifact Commitment"
+    },
+    "artifact_commitment_algorithm": {
+      "anyOf": [
+        {
+          "maxLength": 32,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Only 'sha256-utf8-v1' is accepted.",
+      "title": "Artifact Commitment Algorithm"
+    },
+    "artifact_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9_-]{16,128}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opaque identifier of the artifact acted on.",
+      "title": "Artifact Id"
+    },
+    "artifact_version": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Artifact Version"
+    },
+    "event_id": {
+      "description": "Producer-assigned, globally unique. Re-sending the same id is idempotent.",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "identifier_policy": {
+      "default": "opaque",
+      "description": "'opaque': every identifier is an unguessable token. 'public': repository / workspace identifiers may be public slugs; accepted only when the instance allows public identifiers.",
+      "enum": [
+        "opaque",
+        "public"
+      ],
+      "title": "Identifier Policy",
+      "type": "string"
+    },
+    "occurred_at": {
+      "description": "When the event happened at the source. Timezone-aware.",
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/SafeOutcomeEnum"
+    },
+    "policy_version": {
+      "description": "Producer-side disclosure policy the envelope was built under.",
+      "pattern": "^[A-Za-z0-9._-]{1,32}$",
+      "title": "Policy Version",
+      "type": "string"
+    },
+    "producer_signature": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9_=-]{16,1024}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Producer Signature"
+    },
+    "repository_id": {
+      "description": "Under the opaque policy: an opaque token (same shape as event_id). Under the public policy: an `owner` or `owner/repo` slug.",
+      "maxLength": 201,
+      "title": "Repository Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "Envelope schema version. Only 1 exists.",
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "session_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9_-]{16,128}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opaque identifier of the producer's session.",
+      "title": "Session Id"
+    },
+    "workspace_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9_-]{16,128}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opaque identifier of the checkout, if any.",
+      "title": "Workspace Id"
+    }
+  },
+  "required": [
+    "schema_version",
+    "policy_version",
+    "event_id",
+    "actor_id",
+    "repository_id",
+    "action",
+    "outcome",
+    "occurred_at"
+  ],
+  "title": "AxonRelay Safe Envelope",
+  "type": "object"
+}

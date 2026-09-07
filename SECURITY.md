@@ -27,6 +27,47 @@ So the rules are:
 - Change the Postgres password from the documented development default
   (`axonrelay_dev`) anywhere other than a laptop.
 
+**Per-caller identity (opt-in).** With `AXONRELAY_REQUIRE_AUTH=1` every HTTP
+caller - REST and the MCP Streamable HTTP transport - must present a credential
+issued by `python -m app.credentials issue`
+([ADR-011](docs/adr-011-caller-identity.md)). The credential names the Actor the
+server records for that caller's approvals, sessions and tasks, so a request
+parameter cannot claim somebody else's identity, and it carries scopes
+(`ledger:read`, `ledger:write`, `coordination:read`, `coordination:write`,
+`export:read`, `administration`) that every tool and every route is mapped to.
+A scope is necessary, not sufficient: a credential may only drive its own
+coordination sessions, and may only approve a task it holds the `approver`
+role on (or, for a human Actor, any task). Only the SHA-256 of a token is
+stored; tokens never appear in a log, an error or a response. The health check
+and FastAPI's schema routes stay open by decision - the schema describes shapes
+this repository already publishes. Unset, the process behaves as before and every call runs as the
+operator. **stdio is always loopback-trusted**, with or without the flag: it has
+no request to carry a credential and the caller is a process you started.
+
+**Metadata minimization.** In content-blind mode the coordination plane's
+*responses* are minimized too ([ADR-012](docs/adr-012-metadata-minimization.md)):
+opaque references instead of host names, absolute clone paths and git
+directories; structured codes instead of focus, reason, subject, body and
+acknowledgement prose; counts instead of file paths. What remains observable -
+activity times, the correlation structure of stable references, the coarse
+nature of the work - is listed with its reasons in the ADR's threat model.
+Two rules apply in **either** mode, because they are about secrets rather than
+preference: an agent's `config` values never leave a serializer (only its key
+names), and a URL carrying credentials, a query string, a fragment or a
+non-http(s) scheme is refused rather than stored. Operational rows expire on a
+documented schedule (`python -m app.retention`); the ledger never does, and a
+test proves a sweep leaves the approval chain verifiable.
+
+**Content-blind mode.** A shared instance can be run with
+`AXONRELAY_SAFE_MODE=1` ([ADR-010](docs/adr-010-safe-envelope.md)). Every
+surface that accepts free text then refuses with a fixed message, and the
+only write path is a versioned, allowlisted envelope of opaque identifiers,
+enums, a source-produced artifact commitment and timestamps
+([schema](docs/schemas/safe-envelope-v1.json)). Rejected values are never
+stored, logged, echoed in errors or sent onward; canary tests enforce that.
+Without the flag the instance is the full-text local PoC and should be treated
+as holding whatever was sent to it.
+
 What the application *does* defend:
 
 - The approval ledger is tamper-evident: a per-task SHA-256 hash chain, verified

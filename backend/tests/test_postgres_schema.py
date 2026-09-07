@@ -29,13 +29,14 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
 import pytest
 from sqlalchemy import Enum, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
-from app import coordination, crud, models
+from app import coordination, crud, ledger, models
 
 TEST_URL = os.environ.get("AXONRELAY_TEST_POSTGRES_URL")
 
@@ -54,9 +55,15 @@ MODEL_ENUMS = [
     models.ClaimResourceEnum,
     models.ClaimStatusEnum,
     models.RelayKindEnum,
+    models.SafeActionEnum,
+    models.SafeOutcomeEnum,
+    models.FocusCodeEnum,
+    models.ClaimReasonCodeEnum,
+    models.RelayCodeEnum,
+    models.AckCodeEnum,
 ]
 
-COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts"}
+COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts", "safe_events", "credentials"}
 
 
 def _expected_head() -> str:
@@ -83,6 +90,20 @@ def _recreate_database(url: str) -> None:
     admin.dispose()
 
 
+def _run_alembic(url: str, target: str) -> None:
+    """`alembic upgrade <target>` against `url`, in a subprocess (see migrated_engine)."""
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    completed = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", target],
+        cwd=backend_dir,
+        env={**os.environ, "DATABASE_URL": url},
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.fail(f"alembic upgrade {target} failed:\n{completed.stdout}\n{completed.stderr}")
+
+
 @pytest.fixture(scope="module")
 def migrated_engine():
     """A fresh database with the whole Alembic chain applied to it.
@@ -94,17 +115,7 @@ def migrated_engine():
     subprocess is also exactly how an operator runs it.
     """
     _recreate_database(TEST_URL)
-
-    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    completed = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=backend_dir,
-        env={**os.environ, "DATABASE_URL": TEST_URL},
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        pytest.fail(f"alembic upgrade head failed:\n{completed.stdout}\n{completed.stderr}")
+    _run_alembic(TEST_URL, "head")
 
     engine = create_engine(TEST_URL)
     try:
@@ -132,6 +143,68 @@ def _db_enum_labels(engine) -> dict[str, set[str]]:
     for typname, label in rows:
         labels.setdefault(typname, set()).add(label)
     return labels
+
+
+@pytest.fixture(scope="module")
+def legacy_engine():
+    parsed = make_url(TEST_URL)
+    # str(URL) masks the password ("***"); render it for real or the
+    # subprocess and the engine cannot authenticate (CI has a password,
+    # a local trust-auth cluster does not, which is how this hid).
+    legacy_url = parsed.set(database=f"{parsed.database}_legacy").render_as_string(hide_password=False)
+    _recreate_database(legacy_url)
+    _run_alembic(legacy_url, "008")
+
+    engine = create_engine(legacy_url)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO actors (type, name, created_at) VALUES ('HUMAN', 'legacy', now())"))
+        conn.execute(
+            text(
+                "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
+                "VALUES ('legacy-thread', 'legacy', 'WAITING_APPROVAL', now(), now())"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO drafts (task_id, version, content, created_at) VALUES (1, 1, 'old bytes', now())")
+        )
+        # A second task whose unlocked pre-009 add_draft raced itself into
+        # two drafts with the same version number.
+        conn.execute(
+            text(
+                "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
+                "VALUES ('legacy-dup', 'dup', 'DRAFT', now(), now())"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO drafts (task_id, version, content, created_at) VALUES "
+                "(2, 1, 'first', now()), (2, 1, 'raced duplicate', now()), (2, 2, 'later', now())"
+            )
+        )
+        created_at = "2026-08-01 12:00:00.000000"
+        entry_hash = ledger.compute_entry_hash(
+            None,
+            task_id=1,
+            reviewer_actor_id=1,
+            action="approved",
+            comment="pre-009",
+            created_at=datetime.fromisoformat(created_at),
+        )
+        conn.execute(
+            text(
+                "INSERT INTO approvals (task_id, reviewer_actor_id, action, comment, created_at, prev_hash, entry_hash) "
+                "VALUES (1, 1, 'approved', 'pre-009', :created_at, NULL, :entry_hash)"
+            ),
+            {"created_at": created_at, "entry_hash": entry_hash},
+        )
+    engine.dispose()
+
+    _run_alembic(legacy_url, "head")
+    engine = create_engine(legacy_url)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 class TestMigrationChain:
@@ -163,6 +236,90 @@ class TestMigrationChain:
                 ).all()
             }
         assert "uq_workspace_identity" in names
+
+    def test_the_artifact_binding_schema_is_in_place(self, migrated_engine):
+        """Migration 009: a draft version names one artifact, and both ledger tables are indexed on task_id."""
+        with migrated_engine.connect() as conn:
+            constraints = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT conname FROM pg_constraint WHERE conrelid = 'drafts'::regclass AND contype = 'u'")
+                ).all()
+            }
+            indexes = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT indexname FROM pg_indexes WHERE tablename IN ('drafts', 'approvals')")
+                ).all()
+            }
+            approval_columns = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name = 'approvals'")
+                ).all()
+            }
+        assert "uq_drafts_task_version" in constraints
+
+        assert {"ix_drafts_task_id", "ix_approvals_task_id"} <= indexes
+        assert {
+            "hash_version",
+            "artifact_ref",
+            "artifact_version",
+            "artifact_commitment",
+            "artifact_commitment_algorithm",
+            "producer_actor_id",
+        } <= approval_columns
+
+    def test_a_credential_is_unique_by_digest_and_dies_with_its_actor(self, migrated_engine):
+        """Migration 011: the token digest is the lookup key, and a deleted Actor takes its credentials."""
+        with migrated_engine.connect() as conn:
+            uniques = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT conname FROM pg_constraint WHERE conrelid = 'credentials'::regclass AND contype = 'u'")
+                ).all()
+            }
+            cascade = conn.execute(
+                text("SELECT confdeltype FROM pg_constraint WHERE conrelid = 'credentials'::regclass AND contype = 'f'")
+            ).scalar()
+            columns = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name = 'credentials'")
+                ).all()
+            }
+        assert "uq_credentials_token_hash" in uniques
+        assert cascade == "c"  # ON DELETE CASCADE
+        assert "token" not in columns  # only the digest is stored
+        assert "token_hash" in columns
+
+    def test_the_minimization_columns_are_in_place(self, migrated_engine):
+        """Migration 012: opaque ids are unique, and each free-text field has a code beside it."""
+        with migrated_engine.connect() as conn:
+            indexes = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT indexname FROM pg_indexes WHERE tablename IN ('actors', 'workspaces')")
+                ).all()
+            }
+            columns = {
+                (r[0], r[1])
+                for r in conn.execute(
+                    text(
+                        "SELECT table_name, column_name FROM information_schema.columns "
+                        "WHERE table_name IN ('actors','workspaces','sessions','claims','relays','relay_receipts')"
+                    )
+                ).all()
+            }
+        assert {"ix_actors_opaque_id", "ix_workspaces_opaque_id"} <= indexes
+        assert {
+            ("actors", "opaque_id"),
+            ("workspaces", "opaque_id"),
+            ("sessions", "focus_code"),
+            ("claims", "reason_code"),
+            ("relays", "code"),
+            ("relay_receipts", "ack_code"),
+        } <= columns
 
 
 class TestEnumParity:
@@ -228,6 +385,7 @@ class TestConcurrentApprovals:
         task = models.Task(thread_id="parity-race", title="race", status=models.TaskStatusEnum.WAITING_APPROVAL)
         setup.add_all([actor, task])
         setup.commit()
+        crud.add_draft(setup, task_id=task.id, content="the draft under review")
         task_id, actor_id = task.id, actor.id
         setup.close()
 
@@ -263,6 +421,63 @@ class TestConcurrentApprovals:
 
             assert all(approvals[i].prev_hash == approvals[i - 1].entry_hash for i in range(1, len(approvals)))
             assert crud.verify_approval_chain(check, task_id)["valid"] is True
+        finally:
+            check.close()
+
+    def test_racing_editors_each_get_their_own_version_and_one_chain(self, migrated_engine):
+        """Approvals that carry a modified draft race on the *draft* table too.
+
+        The draft append happens under the same task row lock as the ledger
+        write, so eight editors must produce eight distinct new versions, each
+        approval bound to the version it created, on one linear chain. Without
+        the lock the unique constraint would reject the losers instead.
+        """
+        factory = sessionmaker(bind=migrated_engine, autoflush=False)
+
+        setup = factory()
+        actor = models.Actor(type=models.ActorTypeEnum.HUMAN, name="editor")
+        task = models.Task(thread_id="parity-editors", title="edit", status=models.TaskStatusEnum.WAITING_APPROVAL)
+        setup.add_all([actor, task])
+        setup.commit()
+        crud.add_draft(setup, task_id=task.id, content="v1")
+        task_id, actor_id = task.id, actor.id
+        setup.close()
+
+        barrier = threading.Barrier(self.WRITERS)
+        failures: list[str] = []
+
+        def edit(index: int) -> None:
+            session = factory()
+            try:
+                barrier.wait(timeout=30)
+                crud.record_approval(session, task_id, actor_id, "approved", modified_draft=f"edit by {index}")
+            except Exception as exc:  # noqa: BLE001 - reported as a test failure
+                failures.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=edit, args=(i,)) for i in range(self.WRITERS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert failures == []
+
+        check = factory()
+        try:
+            drafts = crud.get_drafts(check, task_id)
+            assert [d.version for d in drafts] == list(range(1, self.WRITERS + 2))
+            assert all(d.producer_actor_id == actor_id for d in drafts[1:])
+
+            approvals = crud.get_approvals(check, task_id)
+            assert sorted(a.artifact_version for a in approvals) == list(range(2, self.WRITERS + 2))
+            by_version = {d.version: d for d in drafts}
+            assert all(a.artifact_commitment == by_version[a.artifact_version].commitment for a in approvals)
+
+            verdict = crud.verify_approval_chain(check, task_id)
+            assert verdict["valid"] is True
+            assert verdict["artifact_bound"] == self.WRITERS
         finally:
             check.close()
 
@@ -338,3 +553,156 @@ class TestConcurrentResourceClaims:
         assert failures == []
         assert len(outcomes) == self.CLAIMANTS
         assert outcomes.count(True) == 1, outcomes
+
+
+class TestArtifactBindingMigration:
+    """Migration 009 applied to a database that already holds ledger rows.
+
+    `migrated_engine` starts from nothing, which cannot show what 009 does to
+    existing data. This class builds a second database at revision 008, writes
+    rows the way the app wrote them then (a draft without a commitment, a v1
+    approval), and upgrades to head.
+    """
+
+    def test_existing_drafts_get_a_commitment_and_existing_approvals_stay_v1(self, legacy_engine):
+        session = sessionmaker(bind=legacy_engine, autoflush=False)()
+        try:
+            draft = crud.get_drafts(session, 1)[0]
+            assert draft.commitment == ledger.compute_artifact_commitment("old bytes")
+            assert draft.commitment_algorithm == ledger.COMMITMENT_ALGORITHM
+            assert draft.producer_actor_id is None
+
+            (approval,) = crud.get_approvals(session, 1)
+            assert approval.hash_version == 1  # stamped by 009: hashed with the v1 payload
+            assert approval.artifact_bound is False
+            assert approval.artifact_commitment is None
+        finally:
+            session.close()
+
+    def test_duplicate_draft_versions_are_renumbered_before_the_constraint(self, legacy_engine):
+        session = sessionmaker(bind=legacy_engine, autoflush=False)()
+        try:
+            drafts = crud.get_drafts(session, 2)
+            assert [(d.version, d.content) for d in drafts] == [(1, "first"), (2, "raced duplicate"), (3, "later")]
+        finally:
+            session.close()
+
+    def test_the_old_chain_verifies_as_v1_and_new_entries_extend_it_as_v2(self, legacy_engine):
+        session = sessionmaker(bind=legacy_engine, autoflush=False)()
+        try:
+            before = crud.verify_approval_chain(session, 1)
+            assert before == {
+                "valid": True,
+                "broken_at": None,
+                "count": 1,
+                "legacy": 0,
+                "artifact_bound": 0,
+                "unbound": 1,
+            }
+
+            new = crud.record_approval(session, 1, 1, "approved", "post-009")
+            assert new.artifact_bound is True
+            assert new.artifact_version == 1
+            assert new.prev_hash == crud.get_approvals(session, 1)[0].entry_hash
+
+            after = crud.verify_approval_chain(session, 1)
+            assert after["valid"] is True
+            assert (after["artifact_bound"], after["unbound"]) == (1, 1)
+        finally:
+            session.close()
+
+
+class TestCredentialsOnPostgres:
+    """Authentication against the real engine: the digest lookup and the cascade."""
+
+    def test_a_credential_authenticates_and_a_revoked_one_does_not(self, pg_session):
+        from app import authz
+
+        actor = models.Actor(type=models.ActorTypeEnum.AI, name="pg-cred-actor")
+        pg_session.add(actor)
+        pg_session.commit()
+
+        token = authz.issue_token()
+        row = models.Credential(
+            actor_id=actor.id,
+            label="pg",
+            token_hash=authz.token_digest(token),
+            scopes=authz.format_scopes({authz.Scope.LEDGER_READ}),
+        )
+        pg_session.add(row)
+        pg_session.commit()
+
+        principal = authz.authenticate(pg_session, token)
+        assert principal is not None
+        assert principal.actor_id == actor.id
+        assert principal.scopes == {authz.Scope.LEDGER_READ}
+
+        row.revoked_at = datetime(2026, 9, 7, 0, 0, 0)
+        pg_session.commit()
+        assert authz.authenticate(pg_session, token) is None
+
+    def test_deleting_the_actor_deletes_its_credentials(self, pg_session):
+        from app import authz
+
+        actor = models.Actor(type=models.ActorTypeEnum.AI, name="pg-cred-cascade")
+        pg_session.add(actor)
+        pg_session.commit()
+        token = authz.issue_token()
+        pg_session.add(
+            models.Credential(
+                actor_id=actor.id,
+                label="pg-cascade",
+                token_hash=authz.token_digest(token),
+                scopes=authz.format_scopes({authz.Scope.LEDGER_READ}),
+            )
+        )
+        pg_session.commit()
+
+        pg_session.delete(actor)
+        pg_session.commit()
+
+        # The database enforces this, not the ORM: the module-scoped engine is
+        # shared, so the label is unique to this test.
+        assert pg_session.query(models.Credential).filter_by(label="pg-cascade").count() == 0
+        assert authz.authenticate(pg_session, token) is None
+
+    def test_two_credentials_cannot_share_a_digest(self, pg_session):
+        from sqlalchemy.exc import IntegrityError
+
+        from app import authz
+
+        actor = models.Actor(type=models.ActorTypeEnum.AI, name="pg-cred-dup")
+        pg_session.add(actor)
+        pg_session.commit()
+        digest = authz.token_digest(authz.issue_token())
+        for _ in range(2):
+            pg_session.add(models.Credential(actor_id=actor.id, label="dup", token_hash=digest, scopes=""))
+        with pytest.raises(IntegrityError):
+            pg_session.commit()
+        pg_session.rollback()
+
+
+class TestMinimizationMigration:
+    """Migration 012 against rows that already exist."""
+
+    def test_existing_rows_are_backfilled_with_unique_opaque_ids(self, legacy_engine):
+        session = sessionmaker(bind=legacy_engine, autoflush=False)()
+        try:
+            actors = session.query(models.Actor).all()
+            assert actors, "the legacy fixture seeds an actor"
+            assert all(a.opaque_id for a in actors)
+            assert len({a.opaque_id for a in actors}) == len(actors)
+        finally:
+            session.close()
+
+    def test_a_second_opaque_id_cannot_collide(self, pg_session):
+        from sqlalchemy.exc import IntegrityError
+
+        from app import disclosure
+
+        shared = disclosure.new_opaque_id()
+        for name in ("dup-a", "dup-b"):
+            pg_session.add(models.Actor(type=models.ActorTypeEnum.AI, name=name, opaque_id=shared))
+        with pytest.raises(IntegrityError):
+            pg_session.commit()
+        pg_session.rollback()

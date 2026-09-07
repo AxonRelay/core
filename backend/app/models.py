@@ -1,6 +1,7 @@
 """Database models for AxonRelay (personal PoC pivot, post-migration 003)."""
 
 import enum
+import secrets
 from datetime import datetime
 
 from sqlalchemy import (
@@ -16,9 +17,20 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 
 from app.database import Base
+
+#: Bytes of randomness in an opaque identifier, kept in step with
+#: app.disclosure.OPAQUE_ID_BYTES and migration 012. Defined here, not
+#: imported, because `disclosure` imports this module.
+OPAQUE_ID_BYTES = 12
+
+
+def _new_opaque_id() -> str:
+    """Default for every opaque_id column, so a row cannot exist without one."""
+    return secrets.token_urlsafe(OPAQUE_ID_BYTES)
+
 
 # =============================================================================
 # Enums
@@ -82,6 +94,12 @@ class Actor(Base):
     id = Column(Integer, primary_key=True, index=True)
     type = Column(Enum(ActorTypeEnum), nullable=False, index=True)
     name = Column(String(255), nullable=False)
+    # Stable, unguessable stand-in for `name` at a shared boundary. A name is
+    # chosen by an operator and is arbitrary text - it routinely carries a
+    # person, a machine or a project - so it is not something a shared instance
+    # should hand back. Random rather than derived: a digest of a name a peer
+    # can guess is not opaque.
+    opaque_id = Column(String(32), unique=True, index=True, default=_new_opaque_id)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     agent_definition = relationship("AgentDefinition", back_populates="actor", uselist=False)
@@ -105,6 +123,17 @@ class AgentDefinition(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     actor = relationship("Actor", back_populates="agent_definition")
+
+    @property
+    def config_keys(self) -> list[str] | None:
+        """The config's key names, never its values — it is where credentials go.
+
+        A property rather than a serializer detail so every response model that
+        reads this row from attributes gets the same answer (app/disclosure.py).
+        """
+        from app import disclosure  # local: disclosure imports models
+
+        return disclosure.config_keys(self.config)
 
 
 class TaskAssignment(Base):
@@ -155,15 +184,30 @@ class Task(Base):
 
 
 class Draft(Base):
-    """Version history of task drafts."""
+    """Version history of task drafts — the artifacts approvals bind to.
+
+    ``(task_id, version)`` is unique so a version number names exactly one
+    artifact. ``commitment`` is the SHA-256 of the content (see
+    app/ledger.py); it is what an approval records, so the ledger can prove
+    which bytes were approved without ever re-reading them.
+    """
 
     __tablename__ = "drafts"
+    __table_args__ = (UniqueConstraint("task_id", "version", name="uq_drafts_task_version"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # Artifact commitment (migration 009). NULL only on rows the backfill
+    # could not reach; record_approval fills it in before binding to them.
+    commitment = Column(String(64))
+    commitment_algorithm = Column(String(32))
+    # Producer of this version. Deliberately not a FK: a ledger field must not
+    # be rewritten (SET NULL) because an Actor row was deleted.
+    producer_actor_id = Column(Integer)
 
     task = relationship("Task", back_populates="drafts")
 
@@ -174,7 +218,7 @@ class Approval(Base):
     __tablename__ = "approvals"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     reviewer_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"))
     action = Column(String(20), nullable=False)
     comment = Column(Text)
@@ -185,8 +229,28 @@ class Approval(Base):
     prev_hash = Column(String(64))
     entry_hash = Column(String(64))
 
+    # Which payload the row was hashed with: 1 = event only (migrations
+    # 004–008; 009 stamps those rows), 2 = artifact-bound. NULL only on rows
+    # that were never hashed (pre-004). Verification picks the payload by this.
+    hash_version = Column(Integer)
+
+    # Artifact binding (migration 009) — all five fields are inside the v2
+    # hash. NULL on legacy rows, which are reported as not artifact-bound.
+    artifact_ref = Column(String(255))
+    artifact_version = Column(Integer)
+    artifact_commitment = Column(String(64))
+    artifact_commitment_algorithm = Column(String(32))
+    producer_actor_id = Column(Integer)  # not a FK, same reason as Draft
+
     task = relationship("Task", back_populates="approvals")
     reviewer = relationship("Actor", back_populates="approvals", foreign_keys=[reviewer_actor_id])
+
+    @property
+    def artifact_bound(self) -> bool:
+        """True when this entry names the exact artifact it approved."""
+        from app import ledger  # ledger has no model imports; local to keep the module graph acyclic
+
+        return (self.hash_version or 1) >= ledger.ARTIFACT_BINDING_SINCE and self.artifact_commitment is not None
 
 
 class ExternalLink(Base):
@@ -202,6 +266,18 @@ class ExternalLink(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     task = relationship("Task", back_populates="external_links")
+
+    @validates("url")
+    def _sanitize_url(self, _key: str, value: str | None) -> str | None:
+        """Refuse a URL that carries a credential, a query, a fragment or an odd scheme.
+
+        On the model rather than in a caller: this row is the one place the
+        schema invites a URL, and it has had no writer until now. Putting the
+        rule here means the first writer inherits it (app/disclosure.py).
+        """
+        from app import disclosure  # local: disclosure imports models
+
+        return disclosure.sanitize_url(value)
 
 
 # =============================================================================
@@ -281,6 +357,81 @@ class RelayKindEnum(enum.StrEnum):
     WARNING = "warning"
 
 
+class FocusCodeEnum(enum.StrEnum):
+    """What a session is doing, as a code rather than a sentence.
+
+    Free-form focus text is useful to a human reading the board and is exactly
+    the kind of thing that should not cross a shared boundary: it quotes file
+    names, ticket titles and sometimes the work itself. These cover what a peer
+    actually needs in order to decide whether to wait or work elsewhere.
+    """
+
+    EXPLORING = "exploring"
+    IMPLEMENTING = "implementing"
+    REVIEWING = "reviewing"
+    TESTING = "testing"
+    DEBUGGING = "debugging"
+    DOCUMENTING = "documenting"
+    RELEASING = "releasing"
+    BLOCKED = "blocked"
+    IDLE = "idle"
+
+
+class ClaimReasonCodeEnum(enum.StrEnum):
+    """Why a territory or resource claim was taken."""
+
+    EDITING = "editing"
+    REFACTORING = "refactoring"
+    RUNNING_TESTS = "running_tests"
+    MIGRATING = "migrating"
+    RELEASING = "releasing"
+    INVESTIGATING = "investigating"
+
+
+class RelayCodeEnum(enum.StrEnum):
+    """What a relay is asking for, without saying it in prose."""
+
+    HANDOFF_READY = "handoff_ready"
+    NEEDS_REVIEW = "needs_review"
+    BLOCKED_ON_YOU = "blocked_on_you"
+    CONFLICT_DETECTED = "conflict_detected"
+    RELEASE_REQUESTED = "release_requested"
+    HEADS_UP = "heads_up"
+    ANSWERED = "answered"
+
+
+class AckCodeEnum(enum.StrEnum):
+    """How a recipient answered a relay."""
+
+    ACKNOWLEDGED = "acknowledged"
+    DONE = "done"
+    DECLINED = "declined"
+    DEFERRED = "deferred"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class SafeActionEnum(enum.StrEnum):
+    """What a Safe Envelope reports happened. Closed set; free text has no slot."""
+
+    SESSION_START = "session_start"
+    SESSION_HEARTBEAT = "session_heartbeat"
+    SESSION_END = "session_end"
+    CLAIM_REQUEST = "claim_request"
+    CLAIM_RELEASE = "claim_release"
+    ARTIFACT_PRODUCED = "artifact_produced"
+    DECISION_APPROVE = "decision_approve"
+    DECISION_REJECT = "decision_reject"
+    RELAY_NOTICE = "relay_notice"
+    RELAY_ACK = "relay_ack"
+
+
+class SafeOutcomeEnum(enum.StrEnum):
+    SUCCESS = "success"
+    REFUSED = "refused"
+    CONFLICT = "conflict"
+    ERROR = "error"
+
+
 class Workspace(Base):
     """One checkout of one repository on one machine.
 
@@ -306,6 +457,11 @@ class Workspace(Base):
     git_dir = Column(String(1000), index=True)
 
     label = Column(String(255))
+    # The checkout's identity at a shared boundary. `host`, `clone_path` and
+    # `git_dir` name a machine and a filesystem; this names the same checkout
+    # without describing it, and stays the same across restarts so claim and
+    # relay history remains continuous.
+    opaque_id = Column(String(32), unique=True, index=True, default=_new_opaque_id)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -329,6 +485,9 @@ class Session(Base):
 
     branch = Column(String(255))
     focus = Column(Text)
+    #: The disclosable form of `focus`. Set it and a shared boundary has
+    #: something to say about this session without quoting the prose.
+    focus_code = Column(Enum(FocusCodeEnum))
     status = Column(Enum(SessionStatusEnum), nullable=False, default=SessionStatusEnum.ACTIVE, index=True)
 
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -363,6 +522,7 @@ class Claim(Base):
 
     mode = Column(Enum(ClaimModeEnum), nullable=False, default=ClaimModeEnum.EXCLUSIVE)
     reason = Column(Text)
+    reason_code = Column(Enum(ClaimReasonCodeEnum))
     status = Column(Enum(ClaimStatusEnum), nullable=False, default=ClaimStatusEnum.HELD, index=True)
 
     # Set when the claim was granted over a live conflict via force=True. The
@@ -403,6 +563,7 @@ class Relay(Base):
     kind = Column(Enum(RelayKindEnum), nullable=False, default=RelayKindEnum.NOTE, index=True)
     subject = Column(String(500), nullable=False)
     body = Column(Text)
+    code = Column(Enum(RelayCodeEnum))
     in_reply_to_id = Column(Integer, ForeignKey("relays.id", ondelete="SET NULL"))
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -430,6 +591,73 @@ class RelayReceipt(Base):
     read_at = Column(DateTime)
     acked_at = Column(DateTime)
     ack_note = Column(Text)
+    ack_code = Column(Enum(AckCodeEnum))
 
     relay = relationship("Relay", back_populates="receipts")
     session = relationship("Session")
+
+
+class SafeEvent(Base):
+    """One ingested Safe Envelope (app/safe_envelope.py). Append-only, metadata only.
+
+    Every column is a bounded identifier, an enum, a digest or a timestamp. The
+    table has no text column by design: a producer that wanted to send a
+    title, a body or a path has no field to put it in, and the schema rejects
+    unknown fields before anything reaches this row.
+    """
+
+    __tablename__ = "safe_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schema_version = Column(Integer, nullable=False)
+    policy_version = Column(String(32), nullable=False)
+    identifier_policy = Column(String(16), nullable=False)
+
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    actor_ref = Column(String(128), nullable=False, index=True)
+    repository_ref = Column(String(201), nullable=False, index=True)
+    workspace_ref = Column(String(128))
+    session_ref = Column(String(128), index=True)
+
+    action = Column(Enum(SafeActionEnum), nullable=False, index=True)
+    outcome = Column(Enum(SafeOutcomeEnum), nullable=False)
+
+    artifact_ref = Column(String(128))
+    artifact_version = Column(Integer)
+    artifact_commitment = Column(String(64))
+    artifact_commitment_algorithm = Column(String(32))
+
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    received_at = Column(DateTime, nullable=False)
+    producer_signature = Column(String(1024))
+
+
+class Credential(Base):
+    """An issued API credential: which Actor a caller is, and what it may do.
+
+    Only the SHA-256 of the token is stored (`token_hash`, unique so a lookup
+    is a single indexed hit and never a scan). The token itself exists once,
+    in the output of `python -m app.credentials issue`; nothing here can
+    recover it, and nothing logs it. See app/authz.py.
+
+    `actor_id` is a real FK with CASCADE: deleting an Actor must take its
+    credentials with it, or a deleted identity would keep authenticating.
+    That is the opposite of the ledger's rule (where a hashed reference must
+    never change), and deliberately so - this row is access control, not
+    evidence.
+    """
+
+    __tablename__ = "credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(255), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    #: Comma-separated Scope values; parsed by authz.parse_scopes, which drops
+    #: a name it does not know rather than guessing at it.
+    scopes = Column(String(255), nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_used_at = Column(DateTime)
+    revoked_at = Column(DateTime)
+
+    actor = relationship("Actor")

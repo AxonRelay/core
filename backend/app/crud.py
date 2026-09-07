@@ -320,23 +320,96 @@ def delete_task(db: Session, task_id: int):
     return True
 
 
+# ========== Ledger contract errors ==========
+
+
+class LedgerError(ValueError):
+    """A write that would violate the approval ledger's contract."""
+
+
+class TaskNotFoundError(LedgerError):
+    pass
+
+
+class ArtifactRequiredError(LedgerError):
+    """An approval was attempted on a task that has no artifact to bind to."""
+
+
+class StaleArtifactError(LedgerError):
+    """The decision targeted a draft version / commitment that is no longer the latest."""
+
+
+class CommitmentMismatchError(LedgerError):
+    """A supplied commitment does not match the artifact content."""
+
+
+def _lock_task(db: Session, task_id: int) -> models.Task:
+    """Take the per-task row lock that serializes ledger writers.
+
+    `with_for_update` is a no-op on SQLite (the test backend), which serializes
+    writers at the database level anyway. On Postgres it is a real `SELECT ...
+    FOR UPDATE`, held until the caller commits.
+    """
+    task = db.query(models.Task).filter(models.Task.id == task_id).with_for_update().first()
+    if task is None:
+        raise TaskNotFoundError(f"Task {task_id} not found")
+    return task
+
+
 # ========== Draft Operations ==========
 
 
-def add_draft(db: Session, task_id: int, content: str):
-    """Append a new draft version to a task."""
-    last_version = (
-        db.query(models.Draft.version)
-        .filter(models.Draft.task_id == task_id)
-        .order_by(models.Draft.version.desc())
-        .first()
+def _latest_draft(db: Session, task_id: int) -> models.Draft | None:
+    return db.query(models.Draft).filter(models.Draft.task_id == task_id).order_by(models.Draft.version.desc()).first()
+
+
+def _append_draft(
+    db: Session,
+    task_id: int,
+    content: str,
+    *,
+    producer_actor_id: int | None = None,
+    commitment: str | None = None,
+) -> models.Draft:
+    """Append the next draft version. Caller holds the task lock; no commit here."""
+    computed = ledger.compute_artifact_commitment(content)
+    if commitment is not None and commitment != computed:
+        raise CommitmentMismatchError("Supplied commitment does not match the draft content")
+    last = _latest_draft(db, task_id)
+    draft = models.Draft(
+        task_id=task_id,
+        version=(last.version + 1) if last else 1,
+        content=content,
+        commitment=computed,
+        commitment_algorithm=ledger.COMMITMENT_ALGORITHM,
+        producer_actor_id=producer_actor_id,
     )
-    next_version = (last_version[0] + 1) if last_version else 1
-    db_draft = models.Draft(task_id=task_id, version=next_version, content=content)
-    db.add(db_draft)
+    db.add(draft)
+    db.flush()
+    return draft
+
+
+def add_draft(
+    db: Session,
+    task_id: int,
+    content: str,
+    *,
+    producer_actor_id: int | None = None,
+    commitment: str | None = None,
+):
+    """Append a new draft version to a task, with its content commitment.
+
+    `commitment`, when given, is a source-produced value that must match the
+    content; a mismatch is refused rather than silently recomputed. The task
+    row is locked first so two appends cannot claim the same version (the
+    unique constraint would catch the second one, but the lock avoids the
+    failed transaction altogether).
+    """
+    _lock_task(db, task_id)
+    draft = _append_draft(db, task_id, content, producer_actor_id=producer_actor_id, commitment=commitment)
     db.commit()
-    db.refresh(db_draft)
-    return db_draft
+    db.refresh(draft)
+    return draft
 
 
 def get_drafts(db: Session, task_id: int):
@@ -352,8 +425,27 @@ def record_approval(
     reviewer_actor_id: int | None,
     action: str,
     comment: str | None = None,
+    *,
+    artifact_version: int | None = None,
+    expected_commitment: str | None = None,
+    modified_draft: str | None = None,
 ):
-    """Record an approval / rejection event, chained to the task's prior entry.
+    """Record an approval / rejection event bound to the artifact it decided on.
+
+    The entry is chained to the task's prior entry (see app/ledger.py) and
+    carries an **artifact binding**: the reference, version, commitment and
+    producer of the draft that was reviewed. All of it is inside the hash.
+
+    * A task with no draft cannot be approved (`ArtifactRequiredError`): an
+      approval must have an unambiguous target.
+    * `artifact_version` / `expected_commitment` let the caller say which
+      draft they looked at. If the task's latest draft is no longer that one,
+      nothing is recorded (`StaleArtifactError`) — the operator never approves
+      content they did not see. Both are optional so trusted local callers can
+      approve "whatever is current".
+    * `modified_draft` appends a new draft version (producer = the reviewer)
+      **before** the approval is written, and the approval binds to that new
+      version.
 
     created_at is set explicitly here (not via the column default) so the value
     that is hashed is exactly the value persisted.
@@ -361,20 +453,53 @@ def record_approval(
     **Concurrency**: read-prev-then-append is a read-modify-write on the task's
     hash chain, so two approvals racing on one task would otherwise both chain
     off the same `prev_hash` and fork the chain (`verify_approval_chain` would
-    then flag the later one as tampering). We take a row lock on the task first,
-    which serializes writers per task for the rest of the transaction. This is
-    what makes the ledger safe for the multi-actor / multi-device use the
-    coordination layer enables; it lifts the single-writer limitation recorded
-    in docs/delta-mvp-spec.md §11.6.
-
-    `with_for_update` is a no-op on SQLite (the test backend), which serializes
-    writers at the database level anyway. On Postgres it is a real `SELECT ...
-    FOR UPDATE`.
+    then flag the later one as tampering). The task row lock taken first
+    serializes writers per task for the rest of the transaction — draft append
+    included, so the version an approval binds to cannot be raced either. This
+    is what makes the ledger safe for the multi-actor / multi-device use the
+    coordination layer enables (docs/delta-mvp-spec.md §11.6).
     """
+    # Lock the task row *before* reading drafts or the chain head, so a
+    # concurrent writer on the same task waits here rather than racing us.
+    _lock_task(db, task_id)
+
+    shown = _latest_draft(db, task_id)
+    if shown is None:
+        raise ArtifactRequiredError(f"Task {task_id} has no draft; an approval must bind to an artifact")
+    if artifact_version is not None and shown.version != artifact_version:
+        raise StaleArtifactError(
+            f"Task {task_id}: the decision targeted draft v{artifact_version} but the latest is v{shown.version}"
+        )
+    # A row the 009 backfill did not reach (SQLite test schema, or content
+    # added outside the app) has no commitment yet; compute it in memory so
+    # the checks below run on it, and persist it only once they pass.
+    shown_commitment = shown.commitment or ledger.compute_artifact_commitment(shown.content)
+    if expected_commitment is not None and shown_commitment != expected_commitment:
+        raise StaleArtifactError(
+            f"Task {task_id}: draft v{shown.version} no longer has the commitment the decision targeted"
+        )
+    if shown.commitment is None:
+        shown.commitment = shown_commitment
+        shown.commitment_algorithm = ledger.COMMITMENT_ALGORITHM
+        db.flush()
+
+    target = shown
+    if modified_draft is not None:
+        # Always a new version, even for identical text: the graph appends
+        # the modified draft to its own state unconditionally, and the
+        # projection matches versions by content, so the two stay aligned.
+        target = _append_draft(db, task_id, modified_draft, producer_actor_id=reviewer_actor_id)
+
+    # Stamped after the artifact exists: the approval is the later event.
     now = datetime.utcnow()
-    # Lock the task row *before* reading the chain head, so a concurrent
-    # approval on the same task waits here rather than racing us to the tail.
-    db.query(models.Task).filter(models.Task.id == task_id).with_for_update().first()
+    binding = ledger.ArtifactBinding(
+        ref=ledger.artifact_ref(task_id, target.version),
+        version=target.version,
+        commitment=target.commitment,
+        commitment_algorithm=target.commitment_algorithm,
+        producer_actor_id=target.producer_actor_id,
+    )
+
     last = (
         db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
     )
@@ -386,6 +511,7 @@ def record_approval(
         action=action,
         comment=comment,
         created_at=now,
+        artifact=binding,
     )
     db_approval = models.Approval(
         task_id=task_id,
@@ -395,6 +521,12 @@ def record_approval(
         created_at=now,
         prev_hash=prev_hash,
         entry_hash=entry_hash,
+        hash_version=ledger.ENTRY_HASH_VERSION,
+        artifact_ref=binding.ref,
+        artifact_version=binding.version,
+        artifact_commitment=binding.commitment,
+        artifact_commitment_algorithm=binding.commitment_algorithm,
+        producer_actor_id=binding.producer_actor_id,
     )
     db.add(db_approval)
     db.commit()
@@ -409,26 +541,58 @@ def get_approvals(db: Session, task_id: int):
 def verify_approval_chain(db: Session, task_id: int) -> dict:
     """Recompute the approval hash chain for a task and report tampering.
 
-    Returns {"valid": bool, "broken_at": <approval id or None>, "count": int,
-    "legacy": int}. ``legacy`` counts pre-migration-004 rows (entry_hash IS NULL)
-    that predate the hash chain; these are not covered by tamper-evidence and are
-    skipped (the chain restarts after them, matching record_approval). A mismatch
-    among hashed rows means a recorded approval was altered or reordered.
+    Returns ``{"valid", "broken_at", "count", "legacy", "artifact_bound",
+    "unbound"}``:
+
+    * ``legacy`` — pre-migration-004 rows (entry_hash IS NULL) that predate the
+      hash chain. Not covered by tamper-evidence; skipped as a leading prefix.
+    * ``artifact_bound`` — rows hashed with the v2 payload, i.e. whose entry
+      names the exact draft (ref, version, commitment, producer) it approved.
+    * ``unbound`` — every other row: legacy rows plus v1 rows (004–008), which
+      are tamper-evident as events but do not identify their artifact.
+
+    A mismatch among hashed rows means a recorded approval was altered or
+    reordered — including any of the artifact-binding fields, or the
+    ``hash_version`` marker itself, since the version is inside the hash.
     """
     approvals = get_approvals(db, task_id)
     prev_hash = None
     legacy = 0
+    bound = 0
     seen_hashed = False
+
+    def _report(valid: bool, broken_at: int | None) -> dict:
+        return {
+            "valid": valid,
+            "broken_at": broken_at,
+            "count": len(approvals),
+            "legacy": legacy,
+            "artifact_bound": bound,
+            "unbound": len(approvals) - bound,
+        }
+
     for approval in approvals:
         if approval.entry_hash is None:
             # A NULL hash is only acceptable as a leading legacy prefix (rows that
             # predate the hash chain). A NULL appearing *after* the chain has
             # started means a hashed row was blanked out — that is tampering.
             if seen_hashed:
-                return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
+                return _report(False, approval.id)
             legacy += 1
             continue
         seen_hashed = True
+        artifact = None
+        # Dispatch on the row's own version (NULL/1 = event-only payload), not
+        # on equality with the current version, so a later payload bump does
+        # not turn every older row into a false tamper report.
+        if (approval.hash_version or 1) >= ledger.ARTIFACT_BINDING_SINCE:
+            artifact = ledger.ArtifactBinding(
+                ref=approval.artifact_ref,
+                version=approval.artifact_version,
+                commitment=approval.artifact_commitment,
+                commitment_algorithm=approval.artifact_commitment_algorithm,
+                producer_actor_id=approval.producer_actor_id,
+            )
         expected = ledger.compute_entry_hash(
             prev_hash,
             task_id=approval.task_id,
@@ -436,8 +600,12 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             action=approval.action,
             comment=approval.comment,
             created_at=approval.created_at,
+            artifact=artifact,
+            version=approval.hash_version,
         )
         if approval.prev_hash != prev_hash or approval.entry_hash != expected:
-            return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
+            return _report(False, approval.id)
+        if artifact is not None:
+            bound += 1
         prev_hash = approval.entry_hash
-    return {"valid": True, "broken_at": None, "count": len(approvals), "legacy": legacy}
+    return _report(True, None)
