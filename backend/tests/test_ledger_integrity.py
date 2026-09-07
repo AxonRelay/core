@@ -6,7 +6,10 @@ from app import crud, ledger, models
 
 
 def _task(db):
-    return crud.create_task(db, thread_id="thread-1", title="t")
+    task = crud.create_task(db, thread_id="thread-1", title="t")
+    # Every approval binds to an artifact, so the task under test has one draft.
+    crud.add_draft(db, task_id=task.id, content="draft under review")
+    return task
 
 
 def test_chain_links_each_entry_to_the_previous(db, self_actor):
@@ -19,12 +22,19 @@ def test_chain_links_each_entry_to_the_previous(db, self_actor):
     assert a2.prev_hash == a1.entry_hash  # second links to the first
 
     result = crud.verify_approval_chain(db, task.id)
-    assert result == {"valid": True, "broken_at": None, "count": 2, "legacy": 0}
+    assert result == {"valid": True, "broken_at": None, "count": 2, "legacy": 0, "artifact_bound": 2, "unbound": 0}
 
 
 def test_empty_chain_is_valid(db):
     task = _task(db)
-    assert crud.verify_approval_chain(db, task.id) == {"valid": True, "broken_at": None, "count": 0, "legacy": 0}
+    assert crud.verify_approval_chain(db, task.id) == {
+        "valid": True,
+        "broken_at": None,
+        "count": 0,
+        "legacy": 0,
+        "artifact_bound": 0,
+        "unbound": 0,
+    }
 
 
 def test_legacy_unhashed_rows_are_skipped_then_chain_verifies(db, self_actor):
@@ -39,7 +49,7 @@ def test_legacy_unhashed_rows_are_skipped_then_chain_verifies(db, self_actor):
     crud.record_approval(db, task_id=task.id, reviewer_actor_id=self_actor.id, action="approved", comment="ok")
 
     result = crud.verify_approval_chain(db, task.id)
-    assert result == {"valid": True, "broken_at": None, "count": 3, "legacy": 1}
+    assert result == {"valid": True, "broken_at": None, "count": 3, "legacy": 1, "artifact_bound": 2, "unbound": 1}
 
 
 def test_nulling_a_hashed_rows_hash_is_detected_not_treated_as_legacy(db, self_actor):

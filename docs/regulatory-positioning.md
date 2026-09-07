@@ -16,9 +16,10 @@ agents.
   regulation, and it does not claim to.
 - It does not certify, attest, or provide legal evidence of anything. The
   ledger's hash chain is *tamper-evident* (you can detect that a stored entry
-  was altered); it is not qualified electronic signing, trusted timestamping,
-  or non-repudiation. Those are explicitly out of scope
-  ([delta-mvp-spec §8](./delta-mvp-spec.md)).
+  was altered) and, since [ADR-009](./adr-009-artifact-commitment.md), each
+  entry names the draft version and content commitment it decided on. Neither
+  is qualified electronic signing, trusted timestamping, or non-repudiation.
+  Those are explicitly out of scope ([delta-mvp-spec §8](./delta-mvp-spec.md)).
 - Nothing in this repository is legal advice.
 
 ## Why regulation is mentioned at all
@@ -116,8 +117,10 @@ AxonRelay は、人と AI の混成チーム向けの永続的で改ざん検知
 
 - どのシステムも EU AI Act その他の規制に適合させないし、そう主張もしない。
 - 何かを証明・認定・法的に立証することはない。台帳の hash chain は
-  *改ざん検知*（保存済みエントリの改変を検出できる）であって、適格電子署名・
-  タイムスタンプ局・否認防止ではない。それらは明示的に対象外である
+  *改ざん検知*（保存済みエントリの改変を検出できる）であり、
+  [ADR-009](./adr-009-artifact-commitment.md) 以降は各エントリが判断対象の
+  draft 版と本文 commitment を名指しする。いずれも適格電子署名・タイムスタンプ局・
+  否認防止ではない。それらは明示的に対象外である
   （[delta-mvp-spec §8](./delta-mvp-spec.md)）。
 - このリポジトリの内容は法的助言ではない。
 

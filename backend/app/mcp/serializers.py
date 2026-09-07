@@ -50,6 +50,9 @@ def draft_to_dict(draft: models.Draft) -> dict:
         "version": draft.version,
         "content": draft.content,
         "created_at": draft.created_at.isoformat(),
+        "commitment": draft.commitment,
+        "commitment_algorithm": draft.commitment_algorithm,
+        "producer_actor_id": draft.producer_actor_id,
     }
 
 
@@ -63,6 +66,14 @@ def approval_to_dict(approval: models.Approval) -> dict:
         "created_at": approval.created_at.isoformat(),
         "prev_hash": approval.prev_hash,
         "entry_hash": approval.entry_hash,
+        "hash_version": approval.hash_version,
+        # Which draft this entry decided on; False / None on pre-009 entries.
+        "artifact_bound": approval.artifact_bound,
+        "artifact_ref": approval.artifact_ref,
+        "artifact_version": approval.artifact_version,
+        "artifact_commitment": approval.artifact_commitment,
+        "artifact_commitment_algorithm": approval.artifact_commitment_algorithm,
+        "producer_actor_id": approval.producer_actor_id,
     }
 
 
