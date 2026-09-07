@@ -114,7 +114,7 @@ def test_a_well_formed_envelope_is_accepted_and_stored_field_for_field(db, full_
     assert stored["action"] == "artifact_produced"
     assert stored["artifact_commitment"] == "a" * 64
     assert stored["identifier_policy"] == "opaque"
-    assert stored["occurred_at"] == "2026-09-07T01:02:03Z"
+    assert stored["occurred_at"] == "2026-09-07T01:02:03"  # naive UTC, like every other serializer
 
 
 def test_resending_an_event_id_is_idempotent(db, full_text_mode):
@@ -163,6 +163,10 @@ def test_every_free_text_field_is_rejected_by_name_only(db, full_text_mode, capl
         ("event_id", "has.dot.and.is.long.enough"),
         ("actor_id", "actor:with:colons_is_long"),
         ("repository_id", "owner/repo"),  # a slug is public, not opaque
+        ("repository_id", "github.com"),  # dotted hostname: not opaque
+        ("repository_id", "x"),  # one character: not opaque
+        ("repository_id", "a/b/c"),  # not even a slug
+        ("repository_id", "user.name_at_example.invalid"),
         ("artifact_commitment", "not-a-digest"),
         ("artifact_commitment_algorithm", "md5"),
         ("policy_version", "p" * 40),
@@ -176,7 +180,7 @@ def test_every_free_text_field_is_rejected_by_name_only(db, full_text_mode, capl
 def test_bounded_fields_reject_anything_outside_their_shape(db, full_text_mode, field, value):
     with pytest.raises(safe_envelope.EnvelopeRejected) as exc:
         safe_envelope.ingest(db, _envelope(**{field: value}))
-    assert field in exc.value.fields
+    assert exc.value.fields == [field]  # the field's own name, no union or validator tags
     assert str(value) not in str(exc.value)
 
 
@@ -208,6 +212,55 @@ def test_public_identifiers_need_the_policy(db, monkeypatch, full_text_mode):
     monkeypatch.setenv(safe_envelope.PUBLIC_IDENTIFIERS_ENV, "1")
     event, _ = safe_envelope.ingest(db, public)
     assert event.repository_ref == "AxonRelay/core"
+
+
+def test_public_slugs_are_the_only_extra_shape_the_public_policy_admits(db, monkeypatch, full_text_mode):
+    monkeypatch.setenv(safe_envelope.PUBLIC_IDENTIFIERS_ENV, "1")
+    for bad in ("a/b/c", "https://example.invalid/x", "owner/repo?x=1", "-" * 250):
+        with pytest.raises(safe_envelope.EnvelopeRejected) as exc:
+            safe_envelope.ingest(
+                db, _envelope(identifier_policy="public", repository_id=bad, event_id="pub_" + "0" * 16)
+            )
+        assert exc.value.fields == ["repository_id"]
+    # The other identifiers stay opaque even under the public policy.
+    with pytest.raises(safe_envelope.EnvelopeRejected) as exc:
+        safe_envelope.ingest(db, _envelope(identifier_policy="public", actor_id="owner/repo"))
+    assert exc.value.fields == ["actor_id"]
+
+
+def test_the_commitment_algorithm_is_the_ledgers(db, full_text_mode):
+    from app import ledger
+
+    ok, _ = safe_envelope.ingest(db, _envelope(artifact_commitment_algorithm=ledger.COMMITMENT_ALGORITHM))
+    assert ok.artifact_commitment_algorithm == ledger.COMMITMENT_ALGORITHM
+    with pytest.raises(safe_envelope.EnvelopeRejected) as exc:
+        safe_envelope.ingest(db, _envelope(event_id="alg_" + "0" * 16, artifact_commitment_algorithm="sha1"))
+    assert exc.value.fields == ["artifact_commitment_algorithm"]
+
+
+def test_a_lost_race_on_event_id_still_returns_the_winner(db, monkeypatch, full_text_mode):
+    """Insert-first idempotency: if the lookup misses and the constraint fires, the caller gets created=False."""
+    winner, created = safe_envelope.ingest(db, _envelope())
+    assert created
+    real = safe_envelope._find_existing
+    calls = {"n": 0}
+
+    def _miss_once(session, event_id):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real(session, event_id)
+
+    monkeypatch.setattr(safe_envelope, "_find_existing", _miss_once)
+    loser, created = safe_envelope.ingest(db, _envelope(outcome="error"))
+    assert created is False
+    assert loser.id == winner.id
+    assert db.query(models.SafeEvent).count() == 1
+
+
+def test_list_events_rejects_an_unknown_action_by_name(db, full_text_mode):
+    with pytest.raises(safe_envelope.EnvelopeRejected) as exc:
+        safe_envelope.list_events(db, action="free text " + CANARY)
+    assert exc.value.fields == ["action"]
+    assert CANARY not in str(exc.value)
 
 
 def test_the_published_json_schema_matches_the_model():
@@ -386,3 +439,74 @@ def test_the_tool_surface_lists_the_ingestion_tools():
 def test_datetime_round_trip_is_utc(db, full_text_mode):
     event, _ = safe_envelope.ingest(db, _envelope(occurred_at="2026-09-07T10:02:03+09:00"))
     assert event.occurred_at == datetime(2026, 9, 7, 1, 2, 3, tzinfo=UTC).replace(tzinfo=None)
+
+
+# ------------------------------------------------ every surface is classified
+
+#: Tools that only read, or take ids and enums. Anything not listed here and
+#: not refused in safe mode fails the test below, so a new tool has to be
+#: classified on purpose.
+MCP_READ_ONLY = {
+    "list_tasks",
+    "list_pending_approvals",
+    "get_task",
+    "get_drafts",
+    "verify_task_ledger",
+    "list_agents",
+    "get_self_actor",
+    "end_session",
+    "get_board",
+    "release_territory",
+    "read_inbox",
+    "check_git_resource",
+}
+MCP_ENVELOPE = {"ingest_safe_envelope", "list_safe_events"}
+MCP_REFUSED = {name for name, _ in MCP_FREE_TEXT} | {"review_pending_task", "check_conflicts"}
+
+
+def test_every_mcp_tool_is_classified_for_safe_mode():
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    unclassified = names - MCP_READ_ONLY - MCP_ENVELOPE - MCP_REFUSED
+    assert unclassified == set(), f"classify these tools for safe mode: {sorted(unclassified)}"
+    assert names >= MCP_REFUSED and names >= MCP_ENVELOPE
+
+
+def test_check_conflicts_is_refused_in_safe_mode(mcp_db, safe_mode):
+    """It takes caller paths and echoes them; ignoring is receiving."""
+    with pytest.raises(ToolError) as exc:
+        _call_tool("check_conflicts", {"repo": "r", "paths": ["/" + CANARY]})
+    assert str(exc.value).endswith(safe_envelope.SAFE_MODE_REFUSAL)
+
+
+REST_REFUSED = {
+    ("POST", "/tasks"),
+    ("PUT", "/tasks/{task_id}"),
+    ("POST", "/tasks/{task_id}/run"),
+    ("POST", "/tasks/{task_id}/approve"),
+    ("POST", "/tasks/{task_id}/reject"),
+    ("POST", "/agents"),
+    ("PUT", "/agents/{agent_id}"),
+}
+REST_ENVELOPE = {("POST", "/envelopes"), ("GET", "/envelopes")}
+
+
+def test_every_rest_write_route_is_classified_for_safe_mode():
+    from app.main import app
+
+    writes = set()
+    for route in app.routes:
+        methods = getattr(route, "methods", None) or set()
+        for method in methods - {"GET", "HEAD", "OPTIONS"}:
+            writes.add((method, route.path))
+    unclassified = (
+        writes
+        - REST_REFUSED
+        - REST_ENVELOPE
+        - {
+            ("DELETE", "/tasks/{task_id}"),
+            ("DELETE", "/agents/{agent_id}"),
+            ("DELETE", "/tasks/{task_id}/assignments/{actor_id}"),
+            ("POST", "/tasks/{task_id}/assignments"),
+        }
+    )
+    assert unclassified == set(), f"classify these write routes for safe mode: {sorted(unclassified)}"
