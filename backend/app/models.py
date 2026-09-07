@@ -1,6 +1,7 @@
 """Database models for AxonRelay (personal PoC pivot, post-migration 003)."""
 
 import enum
+import secrets
 from datetime import datetime
 
 from sqlalchemy import (
@@ -19,6 +20,17 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship, validates
 
 from app.database import Base
+
+#: Bytes of randomness in an opaque identifier, kept in step with
+#: app.disclosure.OPAQUE_ID_BYTES and migration 012. Defined here, not
+#: imported, because `disclosure` imports this module.
+OPAQUE_ID_BYTES = 12
+
+
+def _new_opaque_id() -> str:
+    """Default for every opaque_id column, so a row cannot exist without one."""
+    return secrets.token_urlsafe(OPAQUE_ID_BYTES)
+
 
 # =============================================================================
 # Enums
@@ -87,7 +99,7 @@ class Actor(Base):
     # person, a machine or a project - so it is not something a shared instance
     # should hand back. Random rather than derived: a digest of a name a peer
     # can guess is not opaque.
-    opaque_id = Column(String(32), unique=True, index=True)
+    opaque_id = Column(String(32), unique=True, index=True, default=_new_opaque_id)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     agent_definition = relationship("AgentDefinition", back_populates="actor", uselist=False)
@@ -449,7 +461,7 @@ class Workspace(Base):
     # `git_dir` name a machine and a filesystem; this names the same checkout
     # without describing it, and stays the same across restarts so claim and
     # relay history remains continuous.
-    opaque_id = Column(String(32), unique=True, index=True)
+    opaque_id = Column(String(32), unique=True, index=True, default=_new_opaque_id)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

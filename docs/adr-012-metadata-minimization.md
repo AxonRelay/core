@@ -78,10 +78,10 @@ migration は既存の自由文からコードを**推測しない**。文から
 
 - **agent config の値は serializer から出ない。** 出るのはキー名だけ
   （`config_keys`）。config は運用者が API キーを置く場所である
-- **URL は保存時に検査する。** 認証情報付き（`https://user:token@…`）、クエリ文字列、
-  フラグメント、http/https 以外のスキームは拒否。`ExternalLink.url` の
-  `@validates` に置いたので、最初の書き手が自動的に継承する。拒否メッセージは
-  URL を繰り返さない
+- **URL は保存時に検査する。** 認証情報付き、クエリ文字列、フラグメント、
+  http/https 以外のスキームは拒否。`ExternalLink.url` の `@validates` に置いた。
+  この列には**現在まだ書き手がいない**——だからこそモデル側に置いた。最初の書き手が
+  規則を継承し、後から思い出す必要がない。拒否メッセージは URL を繰り返さない
 
 ### 5. 保持と削除（`app/retention.py`）
 
@@ -115,6 +115,7 @@ sweep が触れてよいテーブルは `sessions` / `claims` / `relays` / `rela
 | **作業の粗い性質**（`focus_code`、`reason_code`、`kind`、`code`） | 「待つべきか、別の場所を触るべきか」を決めるための最小情報。閉じた語彙なので、任意の文字列より観測できる量は小さい |
 | **規模**（`path_count`、`overlap_count`、open relay の件数） | 重なりの大きさは判断材料であり、パスの中身は判断材料ではない |
 | **repo slug**（public policy 下のみ） | 公開リポジトリの識別子は公開情報。private repo では policy を切ればよい |
+| **REST の Actor 応答** | `/actors*` も同じ policy を通る。通していなければ、board が返す `actor_ref` の隣の `actor_id` を 1 回問い合わせるだけで名前に戻せてしまい、pseudonym が pseudonym でなくなる |
 | **task / draft / approval の本文** | ADR-010 の safe mode は書き込みを拒否するので、safe mode の共有インスタンスはそもそも受け取らない。**モードを後から入れた場合、切替前のデータは残る**——その配備は切替時に既存データを扱う判断が要る |
 | **DB とプロセスを持つ管理者に対して** | 何も隠さない。非目標（ADR-010 と同じ） |
 

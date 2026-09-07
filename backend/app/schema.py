@@ -10,9 +10,19 @@ from app import ledger
 
 
 class ActorResponse(BaseModel):
+    """An Actor as a shared boundary may describe it.
+
+    `name` is arbitrary text an operator chose, so in content-blind mode it is
+    replaced by `actor_ref` (app/disclosure.py). Both are optional because
+    exactly one of them is present, and which one is the policy's decision, not
+    the caller's. Built through `app.disclosure.actor_view`, so this matches
+    what the MCP surface says about the same row.
+    """
+
     id: int
     type: str  # "human" or "ai"
-    name: str
+    name: str | None = None
+    actor_ref: str | None = None
     created_at: datetime
 
     class Config:

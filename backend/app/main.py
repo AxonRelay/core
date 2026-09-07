@@ -18,7 +18,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from app import authz, coordination, crud, langgraph_client, models, safe_envelope, service
+from app import authz, coordination, crud, disclosure, langgraph_client, models, safe_envelope, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.ratelimit import client_key
@@ -158,6 +158,18 @@ def health():
 # ========== Actor Endpoints ==========
 
 
+def _actor_response(actor: models.Actor | None) -> dict | None:
+    """An Actor for a REST response, through the same policy the MCP surface uses.
+
+    Without this the two surfaces disagree: a safe-mode board hands out an
+    opaque `actor_ref`, and one call to `/actors/{id}` with the `actor_id`
+    beside it would turn that reference back into a name.
+    """
+    if actor is None:
+        return None
+    return {**disclosure.actor_view(actor), "created_at": actor.created_at}
+
+
 @app.get("/actors", response_model=list[ActorResponse])
 @limiter.limit("60/minute")
 async def list_actors(request: Request, type: str | None = None, db: Session = Depends(get_db)):
@@ -167,7 +179,7 @@ async def list_actors(request: Request, type: str | None = None, db: Session = D
             actor_type = models.ActorTypeEnum(type)
         except ValueError as e:
             raise HTTPException(status_code=400, detail="Invalid actor type. Must be 'human' or 'ai'") from e
-    return crud.get_actors(db, actor_type=actor_type)
+    return [_actor_response(a) for a in crud.get_actors(db, actor_type=actor_type)]
 
 
 @app.get("/actors/me", response_model=ActorResponse)
@@ -184,7 +196,7 @@ async def get_self(request: Request, db: Session = Depends(get_db)):
     actor = crud.get_actor(db, actor_id) if actor_id else None
     if not actor:
         raise HTTPException(status_code=404, detail="Self actor not seeded")
-    return actor
+    return _actor_response(actor)
 
 
 @app.get("/actors/{actor_id}", response_model=ActorResponse)
@@ -193,7 +205,7 @@ async def get_actor(request: Request, actor_id: int, db: Session = Depends(get_d
     actor = crud.get_actor(db, actor_id)
     if not actor:
         raise HTTPException(status_code=404, detail="Actor not found")
-    return actor
+    return _actor_response(actor)
 
 
 # ========== Agent Definition Endpoints ==========

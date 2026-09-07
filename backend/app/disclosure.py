@@ -41,8 +41,9 @@ from sqlalchemy.orm import Session as DBSession
 
 from app import models, safe_envelope
 
-#: Bytes of randomness in an opaque identifier. Kept in step with migration 012.
-OPAQUE_ID_BYTES = 12
+#: Bytes of randomness in an opaque identifier. Defined on the models, which
+#: default every opaque_id column to one, and mirrored by migration 012.
+OPAQUE_ID_BYTES = models.OPAQUE_ID_BYTES
 
 #: Schemes a stored link may use. Anything else - file:, javascript:, ssh: -
 #: either reaches outside the browser's trust model or names a local path.
@@ -65,9 +66,10 @@ def new_opaque_id() -> str:
 def ensure_opaque_id(db: DBSession, row) -> str:
     """The row's opaque id, minting one if it has none.
 
-    Migration 012 backfills every existing row, so this only fires for a row
-    created outside the app (the SQLite test schema, built from the models
-    rather than the migrations) or by an older writer.
+    New rows get one from the column default and migration 012 backfilled the
+    old ones, so this is the belt to that pair of braces: a row inserted by raw
+    SQL, or one built in a test before the default applied, still gets an id
+    rather than serialising as ``null``.
     """
     if not row.opaque_id:
         row.opaque_id = new_opaque_id()
@@ -231,6 +233,25 @@ HOLDER_SAFE_FIELDS = ("session_id", "actor_ref", "workspace_ref", "focus_code", 
 INBOX_FIELDS = ("relay_id", "kind", "code", "subject", "body", "in_reply_to_id", "created_at", "from", "acked")
 INBOX_SAFE_FIELDS = ("relay_id", "kind", "code", "in_reply_to_id", "created_at", "from", "acked")
 
+OPEN_RELAY_FIELDS = (
+    "relay_id",
+    "kind",
+    "code",
+    "subject",
+    "to_repo",
+    "to_actor_id",
+    "to_workspace_id",
+    "from_actor",
+    "from_actor_id",
+    "created_at",
+)
+OPEN_RELAY_SAFE_FIELDS = ("relay_id", "kind", "code", "to_actor_id", "to_workspace_id", "from_actor_id", "created_at")
+
+BOARD_CLAIM_FIELDS = (*(), "holder")  # claim_view's fields plus a holder; asserted as a superset in tests
+
+GUARD_CALLER_FIELDS = ("host", "clone_path", "repo", "registered")
+GUARD_CALLER_SAFE_FIELDS = ("workspace_ref", "repo", "registered")
+
 CONFLICT_FIELDS = (
     "claim_id",
     "session_id",
@@ -270,6 +291,20 @@ RELAY_SAFE_FIELDS = (
 )
 
 
+def _ref(row) -> str | None:
+    """A row's opaque reference, minted in memory if the row somehow lacks one.
+
+    Returning ``None`` here would quietly turn the pseudonym scheme off for
+    that row, which is the failure mode hardest to notice: every response
+    still renders, and every reference is null.
+    """
+    if row is None:
+        return None
+    if not row.opaque_id:
+        row.opaque_id = new_opaque_id()
+    return row.opaque_id
+
+
 def _repo(value: str | None) -> str | None:
     """A repository slug is a public identifier; disclose it under that policy only."""
     if not safe_mode() or public_identifiers_allowed():
@@ -285,7 +320,7 @@ def actor_view(actor: models.Actor | None) -> dict | None:
         return None
     if not safe_mode():
         return {"id": actor.id, "type": str(actor.type), "name": actor.name}
-    return {"id": actor.id, "type": str(actor.type), "actor_ref": actor.opaque_id}
+    return {"id": actor.id, "type": str(actor.type), "actor_ref": _ref(actor)}
 
 
 def workspace_view(workspace: models.Workspace | None) -> dict | None:
@@ -300,7 +335,7 @@ def workspace_view(workspace: models.Workspace | None) -> dict | None:
             "git_dir": workspace.git_dir,
             "label": workspace.label,
         }
-    return {"id": workspace.id, "workspace_ref": workspace.opaque_id, "repo": _repo(workspace.repo)}
+    return {"id": workspace.id, "workspace_ref": _ref(workspace), "repo": _repo(workspace.repo)}
 
 
 def session_view(session: models.Session) -> dict:
@@ -387,7 +422,7 @@ def board_session_view(session: models.Session, *, stale: bool) -> dict:
     if safe_mode():
         return {
             **common,
-            "actor_ref": session.actor.opaque_id if session.actor else None,
+            "actor_ref": _ref(session.actor),
             "repo": _repo(session.workspace.repo if session.workspace else None),
         }
     workspace = session.workspace
@@ -420,8 +455,8 @@ def holder_view(session: models.Session | None, *, stale: bool) -> dict | None:
     if safe_mode():
         return {
             **common,
-            "actor_ref": session.actor.opaque_id if session.actor else None,
-            "workspace_ref": session.workspace.opaque_id if session.workspace else None,
+            "actor_ref": _ref(session.actor),
+            "workspace_ref": _ref(session.workspace),
         }
     workspace = session.workspace
     return {
@@ -452,8 +487,8 @@ def inbox_entry_view(relay: models.Relay, receipt: models.RelayReceipt | None) -
             **common,
             "from": {
                 "session_id": relay.from_session_id,
-                "actor_ref": relay.from_actor.opaque_id if relay.from_actor else None,
-                "workspace_ref": sender_workspace.opaque_id if sender_workspace else None,
+                "actor_ref": _ref(relay.from_actor),
+                "workspace_ref": _ref(sender_workspace),
                 "repo": _repo(sender_workspace.repo if sender_workspace else None),
             },
         }
@@ -477,11 +512,48 @@ def board_claim_view(claim: models.Claim, *, holder: dict | None) -> dict:
 
 
 def open_relay_view(relay: models.Relay) -> dict:
-    """A board row for a relay nobody has acknowledged yet."""
-    view = relay_view(relay)
+    """A board row for a relay nobody has acknowledged yet.
+
+    Narrower than :func:`relay_view` on purpose. The board lists open relays
+    for *everyone*, not only for their addressee, so this row is read by peers
+    the message is not for - it may say that something is waiting, and who for,
+    but never what it says. (It carried `subject` before the coordination
+    layer had a shared policy; routing it through the full relay view would
+    have widened it to the body.)
+    """
+    common = {
+        "relay_id": relay.id,
+        "kind": str(relay.kind),
+        "code": str(relay.code) if relay.code else None,
+        "to_actor_id": relay.to_actor_id,
+        "to_workspace_id": relay.to_workspace_id,
+        "from_actor_id": relay.from_actor_id,
+        "created_at": relay.created_at.isoformat(),
+    }
     if safe_mode():
-        return view
-    return {**view, "from_actor": relay.from_actor.name if relay.from_actor else None}
+        return common
+    return {
+        **common,
+        "subject": relay.subject,
+        "to_repo": relay.to_repo,
+        "from_actor": relay.from_actor.name if relay.from_actor else None,
+    }
+
+
+def guard_caller_view(*, host: str, clone_path: str, repo: str | None, workspace: models.Workspace | None) -> dict:
+    """Who asked the git guard, echoed back.
+
+    The wrapper sends its own host and path, so echoing them tells the caller
+    nothing it did not already know - but the response is a record like any
+    other, and in safe mode it says which checkout asked without describing it.
+    """
+    if safe_mode():
+        return {
+            "workspace_ref": _ref(workspace),
+            "repo": _repo(repo),
+            "registered": workspace is not None,
+        }
+    return {"host": host, "clone_path": clone_path, "repo": repo, "registered": workspace is not None}
 
 
 def conflict_view(

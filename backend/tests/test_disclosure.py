@@ -220,6 +220,20 @@ def test_the_safe_board_views_emit_exactly_their_allowlists(db, board, safe):
     snapshot = coordination.board(db)
     assert set(snapshot["sessions"][0]) == set(disclosure.BOARD_SESSION_SAFE_FIELDS)
     assert set(snapshot["claims"][0]["holder"]) == set(disclosure.HOLDER_SAFE_FIELDS)
+    assert set(snapshot["claims"][0]) == set(disclosure.CLAIM_SAFE_FIELDS) | {"holder"}
+    assert set(snapshot["open_relays"][0]) == set(disclosure.OPEN_RELAY_SAFE_FIELDS)
+
+
+def test_the_board_lists_open_relays_to_everyone_so_it_never_carries_their_words(db, board, full_text):
+    """`board()` returns unacked relays regardless of addressee - so this row is
+    read by peers the message is not for, in either mode."""
+    from app import coordination
+
+    row = coordination.board(db)["open_relays"][0]
+
+    assert set(row) == set(disclosure.OPEN_RELAY_FIELDS)
+    assert "body" not in row
+    assert BODY not in _rendered(row)
 
 
 def test_an_inbox_is_clean_in_safe_mode(db, board, safe):
@@ -310,11 +324,32 @@ def test_an_opaque_id_is_stable_and_unguessable(db, board):
     assert {disclosure.new_opaque_id() for _ in range(50)}.__len__() == 50
 
 
-def test_a_row_without_one_gets_one_on_demand(db, self_actor):
-    """Migration 012 backfills; this covers a row built from the models instead."""
-    assert self_actor.opaque_id is None
+def test_every_new_row_gets_one_without_being_asked(db, self_actor):
+    """The column default: a row cannot exist without a reference to serialise."""
+    assert self_actor.opaque_id
+    workspace = db.query(models.Workspace).first()
+    if workspace is not None:
+        assert workspace.opaque_id
+
+
+def test_a_row_that_somehow_has_none_still_serialises_a_reference(db, self_actor, safe):
+    """Belt to the default's braces: a row inserted by raw SQL must not render as null."""
+    self_actor.opaque_id = None
+    db.commit()
+
+    assert disclosure.actor_view(self_actor)["actor_ref"] is not None
     minted = disclosure.ensure_opaque_id(db, self_actor)
     assert minted and disclosure.ensure_opaque_id(db, self_actor) == minted
+
+
+def test_the_board_never_renders_a_null_reference(db, board, safe):
+    """The failure mode that renders fine and pseudonymises nothing."""
+    from app import coordination
+
+    snapshot = coordination.board(db)
+    assert snapshot["sessions"][0]["actor_ref"]
+    holder = snapshot["claims"][0]["holder"]
+    assert holder["actor_ref"] and holder["workspace_ref"]
 
 
 # ------------------------------------------------------------ config secrets
@@ -380,3 +415,65 @@ def test_a_plain_https_url_is_kept(db):
     db.add(link)
     db.commit()
     assert link.url == "https://github.com/AxonRelay/core/issues/26"
+
+
+# --------------------------------------- the two surfaces cannot disagree
+
+
+def test_rest_describes_an_actor_the_way_mcp_does(client, db, board, safe):
+    """A safe-mode ref is only a pseudonym if the REST side cannot undo it.
+
+    The board hands out `actor_ref` beside `actor_id`; without this, one call
+    to /actors/{id} with that id turns the reference back into a name.
+    """
+    actor = board["actor"]
+
+    listed = client.get("/actors").json()
+    one = client.get(f"/actors/{actor.id}").json()
+    me = client.get("/actors/me").json()
+
+    for payload in (*listed, one, me):
+        assert payload.get("name") is None
+        assert payload["actor_ref"]
+    assert one["actor_ref"] == disclosure.actor_view(actor)["actor_ref"]
+    assert "writer-bot" not in _rendered([listed, one, me])
+
+
+def test_rest_still_names_actors_in_full_text_mode(client, db, board, full_text):
+    one = client.get(f"/actors/{board['actor'].id}").json()
+    assert one["name"] == "writer-bot"
+    assert one.get("actor_ref") is None
+
+
+def test_the_git_guard_response_follows_the_policy(client, db, board, safe):
+    """The endpoint `tools/gitsafe` polls; it echoes the caller and names holders."""
+    from app import coordination
+
+    coordination.claim_resource(
+        db, session_id=board["session"].id, resource=models.ClaimResourceEnum.STASH, reason=REASON
+    )
+    result = coordination.guard_unregistered_caller(
+        db, host=HOST, clone_path=CLONE, resource=models.ClaimResourceEnum.STASH
+    )
+
+    assert result["allowed"] is False
+    assert set(result["caller"]) == set(disclosure.GUARD_CALLER_SAFE_FIELDS)
+    assert set(result["conflicts"][0]) == set(disclosure.CONFLICT_SAFE_FIELDS)
+    rendered = _rendered(result)
+    for value in RAW_VALUES:
+        assert value not in rendered, f"the git guard leaked {value!r}"
+
+
+def test_the_git_guard_is_unchanged_in_full_text_mode(db, board, full_text):
+    from app import coordination
+
+    coordination.claim_resource(
+        db, session_id=board["session"].id, resource=models.ClaimResourceEnum.STASH, reason=REASON
+    )
+    result = coordination.guard_unregistered_caller(
+        db, host=HOST, clone_path=CLONE, resource=models.ClaimResourceEnum.STASH
+    )
+
+    assert set(result["caller"]) == set(disclosure.GUARD_CALLER_FIELDS)
+    assert result["caller"]["host"] == HOST
+    assert result["conflicts"][0]["reason"] == REASON
