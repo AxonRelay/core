@@ -242,6 +242,16 @@ class Approval(Base):
     artifact_commitment_algorithm = Column(String(32))
     producer_actor_id = Column(Integer)  # not a FK, same reason as Draft
 
+    # Retry de-duplication (migration 013). A caller that can re-send the same
+    # decision - the 2026-07-28 multi-round tools/call replays its whole
+    # request, `request_state` included - names the decision once here, and the
+    # unique index makes a second append impossible rather than unlikely.
+    # Deliberately NOT inside the hash: it identifies the *request*, not the
+    # attested event, so adding it needs no new hash_version.
+    decision_key = Column(String(64))
+
+    __table_args__ = (UniqueConstraint("task_id", "decision_key", name="uq_approval_decision_key"),)
+
     task = relationship("Task", back_populates="approvals")
     reviewer = relationship("Actor", back_populates="approvals", foreign_keys=[reviewer_actor_id])
 

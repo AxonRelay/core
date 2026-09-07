@@ -400,3 +400,94 @@ def test_mcp_decision_tools_accept_a_decision_target():
     for name in ("approve_task", "reject_task"):
         props = tools[name].input_schema["properties"]
         assert {"artifact_version", "expected_commitment"} <= set(props), name
+
+
+# ------------------------------------------------- one decision, one entry
+
+
+def test_a_decision_key_makes_the_write_idempotent(db, self_actor):
+    """The same key twice is the same decision, not a second one (migration 013).
+
+    The interactive path can be replayed by the transport - a 2026-07-28 answer
+    round re-sends the whole `tools/call` - so the ledger, not the caller, is
+    where "already decided" has to be settled.
+    """
+    task, draft = _task_with_draft(db)
+    first = crud.record_approval(
+        db, task.id, self_actor.id, "approved", comment="ok", decision_key="k1", artifact_version=draft.version
+    )
+    again = crud.record_approval(
+        db, task.id, self_actor.id, "approved", comment="ok", decision_key="k1", artifact_version=draft.version
+    )
+    assert again.id == first.id
+    assert again.entry_hash == first.entry_hash
+    assert [a.id for a in crud.get_approvals(db, task.id)] == [first.id]
+
+
+def test_a_replayed_key_does_not_append_the_edit_either(db, self_actor):
+    """The draft version an edit would create is inside the idempotent region."""
+    task, draft = _task_with_draft(db)
+    crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1", modified_draft="edited")
+    crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1", modified_draft="edited")
+    assert [d.version for d in crud.get_drafts(db, task.id)] == [1, 2]
+    assert len(crud.get_approvals(db, task.id)) == 1
+
+
+def test_two_distinct_decisions_are_both_recorded(db, self_actor):
+    """Idempotency must not swallow a genuine second decision on the same task."""
+    task, draft = _task_with_draft(db)
+    crud.record_approval(db, task.id, self_actor.id, "rejected", decision_key="k1")
+    second = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k2")
+    approvals = crud.get_approvals(db, task.id)
+    assert [a.action for a in approvals] == ["rejected", "approved"]
+    assert second.prev_hash == approvals[0].entry_hash
+
+
+def test_unkeyed_decisions_do_not_collide_with_each_other(db, self_actor):
+    """NULL keys are distinct in the index, so the old callers are unaffected."""
+    task, draft = _task_with_draft(db)
+    crud.record_approval(db, task.id, self_actor.id, "rejected")
+    crud.record_approval(db, task.id, self_actor.id, "rejected")
+    assert len(crud.get_approvals(db, task.id)) == 2
+    assert all(a.decision_key is None for a in crud.get_approvals(db, task.id))
+
+
+def test_the_unique_index_is_the_backstop_for_a_race(db, self_actor):
+    """Two writers past the lookup must still not both land."""
+    task, draft = _task_with_draft(db)
+    recorded = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1")
+    duplicate = models.Approval(
+        task_id=task.id,
+        reviewer_actor_id=self_actor.id,
+        action="approved",
+        created_at=datetime.utcnow(),
+        decision_key="k1",
+    )
+    db.add(duplicate)
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+    assert [a.id for a in crud.get_approvals(db, task.id)] == [recorded.id]
+
+
+def test_the_decision_key_is_outside_the_hash(db, self_actor):
+    """It names the request, not the attested event, so it must not move the chain."""
+    task, draft = _task_with_draft(db)
+    keyed = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1")
+    expected = ledger.compute_entry_hash(
+        None,
+        task_id=task.id,
+        reviewer_actor_id=self_actor.id,
+        action="approved",
+        comment=None,
+        created_at=keyed.created_at,
+        artifact=ledger.ArtifactBinding(
+            ref=ledger.artifact_ref(task.id, draft.version),
+            version=draft.version,
+            commitment=draft.commitment,
+            commitment_algorithm=draft.commitment_algorithm,
+            producer_actor_id=draft.producer_actor_id,
+        ),
+    )
+    assert keyed.entry_hash == expected
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
