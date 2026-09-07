@@ -110,9 +110,15 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 - `AXONRELAY_REQUEST_STATE_KEY`（32 バイト以上）を設定すると、Streamable HTTP の
   複数ワーカーと再起動をまたいで再開できる。弱い鍵は起動時に名指しで拒否される
 - TTL は 15 分
+- ハンドルは発行した呼び出し元（提示された credential）に束縛される。stdio と
+  無提示の HTTP では無束縛で、これは loopback 前提と同じ
 - 同じラウンドの再送は台帳側で吸収される（migration 013）。承認も、編集が作る
-  はずだった draft 版も二重には入らない。再送の応答は 1 回目と同じ payload に
-  `replayed: true` が付いたもの
+  はずだった draft 版も二重には入らない。キーには reviewer も含まれるので、
+  別の承認権者が同じ判断に至っても別のエントリになる
+- 判断が通って task が承認待ちを離れたあとの再送は `stale_decision`（1 回目の判断は
+  立っている。文面もそう言う）。まだ承認待ちなら resume をやり直して
+  `replayed: true` を返す——台帳に行があることは graph が判断を受け取った証拠では
+  ないため
 
 ### 呼び出し元 identity と scope（任意）
 
