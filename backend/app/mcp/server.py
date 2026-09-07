@@ -609,6 +609,7 @@ def check_conflicts(repo: str, paths: list[str], session_id: int | None = None, 
     without a wildcard covers everything beneath it ("backend/app" covers
     "backend/app/crud.py").
     """
+    _free_text_surface()
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         conflicts = coordination.find_conflicts(
@@ -889,14 +890,12 @@ def ingest_safe_envelope(envelope: dict[str, Any]) -> dict:
 @mcp.tool()
 def list_safe_events(limit: int = 100, action: str | None = None) -> list[dict]:
     """Stored Safe Envelopes, newest first (optionally one action)."""
-    action_enum = None
-    if action:
-        try:
-            action_enum = models.SafeActionEnum(action)
-        except ValueError:
-            raise ToolError("Invalid action") from None
     with _session() as db:
-        return [safe_envelope.event_to_dict(e) for e in safe_envelope.list_events(db, limit=limit, action=action_enum)]
+        try:
+            events = safe_envelope.list_events(db, limit=limit, action=action)
+        except safe_envelope.EnvelopeRejected as e:
+            raise ToolError(str(e)) from None
+        return [safe_envelope.event_to_dict(e) for e in events]
 
 
 def main() -> None:

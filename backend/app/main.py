@@ -612,13 +612,11 @@ async def list_envelopes_endpoint(
     request: Request, limit: int = 100, action: str | None = None, db: Session = Depends(get_db)
 ):
     """Stored Safe Envelopes, newest first. Every field was allowlisted on the way in."""
-    action_enum = None
-    if action:
-        try:
-            action_enum = models.SafeActionEnum(action)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid action") from None
-    return [safe_envelope.event_to_dict(e) for e in safe_envelope.list_events(db, limit=limit, action=action_enum)]
+    try:
+        events = safe_envelope.list_events(db, limit=limit, action=action)
+    except safe_envelope.EnvelopeRejected as e:
+        raise HTTPException(status_code=400, detail={"reason": e.reason, "fields": e.fields}) from None
+    return [safe_envelope.event_to_dict(e) for e in events]
 
 
 # ========== Coordination Board (read-only; writes go through MCP) ==========
@@ -688,7 +686,7 @@ async def coordination_git_guard_endpoint(
     try:
         resolved = models.ClaimResourceEnum(resource)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Unknown resource '{resource}'") from e
+        raise HTTPException(status_code=400, detail="Unknown resource") from e
 
     if session_id is not None:
         try:

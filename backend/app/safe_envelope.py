@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
@@ -56,9 +57,10 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import models
+from app import ledger, models
 
 logger = logging.getLogger("axonrelay.safe_envelope")
 
@@ -66,10 +68,8 @@ SAFE_MODE_ENV = "AXONRELAY_SAFE_MODE"
 PUBLIC_IDENTIFIERS_ENV = "AXONRELAY_SAFE_PUBLIC_IDENTIFIERS"
 
 SCHEMA_VERSION = 1
-#: Only commitment algorithm the envelope admits today. Same label as
-#: app.ledger.COMMITMENT_ALGORITHM so a draft commitment and an envelope
-#: commitment are comparable.
-COMMITMENT_ALGORITHMS = ("sha256-utf8-v1",)
+#: The envelope admits exactly the algorithm the ledger records for drafts
+#: (app.ledger.COMMITMENT_ALGORITHM), so the two commitments are comparable.
 
 #: Message every refused free-text surface returns. Fixed text: it must never
 #: interpolate anything the caller sent.
@@ -109,10 +109,11 @@ def refuse_free_text_if_safe_mode() -> None:
 
 # An opaque identifier: URL-safe token, long enough not to be a word, and with
 # none of the characters a path, URL, e-mail or repository slug needs.
-OpaqueId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{16,128}$")]
+OPAQUE_ID_PATTERN = r"^[A-Za-z0-9_-]{16,128}$"
 # A public identifier: an `owner` or `owner/repo` slug. Admitted only under policy.
-PublicId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._-]{1,100}(/[A-Za-z0-9._-]{1,100})?$")]
-Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+PUBLIC_ID_PATTERN = r"^[A-Za-z0-9._-]{1,100}(/[A-Za-z0-9._-]{1,100})?$"
+OpaqueId = Annotated[str, StringConstraints(pattern=OPAQUE_ID_PATTERN)]
+Sha256Hex = Annotated[str, StringConstraints(pattern=ledger.SHA256_HEX_PATTERN)]
 PolicyVersion = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._-]{1,32}$")]
 # A detached signature over the envelope, produced by the source. Opaque to
 # the core (it is stored and returned, never verified here); bounded base64url.
@@ -136,7 +137,13 @@ class SafeEnvelope(BaseModel):
 
     event_id: OpaqueId = Field(description="Producer-assigned, globally unique. Re-sending the same id is idempotent.")
     actor_id: OpaqueId = Field(description="Opaque identifier of the acting agent or person.")
-    repository_id: OpaqueId | PublicId = Field(description="Opaque token, or a public slug under the public policy.")
+    repository_id: str = Field(
+        max_length=201,
+        description=(
+            "Under the opaque policy: an opaque token (same shape as event_id). Under the public policy: "
+            "an `owner` or `owner/repo` slug."
+        ),
+    )
     workspace_id: OpaqueId | None = Field(default=None, description="Opaque identifier of the checkout, if any.")
     session_id: OpaqueId | None = Field(default=None, description="Opaque identifier of the producer's session.")
 
@@ -148,7 +155,9 @@ class SafeEnvelope(BaseModel):
     artifact_commitment: Sha256Hex | None = Field(
         default=None, description="Source-produced digest of the artifact. The core never sees the bytes."
     )
-    artifact_commitment_algorithm: Literal["sha256-utf8-v1"] | None = None
+    artifact_commitment_algorithm: str | None = Field(
+        default=None, max_length=32, description=f"Only '{ledger.COMMITMENT_ALGORITHM}' is accepted."
+    )
 
     occurred_at: datetime = Field(description="When the event happened at the source. Timezone-aware.")
     producer_signature: Signature | None = None
@@ -158,8 +167,20 @@ class SafeEnvelope(BaseModel):
     @field_validator("repository_id")
     @classmethod
     def _repository_id_matches_policy(cls, value: str, info: ValidationInfo) -> str:
-        if info.data.get("identifier_policy", "opaque") == "opaque" and "/" in value:
-            raise ValueError("must be an opaque identifier under the opaque identifier policy")
+        # identifier_policy is declared before this field, so it is in info.data
+        # (or absent when it failed its own validation, in which case the
+        # strict shape applies).
+        policy = info.data.get("identifier_policy", "opaque")
+        pattern = PUBLIC_ID_PATTERN if policy == "public" else OPAQUE_ID_PATTERN
+        if not re.fullmatch(pattern, value):
+            raise ValueError(f"must match the {policy} identifier shape")
+        return value
+
+    @field_validator("artifact_commitment_algorithm")
+    @classmethod
+    def _known_algorithm(cls, value: str | None) -> str | None:
+        if value is not None and value != ledger.COMMITMENT_ALGORITHM:
+            raise ValueError("unknown commitment algorithm")
         return value
 
     @field_validator("occurred_at")
@@ -202,10 +223,15 @@ class EnvelopeRejected(ValueError):
 
 
 def _field_names(error: ValidationError) -> list[str]:
+    """Top-level field names only: the envelope is flat, and pydantic appends
+    union-member or validator tags to ``loc`` that are not field names."""
     names: list[str] = []
     for item in error.errors(include_input=False, include_url=False, include_context=False):
-        loc = ".".join(str(part) for part in item.get("loc", ()) if not isinstance(part, int))
-        names.append(loc or "(envelope)")
+        loc = item.get("loc", ())
+        # The first string in loc is the field (declared or unknown-and-
+        # forbidden); later parts are pydantic's union / validator tags.
+        first = next((str(part) for part in loc if isinstance(part, str)), "")
+        names.append(first or "(envelope)")
     return sorted(set(names))
 
 
@@ -238,7 +264,7 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
     endpoint; neither adds logic of its own.
     """
     envelope = validate_envelope(payload)
-    existing = db.query(models.SafeEvent).filter(models.SafeEvent.event_id == envelope.event_id).first()
+    existing = _find_existing(db, envelope.event_id)
     if existing is not None:
         return existing, False
 
@@ -262,17 +288,36 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
         producer_signature=envelope.producer_signature,
     )
     db.add(event)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two sends of one event_id raced past the lookup; the unique
+        # constraint decided. The loser returns the winner's row, so the
+        # contract "re-sending is idempotent" holds under concurrency too.
+        db.rollback()
+        existing = _find_existing(db, envelope.event_id)
+        if existing is None:  # pragma: no cover - the constraint that fired is on event_id
+            raise
+        return existing, False
     db.refresh(event)
     logger.info("safe_envelope stored action=%s outcome=%s", event.action.value, event.outcome.value)
     return event, True
 
 
+def _find_existing(db: Session, event_id: str) -> models.SafeEvent | None:
+    return db.query(models.SafeEvent).filter(models.SafeEvent.event_id == event_id).first()
+
+
 def list_events(
-    db: Session, *, limit: int = 100, action: models.SafeActionEnum | None = None
+    db: Session, *, limit: int = 100, action: str | models.SafeActionEnum | None = None
 ) -> list[models.SafeEvent]:
+    """Stored events, newest first. ``action`` may be the enum or its value; an unknown value is rejected by name."""
     query = db.query(models.SafeEvent)
-    if action is not None:
+    if action:
+        try:
+            action = models.SafeActionEnum(action)
+        except ValueError:
+            raise EnvelopeRejected(["action"], "unknown action") from None
         query = query.filter(models.SafeEvent.action == action)
     return query.order_by(models.SafeEvent.id.desc()).limit(min(max(limit, 1), 1000)).all()
 
@@ -295,7 +340,8 @@ def event_to_dict(event: models.SafeEvent) -> dict[str, Any]:
         "artifact_version": event.artifact_version,
         "artifact_commitment": event.artifact_commitment,
         "artifact_commitment_algorithm": event.artifact_commitment_algorithm,
-        "occurred_at": event.occurred_at.isoformat() + "Z",
-        "received_at": event.received_at.isoformat() + "Z",
+        # Naive UTC, like every other serializer in this codebase.
+        "occurred_at": event.occurred_at.isoformat(),
+        "received_at": event.received_at.isoformat(),
         "producer_signature": event.producer_signature,
     }
