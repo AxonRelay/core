@@ -29,7 +29,7 @@ from typing import Any
 from sqlalchemy import or_
 from sqlalchemy.orm import Session as DBSession
 
-from app import models, territory
+from app import disclosure, models, territory
 
 #: A session that has not sent a heartbeat within this window is reported as
 #: stale. Its claims stay live until they expire - staleness is a hint to the
@@ -186,6 +186,7 @@ def register_session(
     actor_type: models.ActorTypeEnum = models.ActorTypeEnum.AI,
     branch: str | None = None,
     focus: str | None = None,
+    focus_code: models.FocusCodeEnum | None = None,
     label: str | None = None,
     git_dir: str | None = None,
 ) -> models.Session:
@@ -215,12 +216,15 @@ def register_session(
             session.branch = branch
         if focus is not None:
             session.focus = focus
+        if focus_code is not None:
+            session.focus_code = focus_code
     else:
         session = models.Session(
             actor_id=actor.id,
             workspace_id=workspace.id,
             branch=branch,
             focus=focus,
+            focus_code=focus_code,
             status=models.SessionStatusEnum.ACTIVE,
             started_at=now,
             last_heartbeat_at=now,
@@ -237,6 +241,7 @@ def heartbeat_session(
     session_id: int,
     *,
     focus: str | None = None,
+    focus_code: models.FocusCodeEnum | None = None,
     branch: str | None = None,
 ) -> models.Session | None:
     """Refresh a session's liveness and, optionally, what it is working on."""
@@ -246,6 +251,8 @@ def heartbeat_session(
     session.last_heartbeat_at = datetime.utcnow()
     if focus is not None:
         session.focus = focus
+    if focus_code is not None:
+        session.focus_code = focus_code
     if branch is not None:
         session.branch = branch
     db.commit()
@@ -354,35 +361,24 @@ def find_conflicts(
         pairs = territory.any_overlap(paths, list(claim.paths or []))
         if pairs:
             conflicts.append(
-                {
-                    "claim_id": claim.id,
-                    "session_id": claim.session_id,
-                    "mode": str(claim.mode),
-                    "paths": list(claim.paths or []),
-                    "overlapping_paths": sorted({theirs for _, theirs in pairs}),
-                    "reason": claim.reason,
-                    "expires_at": claim.expires_at.isoformat(),
-                    "holder": describe_holder(claim.session),
-                }
+                disclosure.conflict_view(
+                    claim,
+                    holder=describe_holder(claim.session),
+                    overlapping_paths=sorted({theirs for _, theirs in pairs}),
+                )
             )
     return conflicts
 
 
 def describe_holder(session: models.Session | None) -> dict[str, Any] | None:
-    """Who holds a claim, in the terms a peer needs to go find them."""
+    """Who holds a claim, in the terms a peer needs to go find them.
+
+    What "the terms a peer needs" means depends on the mode, so the projection
+    lives in app/disclosure.py with the rest of the boundary policy.
+    """
     if not session:
         return None
-    workspace = session.workspace
-    return {
-        "session_id": session.id,
-        "actor": session.actor.name if session.actor else None,
-        "host": workspace.host if workspace else None,
-        "clone_path": workspace.clone_path if workspace else None,
-        "git_dir": workspace.git_dir if workspace else None,
-        "branch": session.branch,
-        "focus": session.focus,
-        "stale": is_stale(session),
-    }
+    return disclosure.holder_view(session, stale=is_stale(session))
 
 
 def claim_territory(
@@ -393,6 +389,7 @@ def claim_territory(
     repo: str | None = None,
     mode: models.ClaimModeEnum = models.ClaimModeEnum.EXCLUSIVE,
     reason: str | None = None,
+    reason_code: models.ClaimReasonCodeEnum | None = None,
     ttl_minutes: int = DEFAULT_CLAIM_TTL_MINUTES,
     force: bool = False,
 ) -> dict[str, Any]:
@@ -433,6 +430,7 @@ def claim_territory(
         paths=normalized,
         mode=mode,
         reason=reason,
+        reason_code=reason_code,
         status=models.ClaimStatusEnum.HELD,
         forced_over=[c["claim_id"] for c in conflicts] or None,
         created_at=now,
@@ -554,17 +552,7 @@ def find_resource_conflicts(
         other = claim.session.workspace if claim.session else None
         if not _resource_domains_overlap(resource, session.workspace, other):
             continue
-        conflicts.append(
-            {
-                "claim_id": claim.id,
-                "session_id": claim.session_id,
-                "resource": str(claim.resource),
-                "mode": str(claim.mode),
-                "reason": claim.reason,
-                "expires_at": claim.expires_at.isoformat(),
-                "holder": describe_holder(claim.session),
-            }
-        )
+        conflicts.append(disclosure.conflict_view(claim, holder=describe_holder(claim.session)))
     return conflicts
 
 
@@ -574,6 +562,7 @@ def claim_resource(
     session_id: int,
     resource: models.ClaimResourceEnum,
     reason: str | None = None,
+    reason_code: models.ClaimReasonCodeEnum | None = None,
     ttl_minutes: int = DEFAULT_CLAIM_TTL_MINUTES,
     force: bool = False,
 ) -> dict[str, Any]:
@@ -608,6 +597,7 @@ def claim_resource(
         resource=resource,
         mode=models.ClaimModeEnum.EXCLUSIVE,
         reason=reason,
+        reason_code=reason_code,
         status=models.ClaimStatusEnum.HELD,
         forced_over=[c["claim_id"] for c in conflicts] or None,
         created_at=now,
@@ -800,6 +790,7 @@ def send_relay(
     *,
     subject: str,
     body: str | None = None,
+    code: models.RelayCodeEnum | None = None,
     from_session_id: int | None = None,
     to_actor_id: int | None = None,
     to_workspace_id: int | None = None,
@@ -829,6 +820,7 @@ def send_relay(
         kind=kind,
         subject=subject,
         body=body,
+        code=code,
         in_reply_to_id=in_reply_to_id,
         created_at=datetime.utcnow(),
     )
@@ -904,26 +896,17 @@ def read_inbox(
 
 def relay_to_inbox_entry(relay: models.Relay, receipt: models.RelayReceipt | None) -> dict[str, Any]:
     """One inbox row: the message plus this recipient's state on it."""
-    sender = relay.from_session
-    return {
-        "relay_id": relay.id,
-        "kind": str(relay.kind),
-        "subject": relay.subject,
-        "body": relay.body,
-        "in_reply_to_id": relay.in_reply_to_id,
-        "created_at": relay.created_at.isoformat(),
-        "from": {
-            "session_id": relay.from_session_id,
-            "actor": relay.from_actor.name if relay.from_actor else None,
-            "host": sender.workspace.host if sender and sender.workspace else None,
-            "repo": sender.workspace.repo if sender and sender.workspace else None,
-            "clone_path": sender.workspace.clone_path if sender and sender.workspace else None,
-        },
-        "acked": bool(receipt and receipt.acked_at),
-    }
+    return disclosure.inbox_entry_view(relay, receipt)
 
 
-def ack_relay(db: DBSession, *, relay_id: int, session_id: int, note: str | None = None) -> models.RelayReceipt:
+def ack_relay(
+    db: DBSession,
+    *,
+    relay_id: int,
+    session_id: int,
+    note: str | None = None,
+    ack_code: models.AckCodeEnum | None = None,
+) -> models.RelayReceipt:
     """Acknowledge a relay as this session, optionally with a reply note.
 
     Acking removes it from this session's inbox but leaves it in everyone
@@ -939,6 +922,8 @@ def ack_relay(db: DBSession, *, relay_id: int, session_id: int, note: str | None
         receipt = models.RelayReceipt(relay_id=relay_id, session_id=session_id, read_at=now)
         db.add(receipt)
     receipt.acked_at = now
+    if ack_code is not None:
+        receipt.ack_code = ack_code
     if note is not None:
         receipt.ack_note = note
     db.commit()
@@ -980,46 +965,7 @@ def board(db: DBSession, *, repo: str | None = None) -> dict[str, Any]:
     return {
         "generated_at": now.isoformat(),
         "repo": repo,
-        "sessions": [
-            {
-                "session_id": s.id,
-                "actor": s.actor.name if s.actor else None,
-                "actor_type": str(s.actor.type) if s.actor else None,
-                "host": s.workspace.host if s.workspace else None,
-                "repo": s.workspace.repo if s.workspace else None,
-                "clone_path": s.workspace.clone_path if s.workspace else None,
-                "branch": s.branch,
-                "focus": s.focus,
-                "stale": is_stale(s, now),
-                "last_heartbeat_at": s.last_heartbeat_at.isoformat(),
-            }
-            for s in sessions
-        ],
-        "claims": [
-            {
-                "claim_id": c.id,
-                "repo": c.repo,
-                "paths": list(c.paths or []),
-                "resource": str(c.resource) if c.resource else None,
-                "mode": str(c.mode),
-                "reason": c.reason,
-                "expires_at": c.expires_at.isoformat(),
-                "forced_over": c.forced_over,
-                "holder": describe_holder(c.session),
-            }
-            for c in claims
-        ],
-        "open_relays": [
-            {
-                "relay_id": r.id,
-                "kind": str(r.kind),
-                "subject": r.subject,
-                "to_repo": r.to_repo,
-                "to_actor_id": r.to_actor_id,
-                "to_workspace_id": r.to_workspace_id,
-                "from_actor": r.from_actor.name if r.from_actor else None,
-                "created_at": r.created_at.isoformat(),
-            }
-            for r in unacked
-        ],
+        "sessions": [disclosure.board_session_view(s, stale=is_stale(s, now)) for s in sessions],
+        "claims": [disclosure.board_claim_view(c, holder=describe_holder(c.session)) for c in claims],
+        "open_relays": [disclosure.open_relay_view(r) for r in unacked],
     }

@@ -16,7 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 
 from app.database import Base
 
@@ -82,6 +82,12 @@ class Actor(Base):
     id = Column(Integer, primary_key=True, index=True)
     type = Column(Enum(ActorTypeEnum), nullable=False, index=True)
     name = Column(String(255), nullable=False)
+    # Stable, unguessable stand-in for `name` at a shared boundary. A name is
+    # chosen by an operator and is arbitrary text - it routinely carries a
+    # person, a machine or a project - so it is not something a shared instance
+    # should hand back. Random rather than derived: a digest of a name a peer
+    # can guess is not opaque.
+    opaque_id = Column(String(32), unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     agent_definition = relationship("AgentDefinition", back_populates="actor", uselist=False)
@@ -105,6 +111,17 @@ class AgentDefinition(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     actor = relationship("Actor", back_populates="agent_definition")
+
+    @property
+    def config_keys(self) -> list[str] | None:
+        """The config's key names, never its values — it is where credentials go.
+
+        A property rather than a serializer detail so every response model that
+        reads this row from attributes gets the same answer (app/disclosure.py).
+        """
+        from app import disclosure  # local: disclosure imports models
+
+        return disclosure.config_keys(self.config)
 
 
 class TaskAssignment(Base):
@@ -238,6 +255,18 @@ class ExternalLink(Base):
 
     task = relationship("Task", back_populates="external_links")
 
+    @validates("url")
+    def _sanitize_url(self, _key: str, value: str | None) -> str | None:
+        """Refuse a URL that carries a credential, a query, a fragment or an odd scheme.
+
+        On the model rather than in a caller: this row is the one place the
+        schema invites a URL, and it has had no writer until now. Putting the
+        rule here means the first writer inherits it (app/disclosure.py).
+        """
+        from app import disclosure  # local: disclosure imports models
+
+        return disclosure.sanitize_url(value)
+
 
 # =============================================================================
 # Coordination layer (Phase 3) - Workspace / Session / Claim / Relay
@@ -316,6 +345,59 @@ class RelayKindEnum(enum.StrEnum):
     WARNING = "warning"
 
 
+class FocusCodeEnum(enum.StrEnum):
+    """What a session is doing, as a code rather than a sentence.
+
+    Free-form focus text is useful to a human reading the board and is exactly
+    the kind of thing that should not cross a shared boundary: it quotes file
+    names, ticket titles and sometimes the work itself. These cover what a peer
+    actually needs in order to decide whether to wait or work elsewhere.
+    """
+
+    EXPLORING = "exploring"
+    IMPLEMENTING = "implementing"
+    REVIEWING = "reviewing"
+    TESTING = "testing"
+    DEBUGGING = "debugging"
+    DOCUMENTING = "documenting"
+    RELEASING = "releasing"
+    BLOCKED = "blocked"
+    IDLE = "idle"
+
+
+class ClaimReasonCodeEnum(enum.StrEnum):
+    """Why a territory or resource claim was taken."""
+
+    EDITING = "editing"
+    REFACTORING = "refactoring"
+    RUNNING_TESTS = "running_tests"
+    MIGRATING = "migrating"
+    RELEASING = "releasing"
+    INVESTIGATING = "investigating"
+
+
+class RelayCodeEnum(enum.StrEnum):
+    """What a relay is asking for, without saying it in prose."""
+
+    HANDOFF_READY = "handoff_ready"
+    NEEDS_REVIEW = "needs_review"
+    BLOCKED_ON_YOU = "blocked_on_you"
+    CONFLICT_DETECTED = "conflict_detected"
+    RELEASE_REQUESTED = "release_requested"
+    HEADS_UP = "heads_up"
+    ANSWERED = "answered"
+
+
+class AckCodeEnum(enum.StrEnum):
+    """How a recipient answered a relay."""
+
+    ACKNOWLEDGED = "acknowledged"
+    DONE = "done"
+    DECLINED = "declined"
+    DEFERRED = "deferred"
+    NOT_APPLICABLE = "not_applicable"
+
+
 class SafeActionEnum(enum.StrEnum):
     """What a Safe Envelope reports happened. Closed set; free text has no slot."""
 
@@ -363,6 +445,11 @@ class Workspace(Base):
     git_dir = Column(String(1000), index=True)
 
     label = Column(String(255))
+    # The checkout's identity at a shared boundary. `host`, `clone_path` and
+    # `git_dir` name a machine and a filesystem; this names the same checkout
+    # without describing it, and stays the same across restarts so claim and
+    # relay history remains continuous.
+    opaque_id = Column(String(32), unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -386,6 +473,9 @@ class Session(Base):
 
     branch = Column(String(255))
     focus = Column(Text)
+    #: The disclosable form of `focus`. Set it and a shared boundary has
+    #: something to say about this session without quoting the prose.
+    focus_code = Column(Enum(FocusCodeEnum))
     status = Column(Enum(SessionStatusEnum), nullable=False, default=SessionStatusEnum.ACTIVE, index=True)
 
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -420,6 +510,7 @@ class Claim(Base):
 
     mode = Column(Enum(ClaimModeEnum), nullable=False, default=ClaimModeEnum.EXCLUSIVE)
     reason = Column(Text)
+    reason_code = Column(Enum(ClaimReasonCodeEnum))
     status = Column(Enum(ClaimStatusEnum), nullable=False, default=ClaimStatusEnum.HELD, index=True)
 
     # Set when the claim was granted over a live conflict via force=True. The
@@ -460,6 +551,7 @@ class Relay(Base):
     kind = Column(Enum(RelayKindEnum), nullable=False, default=RelayKindEnum.NOTE, index=True)
     subject = Column(String(500), nullable=False)
     body = Column(Text)
+    code = Column(Enum(RelayCodeEnum))
     in_reply_to_id = Column(Integer, ForeignKey("relays.id", ondelete="SET NULL"))
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -487,6 +579,7 @@ class RelayReceipt(Base):
     read_at = Column(DateTime)
     acked_at = Column(DateTime)
     ack_note = Column(Text)
+    ack_code = Column(Enum(AckCodeEnum))
 
     relay = relationship("Relay", back_populates="receipts")
     session = relationship("Session")
