@@ -27,6 +27,19 @@ So the rules are:
 - Change the Postgres password from the documented development default
   (`axonrelay_dev`) anywhere other than a laptop.
 
+**Per-caller identity (opt-in).** With `AXONRELAY_REQUIRE_AUTH=1` every HTTP
+caller - REST and the MCP Streamable HTTP transport - must present a credential
+issued by `python -m app.credentials issue`
+([ADR-011](docs/adr-011-caller-identity.md)). The credential names the Actor the
+server records for that caller's approvals, sessions and tasks, so a request
+parameter cannot claim somebody else's identity, and it carries scopes
+(`ledger:read`, `ledger:write`, `coordination:read`, `coordination:write`,
+`export:read`, `administration`) that every tool and every route is mapped to.
+Only the SHA-256 of a token is stored; tokens never appear in a log, an error or
+a response. Unset, the process behaves as before and every call runs as the
+operator. **stdio is always loopback-trusted**, with or without the flag: it has
+no request to carry a credential and the caller is a process you started.
+
 **Content-blind mode.** A shared instance can be run with
 `AXONRELAY_SAFE_MODE=1` ([ADR-010](docs/adr-010-safe-envelope.md)). Every
 surface that accepts free text then refuses with a fixed message, and the

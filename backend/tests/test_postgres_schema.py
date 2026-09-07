@@ -59,7 +59,7 @@ MODEL_ENUMS = [
     models.SafeOutcomeEnum,
 ]
 
-COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts", "safe_events"}
+COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts", "safe_events", "credentials"}
 
 
 def _expected_head() -> str:
@@ -193,6 +193,7 @@ class TestMigrationChain:
                 ).all()
             }
         assert "uq_drafts_task_version" in constraints
+
         assert {"ix_drafts_task_id", "ix_approvals_task_id"} <= indexes
         assert {
             "hash_version",
@@ -202,6 +203,29 @@ class TestMigrationChain:
             "artifact_commitment_algorithm",
             "producer_actor_id",
         } <= approval_columns
+
+    def test_a_credential_is_unique_by_digest_and_dies_with_its_actor(self, migrated_engine):
+        """Migration 011: the token digest is the lookup key, and a deleted Actor takes its credentials."""
+        with migrated_engine.connect() as conn:
+            uniques = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT conname FROM pg_constraint WHERE conrelid = 'credentials'::regclass AND contype = 'u'")
+                ).all()
+            }
+            cascade = conn.execute(
+                text("SELECT confdeltype FROM pg_constraint WHERE conrelid = 'credentials'::regclass AND contype = 'f'")
+            ).scalar()
+            columns = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_name = 'credentials'")
+                ).all()
+            }
+        assert "uq_credentials_token_hash" in uniques
+        assert cascade == "c"  # ON DELETE CASCADE
+        assert "token" not in columns  # only the digest is stored
+        assert "token_hash" in columns
 
 
 class TestEnumParity:
@@ -553,3 +577,73 @@ class TestArtifactBindingMigration:
             assert (after["artifact_bound"], after["unbound"]) == (1, 1)
         finally:
             session.close()
+
+
+class TestCredentialsOnPostgres:
+    """Authentication against the real engine: the digest lookup and the cascade."""
+
+    def test_a_credential_authenticates_and_a_revoked_one_does_not(self, pg_session):
+        from app import authz
+
+        actor = models.Actor(type=models.ActorTypeEnum.AI, name="pg-cred-actor")
+        pg_session.add(actor)
+        pg_session.commit()
+
+        token = authz.issue_token()
+        row = models.Credential(
+            actor_id=actor.id,
+            label="pg",
+            token_hash=authz.token_digest(token),
+            scopes=authz.format_scopes({authz.Scope.LEDGER_READ}),
+        )
+        pg_session.add(row)
+        pg_session.commit()
+
+        principal = authz.authenticate(pg_session, token)
+        assert principal is not None
+        assert principal.actor_id == actor.id
+        assert principal.scopes == {authz.Scope.LEDGER_READ}
+
+        row.revoked_at = datetime(2026, 9, 7, 0, 0, 0)
+        pg_session.commit()
+        assert authz.authenticate(pg_session, token) is None
+
+    def test_deleting_the_actor_deletes_its_credentials(self, pg_session):
+        from app import authz
+
+        actor = models.Actor(type=models.ActorTypeEnum.AI, name="pg-cred-cascade")
+        pg_session.add(actor)
+        pg_session.commit()
+        token = authz.issue_token()
+        pg_session.add(
+            models.Credential(
+                actor_id=actor.id,
+                label="pg-cascade",
+                token_hash=authz.token_digest(token),
+                scopes=authz.format_scopes({authz.Scope.LEDGER_READ}),
+            )
+        )
+        pg_session.commit()
+
+        pg_session.delete(actor)
+        pg_session.commit()
+
+        # The database enforces this, not the ORM: the module-scoped engine is
+        # shared, so the label is unique to this test.
+        assert pg_session.query(models.Credential).filter_by(label="pg-cascade").count() == 0
+        assert authz.authenticate(pg_session, token) is None
+
+    def test_two_credentials_cannot_share_a_digest(self, pg_session):
+        from sqlalchemy.exc import IntegrityError
+
+        from app import authz
+
+        actor = models.Actor(type=models.ActorTypeEnum.AI, name="pg-cred-dup")
+        pg_session.add(actor)
+        pg_session.commit()
+        digest = authz.token_digest(authz.issue_token())
+        for _ in range(2):
+            pg_session.add(models.Credential(actor_id=actor.id, label="dup", token_hash=digest, scopes=""))
+        with pytest.raises(IntegrityError):
+            pg_session.commit()
+        pg_session.rollback()

@@ -525,3 +525,34 @@ class SafeEvent(Base):
     occurred_at = Column(DateTime, nullable=False, index=True)
     received_at = Column(DateTime, nullable=False)
     producer_signature = Column(String(1024))
+
+
+class Credential(Base):
+    """An issued API credential: which Actor a caller is, and what it may do.
+
+    Only the SHA-256 of the token is stored (`token_hash`, unique so a lookup
+    is a single indexed hit and never a scan). The token itself exists once,
+    in the output of `python -m app.credentials issue`; nothing here can
+    recover it, and nothing logs it. See app/authz.py.
+
+    `actor_id` is a real FK with CASCADE: deleting an Actor must take its
+    credentials with it, or a deleted identity would keep authenticating.
+    That is the opposite of the ledger's rule (where a hashed reference must
+    never change), and deliberately so - this row is access control, not
+    evidence.
+    """
+
+    __tablename__ = "credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(255), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    #: Comma-separated Scope values; parsed by authz.parse_scopes, which drops
+    #: a name it does not know rather than guessing at it.
+    scopes = Column(String(255), nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_used_at = Column(DateTime)
+    revoked_at = Column(DateTime)
+
+    actor = relationship("Actor")

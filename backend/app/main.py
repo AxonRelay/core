@@ -18,7 +18,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from app import coordination, crud, langgraph_client, models, safe_envelope, service
+from app import authz, coordination, crud, langgraph_client, models, safe_envelope, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.ratelimit import client_key
@@ -47,7 +47,36 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AxonRelay API", lifespan=lifespan)
+async def _authorize(request: Request, db: Session = Depends(get_db)):
+    """Resolve the caller and check this route's scope (app/authz.py).
+
+    Registered as an application-wide dependency, so a route cannot be added
+    without a decision: its (method, path) must appear in `authz.ROUTE_SCOPES`
+    or `authz.PUBLIC_ROUTES`, and a structural test fails otherwise. The
+    principal is bound for the duration of the request so the surfaces that
+    record an Actor can read it without threading it through every call.
+
+    Async on purpose: FastAPI runs a *sync* generator dependency in a worker
+    thread, which gets its own copy of the context, so a ContextVar set there
+    would never reach the endpoint (and could not be reset afterwards).
+    """
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    key = (request.method, path)
+    if key in authz.PUBLIC_ROUTES:
+        yield None
+        return
+    if key not in authz.ROUTE_SCOPES:  # pragma: no cover - the structural test forbids it
+        raise HTTPException(status_code=500, detail="This route has no authorization decision")
+    principal = authz.resolve(db, authorization=request.headers.get("authorization"), transport_is_local=False)
+    scope = authz.ROUTE_SCOPES[key]
+    if scope is not None:
+        principal.require(scope)
+    with authz.bind(principal):
+        yield principal
+
+
+app = FastAPI(title="AxonRelay API", lifespan=lifespan, dependencies=[Depends(_authorize)])
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
@@ -78,6 +107,22 @@ async def _value_free_validation_error(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content={"detail": detail})
 
 
+@app.exception_handler(authz.Unauthenticated)
+async def _unauthenticated(request: Request, exc: authz.Unauthenticated) -> JSONResponse:
+    """401 naming what is missing, never what was presented or what is behind the door."""
+    return JSONResponse(
+        status_code=401,
+        content={"detail": str(exc)},
+        headers={"WWW-Authenticate": 'Bearer realm="axonrelay"'},
+    )
+
+
+@app.exception_handler(authz.Forbidden)
+async def _forbidden(request: Request, exc: authz.Forbidden) -> JSONResponse:
+    """403 naming the scope required. Nothing about the resource, which the caller may not know exists."""
+    return JSONResponse(status_code=403, content={"detail": str(exc), "required_scope": exc.scope.value})
+
+
 @app.exception_handler(safe_envelope.SafeModeRefused)
 async def _safe_mode_refused(request: Request, exc: safe_envelope.SafeModeRefused) -> JSONResponse:
     return JSONResponse(status_code=403, content={"detail": safe_envelope.SAFE_MODE_REFUSAL})
@@ -90,7 +135,12 @@ def _free_text_surface() -> None:
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "AxonRelay", "safe_mode": safe_envelope.safe_mode()}
+    return {
+        "status": "ok",
+        "service": "AxonRelay",
+        "safe_mode": safe_envelope.safe_mode(),
+        "auth_required": authz.require_auth(),
+    }
 
 
 # ========== Actor Endpoints ==========
@@ -108,22 +158,29 @@ async def list_actors(request: Request, type: str | None = None, db: Session = D
     return crud.get_actors(db, actor_type=actor_type)
 
 
+@app.get("/actors/me", response_model=ActorResponse)
+@limiter.limit("60/minute")
+async def get_self(request: Request, db: Session = Depends(get_db)):
+    """The Actor this caller is, decided server-side.
+
+    Under a credential that is the credential's Actor; otherwise (loopback,
+    or an instance that has not turned enforcement on) the operator's human
+    Actor. Never a value the request supplied - this is the endpoint a client
+    asks when it wants to know who the server thinks it is.
+    """
+    actor_id = authz.acting_actor_id(db)
+    actor = crud.get_actor(db, actor_id) if actor_id else None
+    if not actor:
+        raise HTTPException(status_code=404, detail="Self actor not seeded")
+    return actor
+
+
 @app.get("/actors/{actor_id}", response_model=ActorResponse)
 @limiter.limit("60/minute")
 async def get_actor(request: Request, actor_id: int, db: Session = Depends(get_db)):
     actor = crud.get_actor(db, actor_id)
     if not actor:
         raise HTTPException(status_code=404, detail="Actor not found")
-    return actor
-
-
-@app.get("/actors/me", response_model=ActorResponse)
-@limiter.limit("60/minute")
-async def get_self(request: Request, db: Session = Depends(get_db)):
-    """Get the single human actor representing the operator."""
-    actor = crud.get_self_actor(db)
-    if not actor:
-        raise HTTPException(status_code=404, detail="Self actor not seeded")
     return actor
 
 
@@ -244,8 +301,7 @@ async def create_task_endpoint(
     db: Session = Depends(get_db),
     _guard: None = Depends(_free_text_surface),
 ):
-    self_actor = crud.get_self_actor(db)
-    creator_actor_id = self_actor.id if self_actor else None
+    creator_actor_id = authz.acting_actor_id(db)
 
     try:
         thread_id = await langgraph_client.create_thread(
@@ -375,11 +431,11 @@ async def run_task_endpoint(
 async def list_pending_approvals_endpoint(
     request: Request, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)
 ):
-    """Unified pending approval inbox for the operator (single human actor)."""
-    self_actor = crud.get_self_actor(db)
-    if not self_actor:
+    """The caller's pending-approval inbox — the tasks assigned to *this* Actor to approve."""
+    actor_id = authz.acting_actor_id(db)
+    if not actor_id:
         return []
-    return crud.list_pending_approvals(db, actor_id=self_actor.id, skip=skip, limit=limit)
+    return crud.list_pending_approvals(db, actor_id=actor_id, skip=skip, limit=limit)
 
 
 # ========== Approve / Reject ==========
@@ -417,8 +473,9 @@ async def approve_task_endpoint(
     if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
         raise HTTPException(status_code=400, detail="Task is not waiting for approval")
 
-    self_actor = crud.get_self_actor(db)
-    reviewer_actor_id = self_actor.id if self_actor else None
+    # The reviewer is the authenticated caller (app/authz.py), so an approval
+    # cannot be attributed to somebody else by any request parameter.
+    reviewer_actor_id = authz.acting_actor_id(db)
 
     # The ledger entry (and, if the operator edited the draft, the new draft
     # version it binds to) is written before the graph resumes: the approval
@@ -467,8 +524,9 @@ async def reject_task_endpoint(
     if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
         raise HTTPException(status_code=400, detail="Task is not waiting for approval")
 
-    self_actor = crud.get_self_actor(db)
-    reviewer_actor_id = self_actor.id if self_actor else None
+    # The reviewer is the authenticated caller (app/authz.py), so an approval
+    # cannot be attributed to somebody else by any request parameter.
+    reviewer_actor_id = authz.acting_actor_id(db)
 
     comment_parts = [reject_data.comment, reject_data.reason]
     combined_comment = " | ".join(p for p in comment_parts if p) or None
