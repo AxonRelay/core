@@ -1,5 +1,12 @@
 # Phase 3 — Coordination Layer 仕様
 
+> **2026-09-07 更新（[ADR-012](./adr-012-metadata-minimization.md)）.** 本仕様が説明する
+> フィールド（`host` / `clone_path` / `git_dir` / `focus` / `reason` / `subject` / `body` /
+> `ack_note`）は、共有インスタンスのレスポンスでは開示ポリシーを通る。content-blind モード
+> （`AXONRELAY_SAFE_MODE`）では opaque ref・構造化コード・件数に置き換わる。保存されるものは
+> 変わらない——変わるのは境界を越えて出るものと、運用行がいつ失効するかである。
+
+
 > 作成: 2026-08-30 / Status: 実装済み (migration 006) / 前提: [delta-mvp-spec.md](./delta-mvp-spec.md)
 
 ---

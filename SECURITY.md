@@ -44,6 +44,20 @@ this repository already publishes. Unset, the process behaves as before and ever
 operator. **stdio is always loopback-trusted**, with or without the flag: it has
 no request to carry a credential and the caller is a process you started.
 
+**Metadata minimization.** In content-blind mode the coordination plane's
+*responses* are minimized too ([ADR-012](docs/adr-012-metadata-minimization.md)):
+opaque references instead of host names, absolute clone paths and git
+directories; structured codes instead of focus, reason, subject, body and
+acknowledgement prose; counts instead of file paths. What remains observable -
+activity times, the correlation structure of stable references, the coarse
+nature of the work - is listed with its reasons in the ADR's threat model.
+Two rules apply in **either** mode, because they are about secrets rather than
+preference: an agent's `config` values never leave a serializer (only its key
+names), and a URL carrying credentials, a query string, a fragment or a
+non-http(s) scheme is refused rather than stored. Operational rows expire on a
+documented schedule (`python -m app.retention`); the ledger never does, and a
+test proves a sweep leaves the approval chain verifiable.
+
 **Content-blind mode.** A shared instance can be run with
 `AXONRELAY_SAFE_MODE=1` ([ADR-010](docs/adr-010-safe-envelope.md)). Every
 surface that accepts free text then refuses with a fixed message, and the

@@ -95,6 +95,17 @@ claude mcp add -t http -H "Authorization: Bearer <token>" axonrelay http://127.0
 
 各 tool に必要な scope は `backend/app/authz.py` の `TOOL_SCOPES`。読み取り系は `ledger:read` / `coordination:read`、書き込み系は `ledger:write` / `coordination:write`、削除は `administration`。scope が足りない呼び出しは「必要な scope 名」だけを返して拒否される。`get_self_actor()` は**サーバから見た呼び出し元の Actor** を返すので、credential がどの identity に結びついているかはこれで確認できる。
 
+### 構造化コードと開示ポリシー
+
+調整系 tool は自由文に加えて**構造化コード**を受け取る（[ADR-012](./adr-012-metadata-minimization.md)）:
+`register_session` / `heartbeat_session` の `focus_code`、`claim_territory` /
+`claim_git_resource` の `reason_code`、`send_relay` の `code`、`ack_relay` の `ack_code`。
+`AXONRELAY_SAFE_MODE=1` のインスタンスでは、ボード・claim・relay・衝突のレスポンスが
+opaque ref とコードと件数だけになり、ホスト名・絶対パス・git ディレクトリ・自由文は返らない。
+`repo` slug は `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS=1` のときだけ返る。
+
+モードによらず、agent の `config` は**キー名のみ**（`config_keys`）が返る。
+
 ### Safe Envelope（content-blind 取り込み）
 
 `AXONRELAY_SAFE_MODE=1` のインスタンスでは上の書き込み系 tool と調整レイヤーの書き込み系 tool は固定文言で拒否され、以下だけが書き込み経路になる（[ADR-010](./adr-010-safe-envelope.md)、[schema](./schemas/safe-envelope-v1.json)）。

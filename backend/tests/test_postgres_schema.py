@@ -57,6 +57,10 @@ MODEL_ENUMS = [
     models.RelayKindEnum,
     models.SafeActionEnum,
     models.SafeOutcomeEnum,
+    models.FocusCodeEnum,
+    models.ClaimReasonCodeEnum,
+    models.RelayCodeEnum,
+    models.AckCodeEnum,
 ]
 
 COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts", "safe_events", "credentials"}
@@ -139,6 +143,68 @@ def _db_enum_labels(engine) -> dict[str, set[str]]:
     for typname, label in rows:
         labels.setdefault(typname, set()).add(label)
     return labels
+
+
+@pytest.fixture(scope="module")
+def legacy_engine():
+    parsed = make_url(TEST_URL)
+    # str(URL) masks the password ("***"); render it for real or the
+    # subprocess and the engine cannot authenticate (CI has a password,
+    # a local trust-auth cluster does not, which is how this hid).
+    legacy_url = parsed.set(database=f"{parsed.database}_legacy").render_as_string(hide_password=False)
+    _recreate_database(legacy_url)
+    _run_alembic(legacy_url, "008")
+
+    engine = create_engine(legacy_url)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO actors (type, name, created_at) VALUES ('HUMAN', 'legacy', now())"))
+        conn.execute(
+            text(
+                "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
+                "VALUES ('legacy-thread', 'legacy', 'WAITING_APPROVAL', now(), now())"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO drafts (task_id, version, content, created_at) VALUES (1, 1, 'old bytes', now())")
+        )
+        # A second task whose unlocked pre-009 add_draft raced itself into
+        # two drafts with the same version number.
+        conn.execute(
+            text(
+                "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
+                "VALUES ('legacy-dup', 'dup', 'DRAFT', now(), now())"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO drafts (task_id, version, content, created_at) VALUES "
+                "(2, 1, 'first', now()), (2, 1, 'raced duplicate', now()), (2, 2, 'later', now())"
+            )
+        )
+        created_at = "2026-08-01 12:00:00.000000"
+        entry_hash = ledger.compute_entry_hash(
+            None,
+            task_id=1,
+            reviewer_actor_id=1,
+            action="approved",
+            comment="pre-009",
+            created_at=datetime.fromisoformat(created_at),
+        )
+        conn.execute(
+            text(
+                "INSERT INTO approvals (task_id, reviewer_actor_id, action, comment, created_at, prev_hash, entry_hash) "
+                "VALUES (1, 1, 'approved', 'pre-009', :created_at, NULL, :entry_hash)"
+            ),
+            {"created_at": created_at, "entry_hash": entry_hash},
+        )
+    engine.dispose()
+
+    _run_alembic(legacy_url, "head")
+    engine = create_engine(legacy_url)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 class TestMigrationChain:
@@ -226,6 +292,34 @@ class TestMigrationChain:
         assert cascade == "c"  # ON DELETE CASCADE
         assert "token" not in columns  # only the digest is stored
         assert "token_hash" in columns
+
+    def test_the_minimization_columns_are_in_place(self, migrated_engine):
+        """Migration 012: opaque ids are unique, and each free-text field has a code beside it."""
+        with migrated_engine.connect() as conn:
+            indexes = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT indexname FROM pg_indexes WHERE tablename IN ('actors', 'workspaces')")
+                ).all()
+            }
+            columns = {
+                (r[0], r[1])
+                for r in conn.execute(
+                    text(
+                        "SELECT table_name, column_name FROM information_schema.columns "
+                        "WHERE table_name IN ('actors','workspaces','sessions','claims','relays','relay_receipts')"
+                    )
+                ).all()
+            }
+        assert {"ix_actors_opaque_id", "ix_workspaces_opaque_id"} <= indexes
+        assert {
+            ("actors", "opaque_id"),
+            ("workspaces", "opaque_id"),
+            ("sessions", "focus_code"),
+            ("claims", "reason_code"),
+            ("relays", "code"),
+            ("relay_receipts", "ack_code"),
+        } <= columns
 
 
 class TestEnumParity:
@@ -470,67 +564,6 @@ class TestArtifactBindingMigration:
     approval), and upgrades to head.
     """
 
-    @pytest.fixture(scope="class")
-    def legacy_engine(self):
-        parsed = make_url(TEST_URL)
-        # str(URL) masks the password ("***"); render it for real or the
-        # subprocess and the engine cannot authenticate (CI has a password,
-        # a local trust-auth cluster does not, which is how this hid).
-        legacy_url = parsed.set(database=f"{parsed.database}_legacy").render_as_string(hide_password=False)
-        _recreate_database(legacy_url)
-        _run_alembic(legacy_url, "008")
-
-        engine = create_engine(legacy_url)
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO actors (type, name, created_at) VALUES ('HUMAN', 'legacy', now())"))
-            conn.execute(
-                text(
-                    "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
-                    "VALUES ('legacy-thread', 'legacy', 'WAITING_APPROVAL', now(), now())"
-                )
-            )
-            conn.execute(
-                text("INSERT INTO drafts (task_id, version, content, created_at) VALUES (1, 1, 'old bytes', now())")
-            )
-            # A second task whose unlocked pre-009 add_draft raced itself into
-            # two drafts with the same version number.
-            conn.execute(
-                text(
-                    "INSERT INTO tasks (thread_id, title, status, created_at, updated_at) "
-                    "VALUES ('legacy-dup', 'dup', 'DRAFT', now(), now())"
-                )
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO drafts (task_id, version, content, created_at) VALUES "
-                    "(2, 1, 'first', now()), (2, 1, 'raced duplicate', now()), (2, 2, 'later', now())"
-                )
-            )
-            created_at = "2026-08-01 12:00:00.000000"
-            entry_hash = ledger.compute_entry_hash(
-                None,
-                task_id=1,
-                reviewer_actor_id=1,
-                action="approved",
-                comment="pre-009",
-                created_at=datetime.fromisoformat(created_at),
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO approvals (task_id, reviewer_actor_id, action, comment, created_at, prev_hash, entry_hash) "
-                    "VALUES (1, 1, 'approved', 'pre-009', :created_at, NULL, :entry_hash)"
-                ),
-                {"created_at": created_at, "entry_hash": entry_hash},
-            )
-        engine.dispose()
-
-        _run_alembic(legacy_url, "head")
-        engine = create_engine(legacy_url)
-        try:
-            yield engine
-        finally:
-            engine.dispose()
-
     def test_existing_drafts_get_a_commitment_and_existing_approvals_stay_v1(self, legacy_engine):
         session = sessionmaker(bind=legacy_engine, autoflush=False)()
         try:
@@ -644,6 +677,32 @@ class TestCredentialsOnPostgres:
         digest = authz.token_digest(authz.issue_token())
         for _ in range(2):
             pg_session.add(models.Credential(actor_id=actor.id, label="dup", token_hash=digest, scopes=""))
+        with pytest.raises(IntegrityError):
+            pg_session.commit()
+        pg_session.rollback()
+
+
+class TestMinimizationMigration:
+    """Migration 012 against rows that already exist."""
+
+    def test_existing_rows_are_backfilled_with_unique_opaque_ids(self, legacy_engine):
+        session = sessionmaker(bind=legacy_engine, autoflush=False)()
+        try:
+            actors = session.query(models.Actor).all()
+            assert actors, "the legacy fixture seeds an actor"
+            assert all(a.opaque_id for a in actors)
+            assert len({a.opaque_id for a in actors}) == len(actors)
+        finally:
+            session.close()
+
+    def test_a_second_opaque_id_cannot_collide(self, pg_session):
+        from sqlalchemy.exc import IntegrityError
+
+        from app import disclosure
+
+        shared = disclosure.new_opaque_id()
+        for name in ("dup-a", "dup-b"):
+            pg_session.add(models.Actor(type=models.ActorTypeEnum.AI, name=name, opaque_id=shared))
         with pytest.raises(IntegrityError):
             pg_session.commit()
         pg_session.rollback()
