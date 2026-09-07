@@ -100,9 +100,17 @@ claude mcp add -t http -H "Authorization: Bearer <token>" axonrelay http://127.0
 調整系 tool は自由文に加えて**構造化コード**を受け取る（[ADR-012](./adr-012-metadata-minimization.md)）:
 `register_session` / `heartbeat_session` の `focus_code`、`claim_territory` /
 `claim_git_resource` の `reason_code`、`send_relay` の `code`、`ack_relay` の `ack_code`。
-`AXONRELAY_SAFE_MODE=1` のインスタンスでは、ボード・claim・relay・衝突のレスポンスが
-opaque ref とコードと件数だけになり、ホスト名・絶対パス・git ディレクトリ・自由文は返らない。
-`repo` slug は `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS=1` のときだけ返る。
+コードを付けておくと、共有インスタンスがその session / claim / relay について
+**言えること**が増える——自由文は開示されないが、コードは開示される。
+
+`AXONRELAY_SAFE_MODE=1` のインスタンスでは、ボード・claim・relay・衝突・git guard の
+レスポンスが opaque ref とコードと件数だけになり、ホスト名・絶対パス・git ディレクトリ・
+自由文は返らない。`repo` slug は `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS=1` のときだけ返る。
+Actor 名も `actor_ref` に置き換わり、これは MCP と REST の両方で同じである。
+
+> 注意: safe mode では調整系の**書き込み** tool 自体が拒否されるので（[ADR-010](./adr-010-safe-envelope.md)）、
+> コードを設定できるのは full-text モードだけである。safe mode でコードを送る producer 側の
+> 配線は #31 の担当。
 
 モードによらず、agent の `config` は**キー名のみ**（`config_keys`）が返る。
 

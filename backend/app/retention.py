@@ -53,7 +53,8 @@ ACKED_RELAY_DAYS = 30
 
 #: An unacknowledged relay is still someone's inbox item, so it lives much
 #: longer — but not forever, because an agent that never came back would
-#: otherwise pin it permanently.
+#: otherwise pin it permanently. A broadcast always takes this window: there is
+#: no list of everyone it was for, so "delivered" cannot be established.
 UNACKED_RELAY_DAYS = 180
 
 #: The only tables a sweep may delete from.
@@ -102,36 +103,17 @@ class SweepResult:
 def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) -> SweepResult:
     """Delete operational metadata past its window. Never touches the ledger.
 
-    Order matters: claims and receipts hang off sessions by CASCADE, so
-    sessions go last and the counts stay attributable rather than being
-    absorbed by a cascade.
+    Everything doomed is decided **before** anything is deleted, because the
+    tables cascade into each other: a session owns its claims and its relay
+    receipts at the database level, so deleting sessions first would absorb
+    rows this function is supposed to count, and would silently strip the
+    receipts that record who had already acknowledged a relay — making a
+    delivered message look unread again for the rest of its long window.
     """
     now = now or datetime.utcnow()
-    result = SweepResult()
 
-    finished_claims = (
-        db.query(models.Claim)
-        .filter(
-            (models.Claim.status == models.ClaimStatusEnum.RELEASED)
-            | (models.Claim.expires_at < now - timedelta(days=FINISHED_CLAIM_DAYS))
-        )
-        .filter(models.Claim.created_at < now - timedelta(days=FINISHED_CLAIM_DAYS))
-        .all()
-    )
-    result.claims = len(finished_claims)
-
-    acked_cutoff = now - timedelta(days=ACKED_RELAY_DAYS)
-    stale_cutoff = now - timedelta(days=UNACKED_RELAY_DAYS)
-    old_relays = []
-    for relay in db.query(models.Relay).filter(models.Relay.created_at < acked_cutoff).all():
-        receipts = list(relay.receipts or [])
-        everyone_acked = bool(receipts) and all(r.acked_at is not None for r in receipts)
-        if everyone_acked or relay.created_at < stale_cutoff:
-            old_relays.append(relay)
-    result.relays = len(old_relays)
-    result.relay_receipts = sum(len(r.receipts or []) for r in old_relays)
-
-    ended_sessions = (
+    # --- sessions that have been finished long enough to forget -------------
+    doomed_sessions = (
         db.query(models.Session)
         .filter(
             models.Session.status == models.SessionStatusEnum.ENDED,
@@ -140,12 +122,75 @@ def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) 
         )
         .all()
     )
-    result.sessions = len(ended_sessions)
+    doomed_session_ids = {s.id for s in doomed_sessions}
 
+    # --- claims whose work is over -----------------------------------------
+    # The window runs from when the claim *finished*, not from when it was
+    # taken: a long-lived claim released a minute ago is exactly the one a
+    # peer is about to ask about ("who held this when I was refused?").
+    def finished_at(claim: models.Claim) -> datetime:
+        return claim.released_at or claim.expires_at
+
+    doomed_claims = [
+        claim
+        for claim in db.query(models.Claim).all()
+        if (claim.status == models.ClaimStatusEnum.RELEASED or claim.expires_at < now)
+        and finished_at(claim) < now - timedelta(days=FINISHED_CLAIM_DAYS)
+    ]
+    doomed_claims += [
+        claim
+        for claim in db.query(models.Claim).filter(models.Claim.session_id.in_(doomed_session_ids or {-1})).all()
+        if claim not in doomed_claims
+    ]
+
+    # --- relays that have been delivered, or have waited long enough --------
+    acked_cutoff = now - timedelta(days=ACKED_RELAY_DAYS)
+    stale_cutoff = now - timedelta(days=UNACKED_RELAY_DAYS)
+    doomed_relays = []
+    for relay in db.query(models.Relay).filter(models.Relay.created_at < acked_cutoff).all():
+        if relay.created_at < stale_cutoff:
+            doomed_relays.append(relay)
+            continue
+        # A receipt exists only for a session that has *read* the relay, so
+        # "every receipt is acked" says nothing about recipients who never
+        # opened it. A broadcast therefore only ever leaves on the long
+        # window; a directed relay may leave once its addressees have acked.
+        broadcast = relay.to_actor_id is None and relay.to_workspace_id is None and relay.to_repo is None
+        receipts = list(relay.receipts or [])
+        delivered = bool(receipts) and all(r.acked_at is not None for r in receipts)
+        surviving = [r for r in receipts if r.session_id not in doomed_session_ids]
+        if delivered and (not broadcast or not surviving):
+            # Directed and acknowledged; or acknowledged by recipients whose
+            # sessions are going, which would leave the relay with no receipts
+            # at all - and a relay with no receipts reads as unacknowledged, so
+            # keeping it would show a delivered message as open again.
+            doomed_relays.append(relay)
+
+    doomed_relay_ids = {r.id for r in doomed_relays}
+
+    # --- receipts: those of doomed relays, and those of doomed sessions -----
+    doomed_receipts = [
+        receipt
+        for receipt in db.query(models.RelayReceipt).all()
+        if receipt.relay_id in doomed_relay_ids or receipt.session_id in doomed_session_ids
+    ]
+
+    result = SweepResult(
+        sessions=len(doomed_sessions),
+        claims=len(doomed_claims),
+        relays=len(doomed_relays),
+        relay_receipts=len(doomed_receipts),
+    )
     if dry_run:
         return result
 
-    for row in (*finished_claims, *old_relays, *ended_sessions):
+    for row in doomed_receipts:
+        db.delete(row)
+    for row in doomed_claims:
+        db.delete(row)
+    for row in doomed_relays:
+        db.delete(row)
+    for row in doomed_sessions:
         db.delete(row)
     db.commit()
     logger.info("retention sweep removed %s", result.as_dict())
