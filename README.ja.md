@@ -48,12 +48,20 @@ MCP のネイティブ機能（`elicitation`）になった。**承認のため�
 
 これらの層が与えてくれないのは「**説明責任の永続的な記録**」だ。elicitation は揮発的で
 セッション内限り、observability ツールは run を記録するが「誰が何を承認したか」は記録しない。
-一方で EU AI Act の高リスク義務は **2026-08-02 に full enforcement** を迎え、その中核要求は
-まさに——改ざん耐性のある行動ログ、高影響行動への人間承認ゲート、そしてすべての行動を
-責任ある identity（人**または**エージェント）に帰属させること——である。
 
-AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（interrupt 境界の外側の例外としてではなく）。
-これがこのリポジトリが保持し、dogfood する残存価値だ。
+規制も同じ方向を向いているが、よく言われるより時期は遅く、範囲は狭い。EU AI Act が
+*高リスク*システムに課す要件には自動イベント記録（第 12 条）と人間による監督（第 14 条）が
+含まれ、承認台帳が記録するものと主題が重なる。ただしこの高リスク義務は 2026-08-02 時点で
+**発効していない**。同日は法の一般適用日であり透明性規則（第 50 条）の開始日であって、
+高リスク義務は Digital Omnibus on AI（Regulation (EU) 2026/1744、2026-07-27 発効）により
+**2027-12-02**（Annex III システム）と **2028-08-02**（Annex I システム）へ延期された。
+日付・一次資料・最終確認日は [docs/regulatory-positioning.md](docs/regulatory-positioning.md) にある。
+
+**AxonRelay はコンプライアンス製品ではなく、認証の仕組みでもない。** 何も認証せず、
+EU AI Act やその他の規制への対応を何ら提供しない。台帳は改ざん検知可能であって、
+法的な証明力を持つものではない。このリポジトリが保持し dogfood するのは、それらの要件と
+まっとうなエンジニアリングが共有する一つの考え——人間は永続的な台帳の **第一級 Actor**
+であり、interrupt 境界の外側の例外ではない——である。
 
 ---
 
@@ -95,8 +103,8 @@ REST API は主にダッシュボードから台帳を読むためにある。
 |-------|------|
 | `Actor` | 人と AI を同型で扱う統一抽象。人間 Actor（`name="self"`）1 件がオペレータ。AI Actor は `AgentDefinition` と 1:1。 |
 | `TaskAssignment` | Actor を Task にロール付きで紐付け: `executor` / `reviewer` / `approver` / `observer`。 |
-| `Draft` | タスク出力の版付き履歴。 |
-| `Approval` | 追記専用の記録: `action`（approved/rejected）/ `comment` / `reviewer_actor_id` / timestamp。per-task SHA-256 hash chain（`prev_hash` / `entry_hash`・[`app/ledger.py`](backend/app/ledger.py)）で改ざん検出可能。 |
+| `Draft` | タスク成果物の版履歴——承認が束縛される **artifact**。`(task_id, version)` は unique。各版は `commitment`（本文バイト列の SHA-256）と、分かる場合は `producer_actor_id` を持つ。 |
+| `Approval` | 追記専用の記録: `action`（approved/rejected）、`comment`、`reviewer_actor_id`、タイムスタンプ、**そして判断対象の artifact**（`artifact_ref` / `artifact_version` / `artifact_commitment` / producer）。per-task の SHA-256 hash chain（`prev_hash` / `entry_hash`）が束縛フィールドまで覆う——[`app/ledger.py`](backend/app/ledger.py) と [ADR-009](docs/adr-009-artifact-commitment.md)。 |
 | `ExternalLink` | 外部成果物へのリンク（将来の MCP リソース URI など）。 |
 
 ステートマシン:
@@ -109,6 +117,13 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 
 台帳は並行書き込みに対して安全。`record_approval` は chain の先端を読む前に task 行の
 ロックを取るため、2 つのエージェントが同一 task を承認しても hash chain は分岐しない。
+同じロックが draft の追加も覆うので、修正 draft 付きの承認は先に新版を作り、その版に束縛される。
+
+混同しやすい 3 つの保証:
+
+- **イベントの改ざん検知** — 承認の編集や並べ替えは、artifact 束縛フィールドの改変も含めて `verify_task_ledger` で検出される。
+- **artifact の同定** — 新しい承認はすべて、判断した draft の版番号と本文 commitment を名指しする。差し替わった draft への判断は拒否される（`409` / `stale_decision`）。保存中の draft 本文がその commitment と今も一致するかは別のチェックであり、台帳は外部 artifact の内容を保存しない。束縛導入前の記録はそのまま検証され、`not artifact-bound` として報告される。
+- **規制グレードの署名・タイムスタンプ・否認防止** — 対象外。[docs/regulatory-positioning.md](docs/regulatory-positioning.md) を参照。
 
 ---
 
@@ -198,7 +213,7 @@ cp .env.example .env                    # ラップトップならそのまま�
 docker compose up -d postgres           # Postgres を 127.0.0.1:5432 に
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-(cd backend && alembic upgrade head)    # migration 008 まで適用・"self" Actor を seed
+(cd backend && alembic upgrade head)    # migration 009 まで適用・"self" Actor を seed
 ```
 
 venv を有効にした状態なら `make dev` で後半 3 つと MCP サーバの起動をまとめて行える。
@@ -253,7 +268,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（26 tools / 3 resources）、LangGraph Platform クライアント、migration 008 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（26 tools / 3 resources）、LangGraph Platform クライアント、migration 009 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
@@ -267,9 +282,11 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 ## ドキュメント
 
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — ピボット仕様（Actor モデル / スコープ / dogfood シナリオ）
+- [docs/regulatory-positioning.md](docs/regulatory-positioning.md) — AxonRelay が*何でないか*（コンプライアンス・認証の主張はしない）、EU AI Act の適用日と一次資料と最終確認日、docs レビューチェックリスト（英日併記）
 - [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: 在席・territory claim・relay
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — 調整レイヤーにメッセージブローカーを入れない理由
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — `gitsafe` を PATH ラッパにせず明示 opt-in に留める理由
+- [docs/adr-009-artifact-commitment.md](docs/adr-009-artifact-commitment.md) — 承認が判断対象の draft 版と本文 commitment を名指しする理由と、それが証明しないこと
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ（アカウント側の手順のみ。backend 側は未実装）
