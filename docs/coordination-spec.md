@@ -315,7 +315,7 @@ python -m app.mcp.server --http --port 8765   # Streamable HTTP — リモート
 | リアルタイム push（WebSocket / SSE での割り込み） | 準同期という設計選択そのものに反する。ボードは pull で足りる |
 | claim の自動取得（ファイル書き込みをフックして claim） | エージェントが「これから何をするか」を宣言することに価値がある。事後の自動記録では衝突を予防できない |
 | coordination イベントの hash chain | 改ざん耐性が必要なのは承認記録。claim / relay は追記のみで十分 |
-| MCP transport の呼び出し元認証 | 個人 PoC。ネットワーク層（Tailscale / Tunnel）で境界を引く。`AXONRELAY_MCP_TOKEN` を設定したときだけ共有シークレットを重ねる（[ADR-008](./adr-008-optional-bearer-token.md)） |
+| MCP transport の呼び出し元認証 | ネットワーク層（Tailscale / Tunnel）で境界を引く。`AXONRELAY_MCP_TOKEN` を設定したときだけ共有シークレットを重ねる（[ADR-008](./adr-008-optional-bearer-token.md)）。`AXONRELAY_REQUIRE_AUTH=1` なら per-caller credential と scope まで進む（[ADR-011](./adr-011-caller-identity.md)）。stdio は loopback 信頼のまま |
 | `gitsafe` の迂回不能化 | `command git` / 絶対パスで抜けられる。PATH 上に `git` という名前のラッパを置く方式は採らない（自己再帰・影響範囲・ネットワーク依存の対価が、防ぐ事故の重さに見合わない）。決定と根拠は [ADR-007](./adr-007-gitsafe-enforcement-path.md) |
 | git 以外の破壊的操作 | エージェントがファイルを直接上書きする類は本レイヤーの範囲外 |
 | A2A プロトコルでの Relay 表現 | [§11.3](./delta-mvp-spec.md) で採用候補に格上げ済みだが、まず内部モデルを dogfood してから |

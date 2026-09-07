@@ -86,6 +86,12 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         <details key={d.id} className="draft">
           <summary>
             v{d.version} <span className="muted small">{formatTime(d.created_at)}</span>
+            {d.commitment && (
+              <span className="muted small" title={`${d.commitment_algorithm ?? "commitment"}: ${d.commitment}`}>
+                {" "}
+                · {d.commitment.slice(0, 12)}…
+              </span>
+            )}
           </summary>
           <pre>{d.content}</pre>
         </details>
@@ -99,6 +105,20 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           <li key={a.id} className={`event event-${a.action}`}>
             <span className="event-action">{a.action}</span>
             <span className="muted small"> · actor #{a.reviewer_actor_id ?? "—"} · {formatTime(a.created_at)}</span>
+            {a.artifact_bound ? (
+              <span
+                className="muted small"
+                title={`${a.artifact_ref ?? ""}\n${a.artifact_commitment_algorithm ?? "commitment"}: ${a.artifact_commitment ?? ""}`}
+              >
+                {" "}
+                · draft v{a.artifact_version}
+                {a.artifact_commitment && ` (${a.artifact_commitment.slice(0, 12)}…)`}
+              </span>
+            ) : (
+              <span className="badge badge-warn small" title="Recorded before approvals named their artifact">
+                not artifact-bound
+              </span>
+            )}
             {a.comment && <div className="event-comment">{a.comment}</div>}
           </li>
         ))}
