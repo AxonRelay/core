@@ -624,6 +624,13 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
         }
 
     for approval in approvals:
+        # Before the legacy skip, because a pre-004 row has no hash to break
+        # and would otherwise be the one place a key could be planted for
+        # free. A key on any payload below v3 is not covered by that row's
+        # hash - see the dispatch below - and the unique index would then
+        # refuse the genuine decision the key belongs to.
+        if approval.decision_key is not None and (approval.hash_version or 1) < ledger.DECISION_KEY_SINCE:
+            return _report(False, approval.id)
         if approval.entry_hash is None:
             # A NULL hash is only acceptable as a leading legacy prefix (rows that
             # predate the hash chain). A NULL appearing *after* the chain has
@@ -658,13 +665,6 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             # rather than with a null one, so it verifies as it was written.
             decision_key=approval.decision_key,
         )
-        # A key on a row whose payload predates v3 is not covered by that
-        # row's hash, so it could be planted for free - and the unique index
-        # would then refuse the genuine decision that key belongs to. The
-        # version dispatch above is what makes this reachable, so this is where
-        # it is caught.
-        if approval.decision_key is not None and (approval.hash_version or 1) < ledger.DECISION_KEY_SINCE:
-            return _report(False, approval.id)
         if approval.prev_hash != prev_hash or approval.entry_hash != expected:
             return _report(False, approval.id)
         if artifact is not None:
