@@ -259,7 +259,7 @@ class Approval(Base):
         # real decision it belongs to. `verify_approval_chain` reports such a
         # row as tampered; this stops it being written in the first place.
         CheckConstraint(
-            "decision_key IS NULL OR (hash_version IS NOT NULL AND hash_version >= 3)",
+            "decision_key IS NULL OR (entry_hash IS NOT NULL AND hash_version IS NOT NULL AND hash_version >= 3)",
             name="ck_approval_decision_key_needs_v3",
         ),
     )
