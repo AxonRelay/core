@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
@@ -250,7 +251,18 @@ class Approval(Base):
     # could not see could be cleared to defeat the de-duplication.
     decision_key = Column(String(64))
 
-    __table_args__ = (UniqueConstraint("task_id", "decision_key", name="uq_approval_decision_key"),)
+    __table_args__ = (
+        UniqueConstraint("task_id", "decision_key", name="uq_approval_decision_key"),
+        # A key only means anything on a payload that hashes it. Without this,
+        # one could be planted on a legacy row - free, because that row's hash
+        # does not cover the field - and the unique index would then refuse the
+        # real decision it belongs to. `verify_approval_chain` reports such a
+        # row as tampered; this stops it being written in the first place.
+        CheckConstraint(
+            "decision_key IS NULL OR (hash_version IS NOT NULL AND hash_version >= 3)",
+            name="ck_approval_decision_key_needs_v3",
+        ),
+    )
 
     task = relationship("Task", back_populates="approvals")
     reviewer = relationship("Actor", back_populates="approvals", foreign_keys=[reviewer_actor_id])
