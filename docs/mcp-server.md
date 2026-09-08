@@ -128,7 +128,9 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 - 配送が確認できなかった場合は自動再送しない。「台帳には記録済み・graph は未確認」と
   `approve_task` / `reject_task` での送り方を返す
 - 配送されないまま追い越された判断は応答の `undelivered` に出る（遅れて送ると別の問いに
-  答えてしまうので、自動では送らない）
+  答えてしまうので、自動では送らない）。承認・差戻しだけでなく decline / cancel /
+  `stale_decision` / `elicitation_unsupported` の応答にも付く。唯一付かないのは
+  input-required ラウンド自体で、そこは SDK が結果を組み立てるため tool 本体が走らない
 - 配送済みの判断と**同じ draft・同じ文言**の判断は再送と区別できないため拒否され、
   `replayed: true` と `note`（`approve_task` / `reject_task` を使えという案内）が返る。
   2 件目の判断を記録したい場合はその 2 つを使う
