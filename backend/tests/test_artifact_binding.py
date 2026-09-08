@@ -275,6 +275,36 @@ def test_a_v2_row_verifies_without_the_decision_key_field(db, self_actor, monkey
     assert crud.verify_approval_chain(db, task.id)["valid"] is True
 
 
+def test_a_decision_key_planted_on_a_pre_hash_row_is_detected(db, self_actor):
+    """A pre-004 row has no hash to break, which makes it the tempting place.
+
+    Verification skips such rows as a legacy prefix, so the key check has to
+    happen before that skip or this is the one row where a key can be planted
+    for free - and the unique index would then refuse the genuine decision it
+    belongs to.
+    """
+    task, draft = _task_with_draft(db)
+    unhashed = models.Approval(
+        task_id=task.id,
+        reviewer_actor_id=self_actor.id,
+        action="approved",
+        created_at=datetime.utcnow(),
+    )
+    db.add(unhashed)
+    db.commit()
+    assert crud.verify_approval_chain(db, task.id)["legacy"] == 1
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+    db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    unhashed.decision_key = "planted where there is no hash to break"
+    db.commit()
+    db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+
+    report = crud.verify_approval_chain(db, task.id)
+    assert report["valid"] is False
+    assert report["broken_at"] == unhashed.id
+
+
 def test_a_decision_key_planted_on_a_pre_v3_row_is_detected(db, self_actor, monkeypatch):
     """Free to plant, because that row's hash does not cover the field.
 
