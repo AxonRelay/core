@@ -60,6 +60,23 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Refuse once any v3 entry exists, because the column is inside its hash.
+
+    Dropping `decision_key` is not reversible in the way a downgrade implies: a
+    later re-upgrade recreates the column empty, and every v3 entry that
+    carried a key then recomputes to a different hash and reports as tampered
+    forever. Losing the ability to verify a legitimate ledger is worse than
+    refusing to downgrade, so this stops rather than corrupts. Immediately
+    after an upgrade, with nothing keyed yet, it is genuinely reversible and
+    proceeds.
+    """
+    keyed = op.get_bind().execute(sa.text("SELECT COUNT(*) FROM approvals WHERE decision_key IS NOT NULL")).scalar()
+    if keyed:
+        raise RuntimeError(
+            f"refusing to downgrade: {keyed} approval(s) carry a decision_key, which is inside their v3 "
+            "entry hash (app/ledger.py). Dropping the column would make those entries unverifiable for "
+            "good. Remove or re-record them deliberately if this downgrade is really what you want."
+        )
     op.drop_constraint("ck_approval_decision_key_needs_v3", "approvals", type_="check")
     op.drop_constraint("uq_approval_decision_key", "approvals", type_="unique")
     op.drop_column("approvals", "decision_key")

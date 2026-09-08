@@ -90,6 +90,28 @@ def _recreate_database(url: str) -> None:
     admin.dispose()
 
 
+def _run_alembic_expecting(url: str, argv: list[str], *, succeed: bool) -> str:
+    """Run an alembic command and assert whether it was supposed to work.
+
+    `_run_alembic` fails the test on a non-zero exit, which is right for a setup
+    step and wrong for a refusal that is the thing under test.
+    """
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    completed = subprocess.run(
+        [sys.executable, "-m", "alembic", *argv],
+        cwd=backend_dir,
+        env={**os.environ, "DATABASE_URL": url},
+        capture_output=True,
+        text=True,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if succeed and completed.returncode != 0:
+        pytest.fail(f"alembic {' '.join(argv)} should have succeeded:\n{output}")
+    if not succeed and completed.returncode == 0:
+        pytest.fail(f"alembic {' '.join(argv)} should have refused:\n{output}")
+    return output
+
+
 def _run_alembic(url: str, target: str) -> None:
     """`alembic upgrade <target>` against `url`, in a subprocess (see migrated_engine)."""
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -706,3 +728,40 @@ class TestMinimizationMigration:
         with pytest.raises(IntegrityError):
             pg_session.commit()
         pg_session.rollback()
+
+
+def test_downgrading_013_refuses_once_a_decision_key_exists():
+    """The column is inside the v3 hash, so dropping it is not reversible.
+
+    A re-upgrade recreates it empty, and every keyed entry then recomputes to a
+    different hash and reports as tampered for good. Refusing is the lesser
+    harm, and it only refuses once there is something to lose - immediately
+    after the upgrade, with nothing keyed, the downgrade still works.
+    """
+    url = TEST_URL.replace("/" + make_url(TEST_URL).database, "/axonrelay_downgrade_013")
+    _recreate_database(url)
+    _run_alembic(url, "head")
+
+    engine = create_engine(url)
+    try:
+        # Nothing keyed yet: reversible, and it really does reverse.
+        _run_alembic_expecting(url, ["downgrade", "012"], succeed=True)
+        _run_alembic(url, "head")
+
+        session = sessionmaker(bind=engine)()
+        try:
+            actor = models.Actor(type=models.ActorTypeEnum.HUMAN, name="self")
+            session.add(actor)
+            session.commit()
+            task = crud.create_task(session, thread_id="t-downgrade", title="downgrade")
+            crud.add_draft(session, task_id=task.id, content="draft")
+            crud.record_approval(session, task.id, actor.id, "approved", decision_key="k1")
+        finally:
+            session.close()
+
+        output = _run_alembic_expecting(url, ["downgrade", "012"], succeed=False)
+        assert "decision_key" in output
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "013"
+    finally:
+        engine.dispose()
