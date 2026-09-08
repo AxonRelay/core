@@ -56,6 +56,7 @@ from mcp_types.version import SUPPORTED_PROTOCOL_VERSIONS
 from app import crud, langgraph_client, models
 from app.mcp import compat
 from app.mcp import server as mcp_server
+from app.mcp.serializers import approval_to_dict
 
 HTTP_PATH = "/mcp"
 
@@ -1110,3 +1111,33 @@ def test_delivery_is_recorded_even_if_the_projection_fails(waiting_task, mcp_db,
     approval = crud.latest_approval(mcp_db, waiting_task.id)
     assert approval is not None
     assert approval.resumed_at is not None, "the graph got the decision; a retry must not re-deliver it"
+
+
+def test_delivery_state_is_visible_on_every_approval(waiting_task, mcp_db, monkeypatch):
+    """A stranded decision has to be findable, not merely inferable.
+
+    A cancelled or timed-out delivery spends the entry's one attempt and looks,
+    from the task's status alone, exactly like a decision that arrived. The
+    serialised approval carries the attempt so an operator can compare the
+    ledger against the thread instead of guessing.
+    """
+
+    async def _resume(thread_id, payload):
+        raise TimeoutError("Platform did not answer")
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    before = approval_to_dict(
+        crud.record_approval(mcp_db, waiting_task.id, None, "rejected", comment="not yet delivered")
+    )
+    assert before["delivery_attempted_at"] is None
+    assert before["carried_edit"] is False
+
+    async def go():
+        with pytest.raises(ToolError):
+            await mcp_server._apply_decision(waiting_task.id, action="approved", comment="ok", modified_draft="edited")
+
+    asyncio.run(go())
+    after = approval_to_dict(crud.latest_approval(mcp_db, waiting_task.id))
+    assert after["delivery_attempted_at"] is not None, "the spent attempt must be visible"
+    assert after["carried_edit"] is True
