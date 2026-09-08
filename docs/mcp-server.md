@@ -122,8 +122,13 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
   記録済みエントリから resume をやり直して `replayed: true` を返す。台帳に行が
   あることは graph が判断を受け取った証拠ではないため。配送済みの判断のあと graph が
   同じ draft に再 interrupt した場合は、これと混ざらず通常どおり新しい問いになる
-- **graph への配送は at-least-once**（`resume_thread` は idempotency key を取らない）。
-  exactly-once を保つのは台帳の側である
+- **graph への配送は at-most-once**。試行権は Platform 呼び出しの前に確保するので、
+  `resumed_at` の意味は「届いた」ではなく「試みた」。2 回目の配送は、そのとき graph が
+  到達している interrupt に答えてしまう（＝誰も見ていない問いへの判断になりうる）ため
+- 配送が確認できなかった場合は自動再送しない。「台帳には記録済み・graph は未確認」と
+  `approve_task` / `reject_task` での送り方を返す
+- 配送されないまま追い越された判断は応答の `undelivered` に出る（遅れて送ると別の問いに
+  答えてしまうので、自動では送らない）
 - 配送済みの判断と**同じ draft・同じ文言**の判断は再送と区別できないため拒否され、
   `replayed: true` と `note`（`approve_task` / `reject_task` を使えという案内）が返る。
   2 件目の判断を記録したい場合はその 2 つを使う
