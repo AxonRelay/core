@@ -25,6 +25,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import (
@@ -471,6 +472,10 @@ async def _apply_decision(
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
         result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
+        # Delivered. Recorded rather than inferred from the task's status,
+        # which cannot tell "never delivered" from "delivered, and the graph
+        # interrupted again" (app/mcp/server.py, `_shown_artifact`).
+        approval.resumed_at = datetime.utcnow()
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)
@@ -615,17 +620,19 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
         # re-shown a draft they have already ruled on (their own edit, if they
         # made one, since that edit is now the latest version), and answering
         # would append a second entry for one decision. Repair instead.
-        newest = crud.get_approvals(db, task_id)[-1:] if drafts else []
-        if (
-            newest
-            and newest[0].reviewer_actor_id == authz.acting_actor_id(db)
-            and newest[0].artifact_version == drafts[-1].version
-        ):
+        #
+        # `resumed_at` is the whole discriminator, and it has to be recorded
+        # rather than inferred: a rejection that WAS delivered and made the
+        # graph interrupt again on the same draft leaves the task in a state
+        # identical to a lost resume, and replaying the old decision there
+        # would rob the reviewer of the new question.
+        newest = crud.latest_approval(db, task_id) if drafts else None
+        if newest is not None and newest.resumed_at is None and newest.reviewer_actor_id == authz.acting_actor_id(db):
             return _ShownArtifact(
                 task_id=task_id,
                 state="recorded_unresumed",
-                approval_id=newest[0].id,
-                reason="A decision by this reviewer is already recorded against the latest draft.",
+                approval_id=newest.id,
+                reason="A decision by this reviewer is recorded but was never delivered to the graph.",
             )
         if not drafts:
             return _ShownArtifact(
@@ -735,20 +742,40 @@ async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
     The recovery half of "a ledger row is not evidence the graph received the
     decision". Everything the resume needs is in the recorded entry, so no new
     entry is written and the reviewer is not asked anything: the decision was
-    made, it just did not arrive. A reviewer's edit is recognised by the bound
-    draft's producer, which is how `record_approval` stamps it.
+    made, it just did not arrive.
+
+    The claim is taken first, as a conditional UPDATE. Two retries arriving
+    together would otherwise both find `resumed_at IS NULL` and both drive the
+    graph - the same defect the row lock prevents on the write side, one step
+    later. A claim whose Platform call then fails is given back, so a lost
+    resume stays recoverable rather than becoming permanent.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
         approval = db.query(models.Approval).filter(models.Approval.id == approval_id).one_or_none()
         if task is None or approval is None:  # pragma: no cover - torn between rounds
             raise ToolError(f"Task {task_id} changed while its recorded decision was being resumed")
+        if not crud.claim_resume(db, approval_id):
+            # Somebody else is delivering it. Answer with what stands.
+            db.refresh(task)
+            payload = task_to_dict(task)
+            payload["approval"] = approval_to_dict(approval)
+            payload["replayed"] = True
+            return payload
+
         resume_payload: dict[str, Any] = {"decision": approval.action, "human_comment": approval.comment}
         if approval.action == "approved":
+            # Faithful to the original call: the producer of the bound draft
+            # cannot answer this, because a reviewer who happened to author
+            # the latest draft earlier looks exactly like one who edited it as
+            # part of this approval.
             bound = next((d for d in crud.get_drafts(db, task_id) if d.version == approval.artifact_version), None)
-            edited = bound is not None and bound.producer_actor_id == approval.reviewer_actor_id
-            resume_payload["modified_draft"] = bound.content if edited else None
-        result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
+            resume_payload["modified_draft"] = bound.content if (approval.edited_artifact and bound) else None
+        try:
+            result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
+        except Exception:
+            crud.release_resume(db, approval_id)
+            raise
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)

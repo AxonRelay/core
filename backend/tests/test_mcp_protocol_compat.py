@@ -717,14 +717,138 @@ def test_a_failed_resume_on_an_edited_draft_is_repaired_too(connect, waiting_tas
     assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
 
 
-def test_a_duplicate_key_never_drives_the_graph_twice(waiting_task, mcp_db, monkeypatch):
-    """Two rounds racing to record one decision: the loser must not resume.
+def test_a_delivered_decision_that_parks_again_is_asked_afresh(connect, waiting_task, mcp_db, monkeypatch):
+    """A graph that interrupts again on the same draft is a new question, not a lost resume.
 
-    The lock inside `record_approval` is what settles who wrote the entry.
-    Deciding it before the lock - looking the key up, seeing nothing, and
-    proceeding - lets both callers believe they wrote it and apply one
-    decision to the graph twice. Driven through `_apply_decision` directly
-    because the tool's repair path intercepts a replay before this point.
+    This is the state the old status-only discriminator could not read: the
+    task is WAITING_APPROVAL, the newest entry is this reviewer's, and it binds
+    the latest draft - identical to a resume that never arrived. Replaying the
+    old rejection there would take the reviewer's new question away from them.
+    `resumed_at` is what tells the two apart.
+    """
+
+    async def _resume(thread_id, payload):
+        # Delivered, and the graph parks again without producing a new draft.
+        return {"next": ["human_approval"], "values": {"drafts": [DRAFT]}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+    asked = []
+
+    async def spy(ctx, params):
+        asked.append(params.message)
+        return types.ElicitResult(action="decline")
+
+    async def go():
+        async with connect(elicitation_callback=spy) as session:
+            first = await _first_round(session, waiting_task.id)
+            await _answer(session, waiting_task.id, first, _accept(approve=False, comment="revise"))
+            # A fresh review, not a retry: no request_state, no answers.
+            return await _first_round(session, waiting_task.id)
+
+    again = asyncio.run(go())
+    assert isinstance(again, types.InputRequiredResult), "the reviewer must be asked, not handed a replay"
+    assert DRAFT in next(iter(again.input_requests.values())).params.message
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
+    assert crud.latest_approval(mcp_db, waiting_task.id).resumed_at is not None
+
+
+def test_recovering_a_decision_that_carried_no_edit_sends_no_edit(connect, waiting_task, mcp_db, monkeypatch):
+    """`edited_artifact`, not the draft's producer, says whether there was an edit.
+
+    A reviewer who authored the latest draft earlier by other means is
+    indistinguishable, by producer alone, from one who edited it as part of
+    this approval - and guessing wrong re-sends a whole draft to the graph as
+    if the human had rewritten it.
+    """
+    self_actor_id = crud.get_self_actor(mcp_db).id
+    # The latest draft is the reviewer's own work, but not this decision's edit.
+    crud.add_draft(mcp_db, task_id=waiting_task.id, content="authored earlier", producer_actor_id=self_actor_id)
+    attempts = []
+
+    async def _resume(thread_id, payload):
+        attempts.append(payload)
+        if len(attempts) == 1:
+            raise TimeoutError("Platform did not answer")
+        return {"values": {"drafts": [DRAFT], "final_output": "shipped"}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        async with connect(elicitation_callback=_unused_callback) as session:
+            asked = await _first_round(session, waiting_task.id)
+            answer = _accept(approve=True)  # no modified_draft
+            assert (await _answer(session, waiting_task.id, asked, answer)).is_error
+            return _payload(await _answer(session, waiting_task.id, asked, answer))
+
+    repaired = asyncio.run(go())
+    assert repaired["replayed"] is True
+    assert attempts[0]["modified_draft"] is None
+    assert attempts[1]["modified_draft"] is None, "recovery must re-send what the original sent"
+    assert crud.latest_approval(mcp_db, waiting_task.id).edited_artifact is False
+
+
+def test_only_one_retry_delivers_a_recovered_decision(connect, waiting_task, mcp_db, monkeypatch):
+    """The resume claim is a conditional UPDATE, so a second recoverer stands down."""
+    attempts = []
+
+    async def _resume(thread_id, payload):
+        attempts.append(payload)
+        if len(attempts) == 1:
+            raise TimeoutError("Platform did not answer")
+        return {"next": ["human_approval"], "values": {"drafts": [DRAFT]}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        async with connect(elicitation_callback=_unused_callback) as session:
+            asked = await _first_round(session, waiting_task.id)
+            answer = _accept(approve=True)
+            assert (await _answer(session, waiting_task.id, asked, answer)).is_error
+            approval_id = crud.latest_approval(mcp_db, waiting_task.id).id
+            first = _payload(await _answer(session, waiting_task.id, asked, answer))
+            # The claim is held; a further recovery attempt must not deliver again.
+            second = await mcp_server._resume_recorded_decision(waiting_task.id, approval_id)
+            return first, second
+
+    first, second = asyncio.run(go())
+    assert first["replayed"] is True and second["replayed"] is True
+    assert len(attempts) == 2, "the second recoverer must not drive the graph"
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
+
+
+def test_a_failed_recovery_gives_the_claim_back(waiting_task, mcp_db, monkeypatch):
+    """A claim that outlived its failed Platform call would make the loss permanent."""
+    failures = []
+
+    async def _resume(thread_id, payload):
+        failures.append(payload)
+        raise TimeoutError("Platform did not answer")
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        with pytest.raises(TimeoutError):
+            await mcp_server._apply_decision(waiting_task.id, action="approved", comment="ok")
+        approval = crud.latest_approval(mcp_db, waiting_task.id)
+        assert approval.resumed_at is None
+        with pytest.raises(TimeoutError):
+            await mcp_server._resume_recorded_decision(waiting_task.id, approval.id)
+        return crud.latest_approval(mcp_db, waiting_task.id)
+
+    approval = asyncio.run(go())
+    assert approval.resumed_at is None, "a failed recovery must leave the decision recoverable"
+    assert len(failures) == 2
+
+
+def test_a_duplicate_key_never_drives_the_graph_twice(waiting_task, mcp_db, monkeypatch):
+    """A second round carrying one decision's key records nothing and resumes nothing.
+
+    Sequential, like the rest of the ledger's concurrency coverage: SQLite has
+    no row locks, so what is observable here is the contract - the second
+    caller is refused by `record_approval` rather than handed the row, and a
+    caller that cannot tell "I wrote this" from "somebody already had" is
+    exactly the one that drives the graph twice. The lock itself is pinned in
+    test_ledger_concurrency.py.
     """
     resumes = []
 

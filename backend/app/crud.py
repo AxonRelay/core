@@ -357,6 +357,41 @@ class DuplicateDecisionError(LedgerError):
         self.approval = approval
 
 
+def claim_resume(db: Session, approval_id: int) -> bool:
+    """Claim the right to tell the graph about this decision. True if we got it.
+
+    A conditional UPDATE rather than a read-then-write: two retries arriving
+    together would both see `resumed_at IS NULL` and both drive the graph.
+    Whoever's UPDATE matches the row owns the resume; the other is told no and
+    returns without touching Platform.
+
+    Held only for the duration of the call - `release_resume` puts it back if
+    the resume fails, so a lost Platform call stays recoverable.
+    """
+    updated = (
+        db.query(models.Approval)
+        .filter(models.Approval.id == approval_id, models.Approval.resumed_at.is_(None))
+        .update({models.Approval.resumed_at: datetime.utcnow()}, synchronize_session=False)
+    )
+    db.commit()
+    return updated == 1
+
+
+def release_resume(db: Session, approval_id: int) -> None:
+    """Give back a resume claim whose Platform call did not succeed."""
+    db.query(models.Approval).filter(models.Approval.id == approval_id).update(
+        {models.Approval.resumed_at: None}, synchronize_session=False
+    )
+    db.commit()
+
+
+def latest_approval(db: Session, task_id: int):
+    """The newest approval entry on a task, or None — the head of its hash chain."""
+    return (
+        db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
+    )
+
+
 def find_decision(db: Session, task_id: int, decision_key: str):
     """The approval already recorded under `decision_key`, or None.
 
@@ -529,6 +564,7 @@ def record_approval(
         db.flush()
 
     target = shown
+    edited = modified_draft is not None
     if modified_draft is not None:
         # Always a new version, even for identical text: the graph appends
         # the modified draft to its own state unconditionally, and the
@@ -545,9 +581,7 @@ def record_approval(
         producer_actor_id=target.producer_actor_id,
     )
 
-    last = (
-        db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
-    )
+    last = latest_approval(db, task_id)
     prev_hash = last.entry_hash if last else None
     entry_hash = ledger.compute_entry_hash(
         prev_hash,
@@ -573,6 +607,7 @@ def record_approval(
         artifact_commitment_algorithm=binding.commitment_algorithm,
         producer_actor_id=binding.producer_actor_id,
         decision_key=decision_key,
+        edited_artifact=edited,
     )
     db.add(db_approval)
     db.commit()
