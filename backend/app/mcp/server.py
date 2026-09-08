@@ -25,7 +25,6 @@ import os
 import re
 import sys
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import (
@@ -392,6 +391,45 @@ async def run_task(task_id: int) -> dict:
         return task_to_dict(task)
 
 
+def _with_undelivered(payload: dict, shown: _ShownArtifact) -> dict:
+    """Attach any decision that was recorded and then lost before it was sent.
+
+    Recovery only re-drives the newest entry, because an older one has been
+    superseded and delivering it now would answer a question it was not made
+    about. Silence about it would be the worse failure: an entry sitting in the
+    ledger that the graph never heard, with nothing pointing at it.
+    """
+    if shown.undelivered:
+        payload["undelivered"] = shown.undelivered
+        payload["undelivered_note"] = (
+            "These recorded decisions were never delivered to the graph and were superseded before "
+            "they could be. They are not re-sent automatically; read them with get_task and decide "
+            "what the thread needs."
+        )
+    return payload
+
+
+async def _deliver(task: models.Task, resume_payload: dict[str, Any], approval_id: int) -> dict:
+    """Make the one delivery attempt this decision gets, and name the doubt if it fails.
+
+    The claim is already taken, so a failure here leaves the entry marked
+    attempted and no second attempt will be made automatically. That is the
+    safe half of an unavoidable ambiguity - a call that times out after
+    Platform accepted it is indistinguishable from one it never received - but
+    it is only safe if the operator is told, in terms they can act on, rather
+    than left with a traceback.
+    """
+    try:
+        return await langgraph_client.resume_thread(task.thread_id, resume_payload)
+    except Exception as e:
+        raise ToolError(
+            f"Decision {approval_id} is recorded in the ledger, but the graph did not confirm it "
+            f"({type(e).__name__}). It will not be re-sent on its own: a second delivery would answer "
+            "whichever question the graph has reached by now. Check the thread, then re-drive it with "
+            f"{' / '.join(compat.FALLBACK_TOOLS)} if it never arrived."
+        ) from None
+
+
 async def _apply_decision(
     task_id: int,
     *,
@@ -480,15 +518,13 @@ async def _apply_decision(
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
-        result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
-        # Delivered. Recorded rather than inferred from the task's status,
-        # which cannot tell "never delivered" from "delivered, and the graph
-        # interrupted again" (`_shown_artifact`). Committed on its own, before
-        # the projection: if `_sync_state` fails, the decision has still
-        # reached the graph, and a retry that re-delivered it would be the
-        # double-apply this column exists to prevent.
-        approval.resumed_at = datetime.utcnow()
-        db.commit()
+        # Claim the one delivery attempt before making it. Recorded rather
+        # than inferred from the task's status, which cannot tell "never sent"
+        # from "sent, and the graph interrupted again"; and taken *before* the
+        # call, because a second delivery does not land harmlessly - it
+        # satisfies whichever interrupt the graph has reached by then.
+        crud.claim_delivery(db, approval.id)
+        result = await _deliver(task, resume_payload, approval.id)
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)
@@ -583,6 +619,12 @@ class _ShownArtifact(BaseModel):
     state: Literal["ready", "no_artifact", "not_waiting", "recorded_unresumed"] = "ready"
     reason: str = ""
     approval_id: int | None = None
+    #: Entries on this task for which delivery was never attempted, other than
+    #: the one this round is about. Normally empty. Carried so the tool can say
+    #: so: a decision that was recorded and then superseded before anything was
+    #: sent cannot be re-driven automatically - delivering it now would answer
+    #: a question it was not made about - but it must not be invisible either.
+    undelivered: list[int] = []
     title: str = ""
     feedback: str | None = None
     version: int | None = None
@@ -646,6 +688,7 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
                 state="recorded_unresumed",
                 approval_id=newest.id,
                 reason="A decision by this reviewer is recorded but was never delivered to the graph.",
+                undelivered=[a.id for a in crud.undelivered_approvals(db, task_id) if a.id != newest.id],
             )
         if not drafts:
             return _ShownArtifact(
@@ -663,6 +706,7 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
             version=shown.version,
             commitment=shown.commitment,
             content=shown.content,
+            undelivered=[a.id for a in crud.undelivered_approvals(db, task_id)],
         )
 
 
@@ -761,24 +805,29 @@ async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
     entry is written and the reviewer is not asked anything: the decision was
     made, it just did not arrive.
 
-    Delivery to the graph is **at least once**, and cannot be made exactly
-    once from this side: `langgraph_client.resume_thread` carries no
-    idempotency key, so nothing here can tell Platform "you have seen this
-    decision". A claim taken before the call would only move the failure - a
-    process that dies holding it strands the decision as permanently
-    delivered, and a call that times out after Platform accepted it looks
-    identical to one it never got. So the stamp is written only after a call
-    returns, and two recoverers racing means the graph is told twice rather
-    than not at all. What stays exactly once is the ledger, which is the
-    record this system exists to keep.
+    Only reachable when `resumed_at IS NULL`, which by construction means
+    nothing was ever sent for this entry: the claim is taken before the
+    Platform call, so an entry that was attempted carries a stamp whether or
+    not the call succeeded. That invariant is what makes re-driving safe here.
+
+    Delivery is therefore **at most once**, and that is the right direction.
+    `langgraph_client.resume_thread` is a plain LangGraph resume with no
+    idempotency key, so a second delivery does not simply repeat the first -
+    it answers whatever interrupt the graph has reached by then, which can be
+    a question no human has seen. An approval ledger cannot let that happen
+    invisibly. A decision stranded as attempted-but-unconfirmed is worse for
+    liveness and better for the property the ledger exists to hold, and it is
+    visible: `undelivered` in the tool's answer, and a person can re-drive it.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
         approval = db.query(models.Approval).filter(models.Approval.id == approval_id).one_or_none()
         if task is None or approval is None:  # pragma: no cover - torn between rounds
             raise ToolError(f"Task {task_id} changed while its recorded decision was being resumed")
-        if approval.resumed_at is not None:
-            # Delivered between the resolver's read and this one; nothing to do.
+        if not crud.claim_delivery(db, approval_id):
+            # Somebody else took the attempt between the resolver's read and
+            # this one. Two deliveries is the outcome to avoid; stand down.
+            db.refresh(approval)
             payload = task_to_dict(task)
             payload["approval"] = approval_to_dict(approval)
             payload["replayed"] = True
@@ -792,9 +841,7 @@ async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
             # part of this approval.
             bound = next((d for d in crud.get_drafts(db, task_id) if d.version == approval.artifact_version), None)
             resume_payload["modified_draft"] = bound.content if (approval.edited_artifact and bound) else None
-        result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
-        approval.resumed_at = datetime.utcnow()
-        db.commit()
+        result = await _deliver(task, resume_payload, approval_id)
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)
@@ -833,7 +880,8 @@ async def review_pending_task(
     of appending a second one.
     """
     if shown.state == "recorded_unresumed":
-        return await _resume_recorded_decision(task_id, shown.approval_id)
+        payload = await _resume_recorded_decision(task_id, shown.approval_id)
+        return _with_undelivered(payload, shown)
     if shown.state == "not_waiting":
         return {
             "status": "stale_decision",
@@ -883,14 +931,17 @@ async def review_pending_task(
                 "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
             }
 
-    return await _apply_decision(
-        task_id,
-        action="approved" if answer.approve else "rejected",
-        comment=answer.comment or None,
-        modified_draft=(answer.modified_draft or None) if answer.approve else None,
-        artifact_version=shown.version,
-        expected_commitment=shown.commitment,
-        decision_key=_decision_key(shown, answer),
+    return _with_undelivered(
+        await _apply_decision(
+            task_id,
+            action="approved" if answer.approve else "rejected",
+            comment=answer.comment or None,
+            modified_draft=(answer.modified_draft or None) if answer.approve else None,
+            artifact_version=shown.version,
+            expected_commitment=shown.commitment,
+            decision_key=_decision_key(shown, answer),
+        ),
+        shown,
     )
 
 
