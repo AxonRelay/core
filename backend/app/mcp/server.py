@@ -391,20 +391,32 @@ async def run_task(task_id: int) -> dict:
         return task_to_dict(task)
 
 
-def _with_undelivered(payload: dict, shown: _ShownArtifact) -> dict:
+def _with_undelivered(payload: dict, task_id: int, *, exclude: int | None = None) -> dict:
     """Attach any decision that was recorded and then lost before it was sent.
 
-    Recovery only re-drives the newest entry, because an older one has been
-    superseded and delivering it now would answer a question it was not made
-    about. Silence about it would be the worse failure: an entry sitting in the
+    Recovery only re-drives the newest such entry, because an older one has
+    been superseded and delivering it now would answer a question it was not
+    made about. Silence would be the worse failure: an entry sitting in the
     ledger that the graph never heard, with nothing pointing at it.
+
+    Read here rather than carried from the resolver's snapshot, and attached to
+    every answer rather than only the deciding ones. A snapshot taken before
+    the reviewer answered can be minutes stale by the time it is reported as
+    current fact, and a decline is exactly as good a moment to learn that
+    something is stranded as an approval is.
+
+    The one answer this cannot reach is the input-required round itself: that
+    result is built by the SDK from the resolvers, and the tool body does not
+    run. It is reported on the round that follows.
     """
-    if shown.undelivered:
-        payload["undelivered"] = shown.undelivered
+    with _session() as db:
+        stranded = [a.id for a in crud.undelivered_approvals(db, task_id) if a.id != exclude]
+    if stranded:
+        payload["undelivered"] = stranded
         payload["undelivered_note"] = (
             "These recorded decisions were never delivered to the graph and were superseded before "
-            "they could be. They are not re-sent automatically; read them with get_task and decide "
-            "what the thread needs."
+            "they could be. They are not re-sent automatically - delivering one now would answer a "
+            "question it was not made about. Read them with get_task and decide what the thread needs."
         )
     return payload
 
@@ -421,7 +433,14 @@ async def _deliver(task: models.Task, resume_payload: dict[str, Any], approval_i
     """
     try:
         return await langgraph_client.resume_thread(task.thread_id, resume_payload)
-    except Exception as e:
+    except BaseException as e:
+        # `BaseException`, not `Exception`: a cancelled request leaves exactly
+        # the same attempted-but-unconfirmed entry, and catching only
+        # `Exception` would let that one case out silently. Cancellation is
+        # re-raised rather than converted - there is nobody left to read a
+        # message - but it does not get to bypass the accounting above it.
+        if not isinstance(e, Exception):
+            raise
         raise ToolError(
             f"Decision {approval_id} is recorded in the ledger, but the graph did not confirm it "
             f"({type(e).__name__}). It will not be re-sent on its own: a second delivery would answer "
@@ -523,7 +542,16 @@ async def _apply_decision(
         # from "sent, and the graph interrupted again"; and taken *before* the
         # call, because a second delivery does not land harmlessly - it
         # satisfies whichever interrupt the graph has reached by then.
-        crud.claim_delivery(db, approval.id)
+        #
+        # The claim can be lost even here, where the entry was just written: a
+        # retry that arrived while this call was between its ledger commit and
+        # this line will have found the unstamped row and taken it. Sending
+        # anyway would be exactly the double delivery the claim exists to stop.
+        if not crud.claim_delivery(db, approval.id):
+            payload = task_to_dict(task)
+            payload["approval"] = approval_to_dict(approval)
+            payload["replayed"] = True
+            return payload
         result = await _deliver(task, resume_payload, approval.id)
         _sync_state(db, task, result)
         db.refresh(task)
@@ -619,12 +647,6 @@ class _ShownArtifact(BaseModel):
     state: Literal["ready", "no_artifact", "not_waiting", "recorded_unresumed"] = "ready"
     reason: str = ""
     approval_id: int | None = None
-    #: Entries on this task for which delivery was never attempted, other than
-    #: the one this round is about. Normally empty. Carried so the tool can say
-    #: so: a decision that was recorded and then superseded before anything was
-    #: sent cannot be re-driven automatically - delivering it now would answer
-    #: a question it was not made about - but it must not be invisible either.
-    undelivered: list[int] = []
     title: str = ""
     feedback: str | None = None
     version: int | None = None
@@ -688,7 +710,6 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
                 state="recorded_unresumed",
                 approval_id=newest.id,
                 reason="A decision by this reviewer is recorded but was never delivered to the graph.",
-                undelivered=[a.id for a in crud.undelivered_approvals(db, task_id) if a.id != newest.id],
             )
         if not drafts:
             return _ShownArtifact(
@@ -706,7 +727,6 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
             version=shown.version,
             commitment=shown.commitment,
             content=shown.content,
-            undelivered=[a.id for a in crud.undelivered_approvals(db, task_id)],
         )
 
 
@@ -881,39 +901,47 @@ async def review_pending_task(
     """
     if shown.state == "recorded_unresumed":
         payload = await _resume_recorded_decision(task_id, shown.approval_id)
-        return _with_undelivered(payload, shown)
+        return _with_undelivered(payload, task_id, exclude=shown.approval_id)
     if shown.state == "not_waiting":
-        return {
-            "status": "stale_decision",
-            "task_id": task_id,
-            # Careful in both directions. "This call recorded nothing" is
-            # always true; "nothing was recorded" is not, because replaying an
-            # answered round lands here once that decision moved the task on -
-            # and "your decision stands" is not either, because the task may
-            # have been carried off by somebody else before this one arrived.
-            # Name what is certain and say where to look for the rest.
-            "reason": (
-                f"{shown.reason} This call recorded nothing and showed nothing. "
-                "Read get_task or verify_task_ledger for the decisions that stand on it."
-            ),
-        }
+        return _with_undelivered(
+            {
+                "status": "stale_decision",
+                "task_id": task_id,
+                # Careful in both directions. "This call recorded nothing" is
+                # always true; "nothing was recorded" is not, because replaying an
+                # answered round lands here once that decision moved the task on -
+                # and "your decision stands" is not either, because the task may
+                # have been carried off by somebody else before this one arrived.
+                # Name what is certain and say where to look for the rest.
+                "reason": (
+                    f"{shown.reason} This call recorded nothing and showed nothing. "
+                    "Read get_task or verify_task_ledger for the decisions that stand on it."
+                ),
+            },
+            task_id,
+        )
     if shown.state == "no_artifact":
-        return {"status": "no_artifact", "task_id": task_id, "reason": shown.reason}
+        return _with_undelivered({"status": "no_artifact", "task_id": task_id, "reason": shown.reason}, task_id)
     if not compat.client_can_elicit(ctx.client_capabilities):
-        return {
-            "status": "elicitation_unsupported",
-            "task_id": task_id,
-            "reason": (
-                "This client did not declare form elicitation, so nothing was shown and nothing is recorded. "
-                f"Read the draft with get_drafts and decide with {' / '.join(compat.FALLBACK_TOOLS)}, "
-                "passing artifact_version and expected_commitment to bind the decision to what you read."
-            ),
-            "fallback_tools": list(compat.FALLBACK_TOOLS),
-            "artifact_version": shown.version,
-            "expected_commitment": shown.commitment,
-        }
+        return _with_undelivered(
+            {
+                "status": "elicitation_unsupported",
+                "task_id": task_id,
+                "reason": (
+                    "This client did not declare form elicitation, so nothing was shown and nothing is recorded. "
+                    f"Read the draft with get_drafts and decide with {' / '.join(compat.FALLBACK_TOOLS)}, "
+                    "passing artifact_version and expected_commitment to bind the decision to what you read."
+                ),
+                "fallback_tools": list(compat.FALLBACK_TOOLS),
+                "artifact_version": shown.version,
+                "expected_commitment": shown.commitment,
+            },
+            task_id,
+        )
     if not isinstance(decision, AcceptedElicitation):
-        return {"status": "no_decision", "elicitation_action": decision.action, "task_id": task_id}
+        return _with_undelivered(
+            {"status": "no_decision", "elicitation_action": decision.action, "task_id": task_id}, task_id
+        )
 
     answer = decision.data
     # Staleness, part 1: the task may have left WAITING_APPROVAL while we
@@ -925,11 +953,14 @@ async def review_pending_task(
     with _session() as db:
         current = crud.get_task(db, task_id)
         if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL:
-            return {
-                "status": "stale_decision",
-                "task_id": task_id,
-                "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
-            }
+            return _with_undelivered(
+                {
+                    "status": "stale_decision",
+                    "task_id": task_id,
+                    "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
+                },
+                task_id,
+            )
 
     return _with_undelivered(
         await _apply_decision(
@@ -941,7 +972,7 @@ async def review_pending_task(
             expected_commitment=shown.commitment,
             decision_key=_decision_key(shown, answer),
         ),
-        shown,
+        task_id,
     )
 
 

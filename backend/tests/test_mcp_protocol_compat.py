@@ -612,12 +612,46 @@ def test_a_superseded_undelivered_decision_is_surfaced_not_re_sent(
 
     async def go():
         async with connect(elicitation_callback=_unused_callback) as session:
-            return await _first_round(session, waiting_task.id)
+            asked = await _first_round(session, waiting_task.id)
+            assert isinstance(asked, types.InputRequiredResult), "the reviewer is asked, not handed a late replay"
+            # Even a decline is a moment to learn something is stranded.
+            return _payload(await _answer(session, waiting_task.id, asked, types.ElicitResult(action="decline")))
 
-    asked = asyncio.run(go())
-    assert isinstance(asked, types.InputRequiredResult), "the reviewer is asked, not handed a late replay"
+    payload = asyncio.run(go())
     assert no_platform == [], "a superseded decision is never delivered late"
+    assert payload["status"] == "no_decision"
+    assert payload["undelivered"] == [stranded.id], "it has to reach the caller, not just the table"
+    assert "not re-sent automatically" in payload["undelivered_note"]
     assert [a.id for a in crud.undelivered_approvals(mcp_db, waiting_task.id)] == [stranded.id]
+
+
+def test_a_decision_whose_claim_was_taken_elsewhere_is_not_sent_twice(waiting_task, mcp_db, monkeypatch):
+    """Even the call that just wrote the entry can lose the claim.
+
+    A retry that arrives while this call sits between its ledger commit and its
+    claim will find the unstamped row and take it. Sending anyway would be the
+    double delivery the claim exists to stop - and a second delivery answers
+    whichever interrupt the graph has reached by then.
+    """
+    from app import crud as crud_module
+
+    sent = []
+
+    async def _resume(thread_id, payload):
+        sent.append(payload)
+        return {"values": {"drafts": [DRAFT], "final_output": "shipped"}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+    # Somebody else got there first.
+    monkeypatch.setattr(crud_module, "claim_delivery", lambda db, approval_id: False)
+
+    async def go():
+        return await mcp_server._apply_decision(waiting_task.id, action="approved", comment="ok")
+
+    payload = asyncio.run(go())
+    assert payload["replayed"] is True
+    assert sent == [], "the caller that lost the claim must not reach Platform"
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
 
 
 def test_a_replayed_edit_does_not_append_a_second_draft_version(connect, waiting_task, no_platform, mcp_db):
