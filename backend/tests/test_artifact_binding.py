@@ -305,6 +305,42 @@ def test_a_decision_key_planted_on_a_pre_hash_row_is_detected(db, self_actor):
     assert report["broken_at"] == unhashed.id
 
 
+def test_claiming_v3_on_an_unhashed_row_does_not_launder_a_planted_key(db, self_actor):
+    """`hash_version` is a column too, so a version check alone proves nothing.
+
+    Setting it to 3 satisfies any "is this payload new enough" test and then
+    falls straight through the legacy skip, since the row still has no hash to
+    recompute. What actually makes a key meaningful is that the row is hashed
+    at a version covering it, and both the constraint and the verifier say so.
+    """
+    task, draft = _task_with_draft(db)
+    unhashed = models.Approval(
+        task_id=task.id,
+        reviewer_actor_id=self_actor.id,
+        action="approved",
+        created_at=datetime.utcnow(),
+    )
+    db.add(unhashed)
+    db.commit()
+
+    unhashed.hash_version = ledger.DECISION_KEY_SINCE
+    unhashed.decision_key = "victim key, on a row with no hash to break"
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+    db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    unhashed = crud.get_approvals(db, task.id)[0]
+    unhashed.hash_version = ledger.DECISION_KEY_SINCE
+    unhashed.decision_key = "victim key, on a row with no hash to break"
+    db.commit()
+    db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+
+    report = crud.verify_approval_chain(db, task.id)
+    assert report["valid"] is False
+    assert report["broken_at"] == unhashed.id
+
+
 def test_a_decision_key_planted_on_a_pre_v3_row_is_detected(db, self_actor, monkeypatch):
     """Free to plant, because that row's hash does not cover the field.
 

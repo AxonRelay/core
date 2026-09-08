@@ -52,10 +52,13 @@ def upgrade() -> None:
     # field - and the unique index would then refuse the real decision the key
     # belongs to. `verify_approval_chain` reports such a row as tampered; this
     # stops it being written at all.
+    # `hash_version` is a column like any other, so requiring it alone would
+    # let a claimed v3 sit on an unhashed row. A key belongs only on a row that
+    # is actually hashed, at a payload version that covers it.
     op.create_check_constraint(
         "ck_approval_decision_key_needs_v3",
         "approvals",
-        "decision_key IS NULL OR (hash_version IS NOT NULL AND hash_version >= 3)",
+        "decision_key IS NULL OR (entry_hash IS NOT NULL AND hash_version IS NOT NULL AND hash_version >= 3)",
     )
 
 
@@ -70,7 +73,13 @@ def downgrade() -> None:
     after an upgrade, with nothing keyed yet, it is genuinely reversible and
     proceeds.
     """
-    keyed = op.get_bind().execute(sa.text("SELECT COUNT(*) FROM approvals WHERE decision_key IS NOT NULL")).scalar()
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        # Count and drop have to be one window. Otherwise a writer that commits
+        # a keyed approval between them loses hashed data to a DROP COLUMN that
+        # was already cleared to proceed.
+        bind.execute(sa.text("LOCK TABLE approvals IN ACCESS EXCLUSIVE MODE"))
+    keyed = bind.execute(sa.text("SELECT COUNT(*) FROM approvals WHERE decision_key IS NOT NULL")).scalar()
     if keyed:
         raise RuntimeError(
             f"refusing to downgrade: {keyed} approval(s) carry a decision_key, which is inside their v3 "

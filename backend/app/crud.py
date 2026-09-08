@@ -626,10 +626,17 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
     for approval in approvals:
         # Before the legacy skip, because a pre-004 row has no hash to break
         # and would otherwise be the one place a key could be planted for
-        # free. A key on any payload below v3 is not covered by that row's
-        # hash - see the dispatch below - and the unique index would then
-        # refuse the genuine decision the key belongs to.
-        if approval.decision_key is not None and (approval.hash_version or 1) < ledger.DECISION_KEY_SINCE:
+        # free - and the unique index would then refuse the genuine decision
+        # the key belongs to.
+        #
+        # `hash_version` alone is not enough to test: it is a column like any
+        # other, so claiming v3 on an unhashed row would satisfy a version
+        # check and then fall straight through the legacy skip below. A key is
+        # only meaningful on a row that is actually hashed, at a payload
+        # version that covers it; anything else is a planted value.
+        if approval.decision_key is not None and (
+            approval.entry_hash is None or (approval.hash_version or 1) < ledger.DECISION_KEY_SINCE
+        ):
             return _report(False, approval.id)
         if approval.entry_hash is None:
             # A NULL hash is only acceptable as a leading legacy prefix (rows that
