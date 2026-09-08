@@ -28,6 +28,18 @@ Three guarantees that are easy to conflate, and what this module gives:
   never stores external artifact contents.
 * **Regulatory-grade signing / timestamping** (qualified signatures, TSA,
   21 CFR Part 11, non-repudiation) — out of scope, as before.
+* **The operational fields added by migration 013** (``decision_key``,
+  ``resumed_at``, ``edited_artifact``) — outside the chain, deliberately.
+  They describe how a decision was *handled*, not what was decided:
+  ``resumed_at`` is written after the entry, so no entry hash could cover it
+  without being invalidated by its own legitimate update. The consequence is
+  worth stating rather than leaving implicit: someone who can write the
+  database can change what the server does next — flip ``resumed_at`` back to
+  NULL and an old decision is re-delivered — at lower cost than editing the
+  decision itself, which still requires rewriting every subsequent entry. Both
+  fields are exposed on every approval payload so the state is at least
+  observable; the chain is what makes an edited *decision* evident, and it has
+  never been what stops a database writer.
 """
 
 from __future__ import annotations
