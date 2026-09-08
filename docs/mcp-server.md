@@ -71,17 +71,100 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `list_tasks(status?, limit?)` | タスク一覧 |
 | `list_pending_approvals()` | **統一承認受信箱** — 最も重要 |
 | `get_task(task_id)` | タスク詳細（assignments / drafts / approvals 同梱） |
-| `get_drafts(task_id)` | ドラフト履歴 |
+| `get_drafts(task_id)` | ドラフト履歴（各版の `commitment` = 本文 SHA-256 と `producer_actor_id` を含む） |
 | `create_task(title, description?, assignments?)` | 新規タスク + Platform thread 確保 |
 | `run_task(task_id)` | Platform 上で graph 実行 → 承認待ちまで |
-| `approve_task(task_id, comment?, modified_draft?)` | 承認（任意で edit） |
-| `reject_task(task_id, comment?, reason?)` | 差戻し（revision loop） |
-| `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。elicitation 非対応クライアントは `approve_task`/`reject_task` を使う |
-| `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy}`。`legacy` は hash chain 導入前の行数） |
+| `approve_task(task_id, comment?, modified_draft?, artifact_version?, expected_commitment?)` | 承認（任意で edit）。`artifact_version` / `expected_commitment` を渡すと**読んだ版に束縛**され、task が先に進んでいれば何も記録せず `status="stale_decision"` を返す。`modified_draft` は新しい draft 版として保存され、承認はその版に束縛される。戻り値に `approval`（束縛と hash を含む）を同梱 |
+| `reject_task(task_id, comment?, reason?, artifact_version?, expected_commitment?)` | 差戻し（revision loop）。束縛引数の意味は `approve_task` と同じ |
+| `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。問いの運び方は交渉した改訂に従う（下の[互換性マトリクス](#mcp-互換性マトリクス)）。表示した draft の版と commitment に判断を束縛するので、待っている間に draft が差し替わると**もう一度尋ねられる**（新しい draft について）。task が承認待ちを離れていれば `stale_decision`。form elicitation 非対応のクライアントには何も尋ねず、`status="elicitation_unsupported"` と束縛引数つきで `approve_task`/`reject_task` を案内する |
+| `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy, artifact_bound, unbound}`。`legacy` は hash chain 導入前の行数、`artifact_bound` は判断対象の draft 版と commitment を名指しする行数、`unbound` はそれ以外。[ADR-009](./adr-009-artifact-commitment.md)） |
 | `list_agents(agent_type?, is_active?)` | AI Actor 一覧 |
 | `create_agent(name, agent_type, ...)` | AI Actor 定義 |
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
 | `get_self_actor()` | オペレータ Human Actor |
+
+## MCP 互換性マトリクス
+
+`backend/app/mcp/compat.py` が原本で、`axonrelay://compat` として配信される。
+テストが SDK の対応版集合と突き合わせるので、この表と実装はずれない
+（[ADR-013](./adr-013-mcp-2026-interaction.md)）。
+
+| 仕様改訂 | 承認の問いの運び方 |
+|---|---|
+| `2024-11-05` / `2025-03-26` | elicitation なし。承認は `approve_task` / `reject_task` |
+| `2025-06-18` / `2025-11-25` | `tools/call` の中で単発の `elicitation/create`。接続を開いたまま待つ |
+| `2026-07-28` | 多ラウンド `tools/call`。`InputRequiredResult` + `requestState` を返し、再接続しても再開できる |
+
+- **Python SDK**: `mcp>=2.1,<3`（`backend/requirements.txt` と同一。上限は手で動かす）
+- **検証済みクライアント**: Claude Code（stdio / `.mcp.json`、form elicitation）、
+  SDK 自身の `ClientSession`（stdio と Streamable HTTP の両方で、両モデルを CI で）
+- **fallback**: `approve_task` / `reject_task`。`artifact_version` /
+  `expected_commitment` を明示に取るので、対話ラウンドなしで同じ束縛が得られる
+
+### 再開ハンドル（2026-07-28）
+
+未完了の承認は `requestState` として封をしてクライアントに返り、次の `tools/call`
+で戻ってくる。SDK は自分が発行したものだけを受け入れる。
+
+- 既定の鍵はプロセスローカル。再起動をまたぐと問い直しになる（stdio ではこれが正しい）
+- `AXONRELAY_REQUEST_STATE_KEY`（32 バイト以上）を設定すると、Streamable HTTP の
+  複数ワーカーと再起動をまたいで再開できる。弱い鍵は起動時に名指しで拒否される
+- TTL は 15 分
+- ハンドルは発行した呼び出し元（提示された credential）に束縛される。stdio と
+  無提示の HTTP では無束縛で、これは loopback 前提と同じ
+- 同じラウンドの再送は台帳側で吸収される（migration 013）。承認も、編集が作る
+  はずだった draft 版も二重には入らない。キーには reviewer も含まれるので、
+  別の承認権者が同じ判断に至っても別のエントリになる
+- `decision_key` は hash payload v3 の中にある（[ADR-013](./adr-013-mcp-2026-interaction.md)）。
+  サーバが動作の根拠にする値なので、検証が見られない場所には置かない
+- 判断が通って task が承認待ちを離れたあとの再送は `stale_decision`。文面は
+  「このラウンドは何も記録していない」とだけ言い、立っている判断は
+  `get_task` / `verify_task_ledger` で読めと案内する
+- 配送済みの判断と**同じ draft・同じ文言**の判断は再送と区別できないため拒否され、
+  `replayed: true` と `note`（`approve_task` / `reject_task` を使えという案内）が返る
+- **graph への配送はやり直さない**。2 回目の配送は、そのとき graph が到達している
+  interrupt に答えてしまう。確認が取れなかった場合は `ToolError` で「台帳には記録済み・
+  graph は未確認・送り直すなら `approve_task` / `reject_task`」と返る
+
+### 呼び出し元 identity と scope（任意）
+
+`AXONRELAY_REQUIRE_AUTH=1` のインスタンスでは、HTTP transport の全呼び出しに credential が要る（[ADR-011](./adr-011-caller-identity.md)）。stdio は常に loopback 信頼で、フラグの有無にかかわらず credential は不要。
+
+```bash
+python -m app.credentials issue --actor self --scopes ledger:read,ledger:write,coordination:read,coordination:write
+# → token は一度だけ表示される。保存は SHA-256 のみ
+claude mcp add -t http -H "Authorization: Bearer <token>" axonrelay http://127.0.0.1:8765/mcp
+```
+
+各 tool に必要な scope は `backend/app/authz.py` の `TOOL_SCOPES`。読み取り系は `ledger:read` / `coordination:read`、書き込み系は `ledger:write` / `coordination:write`、削除は `administration`。scope が足りない呼び出しは「必要な scope 名」だけを返して拒否される。`get_self_actor()` は**サーバから見た呼び出し元の Actor** を返すので、credential がどの identity に結びついているかはこれで確認できる。
+
+### 構造化コードと開示ポリシー
+
+調整系 tool は自由文に加えて**構造化コード**を受け取る（[ADR-012](./adr-012-metadata-minimization.md)）:
+`register_session` / `heartbeat_session` の `focus_code`、`claim_territory` /
+`claim_git_resource` の `reason_code`、`send_relay` の `code`、`ack_relay` の `ack_code`。
+コードを付けておくと、共有インスタンスがその session / claim / relay について
+**言えること**が増える——自由文は開示されないが、コードは開示される。
+
+`AXONRELAY_SAFE_MODE=1` のインスタンスでは、ボード・claim・relay・衝突・git guard の
+レスポンスが opaque ref とコードと件数だけになり、ホスト名・絶対パス・git ディレクトリ・
+自由文は返らない。`repo` slug は `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS=1` のときだけ返る。
+Actor 名も `actor_ref` に置き換わり、これは MCP と REST の両方で同じである。
+
+> 注意: safe mode では調整系の**書き込み** tool 自体が拒否されるので（[ADR-010](./adr-010-safe-envelope.md)）、
+> コードを設定できるのは full-text モードだけである。safe mode でコードを送る producer 側の
+> 配線は #31 の担当。
+
+モードによらず、agent の `config` は**キー名のみ**（`config_keys`）が返る。
+
+### Safe Envelope（content-blind 取り込み）
+
+`AXONRELAY_SAFE_MODE=1` のインスタンスでは上の書き込み系 tool と調整レイヤーの書き込み系 tool は固定文言で拒否され、以下だけが書き込み経路になる（[ADR-010](./adr-010-safe-envelope.md)、[schema](./schemas/safe-envelope-v1.json)）。
+
+| Tool | 用途 |
+|---|---|
+| `ingest_safe_envelope(envelope)` | metadata-only の envelope を 1 件取り込む。opaque id・action/outcome enum・producer 算出の artifact commitment・timestamp のみ。未知フィールドは拒否、拒否理由はフィールド名だけ。同じ `event_id` の再送は冪等 |
+| `list_safe_events(limit?, action?)` | 取り込み済み envelope を新しい順に返す |
 
 ### 調整レイヤー (Phase 3)
 
@@ -105,6 +188,7 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | URI | 内容 |
 |---|---|
 | `axonrelay://board` | 調整ボードのスナップショット（稼働セッション / claim / 未 ack relay）。tool call を消費せず ambient context に置ける |
+| `axonrelay://compat` | 対応する MCP 仕様改訂・SDK 版・検証済みクライアント・fallback tool（下の[互換性マトリクス](#mcp-互換性マトリクス)と同じ内容を JSON で） |
 | `axonrelay://tasks/{task_id}` | Markdown 形式のタスク詳細（LLM コンテキスト用） |
 | `axonrelay://tasks/{task_id}/drafts/{version}` | 特定バージョンのドラフト |
 

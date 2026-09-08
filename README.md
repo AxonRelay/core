@@ -52,14 +52,25 @@ a differentiator.
 
 What none of those layers give you is a **persistent record of accountability**:
 elicitation is ephemeral and per-session; observability tools log runs, not
-*who approved what*. Meanwhile the EU AI Act's high-risk obligations reach full
-enforcement on 2026-08-02, and their core asks are exactly: an immutable action
-log, a human approval gate for high-impact actions, and attribution of every
-action to a responsible identity (human **or** agent).
+*who approved what*.
 
-AxonRelay treats the human as a **first-class Actor** in that ledger, not an
-exception at the interrupt boundary. That is the residual value this repo
-preserves and dogfoods.
+Regulation points the same way, but later and more narrowly than is often
+stated. The EU AI Act's requirements for *high-risk* systems include automatic
+event logging (Article 12) and human oversight (Article 14), which overlap in
+theme with what an approval ledger records. Those high-risk obligations were
+**not** in force on 2026-08-02: that date is the Act's general application
+date and the start of its transparency rules (Article 50), while the
+Digital Omnibus on AI (Regulation (EU) 2026/1744, in force 2026-07-27)
+deferred the high-risk obligations to **2027-12-02** (Annex III systems) and
+**2028-08-02** (Annex I systems). Dates, primary sources and the day they were
+last checked are in [docs/regulatory-positioning.md](docs/regulatory-positioning.md).
+
+**AxonRelay is not a compliance product and not a certification mechanism.**
+It certifies nothing and makes nothing conform to the EU AI Act or any other
+regulation; the ledger is tamper-evident, not legally probative. What it
+preserves and dogfoods is one idea those requirements share with plain good
+engineering: the human is a **first-class Actor** in a durable ledger, not an
+exception at the interrupt boundary.
 
 ---
 
@@ -101,8 +112,8 @@ through MCP; the REST API is mostly for reading the ledger from a dashboard.
 |-------|---------|
 | `Actor` | Unified abstraction for humans and AI. A single human Actor (`name="self"`) is the operator; AI actors are 1:1 with `AgentDefinition`. |
 | `TaskAssignment` | Binds an Actor to a Task with a role: `executor` / `reviewer` / `approver` / `observer`. |
-| `Draft` | Versioned history of a task's output. |
-| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp. Tamper-evident via a per-task SHA-256 hash chain (`prev_hash` / `entry_hash`, see [`app/ledger.py`](backend/app/ledger.py)). |
+| `Draft` | Versioned history of a task's output — the **artifacts** approvals bind to. `(task_id, version)` is unique; each version carries a `commitment` (SHA-256 of its bytes) and, when known, the `producer_actor_id`. |
+| `Approval` | Append-only record: `action` (approved/rejected), `comment`, `reviewer_actor_id`, timestamp, **and the artifact it decided on** (`artifact_ref` / `artifact_version` / `artifact_commitment` / producer). Tamper-evident via a per-task SHA-256 hash chain (`prev_hash` / `entry_hash`) that covers the binding too — see [`app/ledger.py`](backend/app/ledger.py) and [ADR-009](docs/adr-009-artifact-commitment.md). |
 | `ExternalLink` | Link to an external artifact (e.g. a future MCP resource URI). |
 
 State machine:
@@ -115,7 +126,21 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 
 The ledger is safe for concurrent writers: `record_approval` locks the task row
 before reading the chain head, so two agents approving the same task cannot fork
-its hash chain.
+its hash chain. The same lock covers the draft append, so an approval that
+carries an edited draft creates the new version first and binds to it.
+
+Three guarantees that are easy to conflate:
+
+- **Tamper-evident events** — an edited or reordered approval, including any of
+  its artifact-binding fields, fails `verify_task_ledger`.
+- **Artifact identity** — each new approval names the exact draft version and
+  content commitment it decided on; a decision made against a superseded draft
+  is refused (`409` / `stale_decision`). Whether the stored draft bytes still
+  match that commitment is a separate check; the ledger never stores external
+  artifact contents. Entries recorded before this binding existed verify as
+  what they are and are reported as `not artifact-bound`.
+- **Regulatory-grade signing, timestamping and non-repudiation** — out of scope;
+  see [docs/regulatory-positioning.md](docs/regulatory-positioning.md).
 
 ---
 
@@ -126,8 +151,14 @@ its hash chain.
 | `Workspace` | One checkout of one repo on one machine, identified by `(host, repo, clone_path)`. Two clones of the same repo are two workspaces. |
 | `Session` | An Actor working inside a Workspace over a stretch of time. Holds claims, receives relays. Re-registering resumes it, so an agent restart loses nothing. |
 | `Claim` | An **advisory, expiring** lease — on paths within a repo, or on a shared git resource (`worktree` / `stash` / `refs` / `remote`) that no path pattern can describe. Overlapping claims are refused by default (`force` overrides, and the override is recorded). |
-| `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. |
+| `Relay` | A durable message addressed by audience — one actor, one clone, one repo, or the whole fleet. Delivered by pull. Carries a structured `code` beside its prose. |
 | `RelayReceipt` | Per-recipient read/ack state, so one peer acking a broadcast does not hide it from the others. |
+
+Every response about the board passes a disclosure policy
+([ADR-012](docs/adr-012-metadata-minimization.md)): in content-blind mode it
+carries opaque references, structured codes and counts, not host names,
+absolute paths or prose. Operational rows expire on a documented schedule
+(`python -m app.retention`); the ledger never does.
 
 Design, semantics, and the per-turn protocol agents follow:
 **[docs/coordination-spec.md](docs/coordination-spec.md)**.
@@ -140,7 +171,8 @@ Design, semantics, and the per-turn protocol agents follow:
 
 **Ledger — 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
 `list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
-(interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
+(interactive approval via MCP elicitation, in whichever shape the negotiated
+protocol revision uses — see `docs/mcp-server.md`), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
 
 **Coordination — 12 tools**: `register_session`, `heartbeat_session`,
@@ -156,6 +188,21 @@ board before destructive git.
 
 **3 resources**: `axonrelay://board`, `axonrelay://tasks/{id}`,
 `axonrelay://tasks/{id}/drafts/{version}`.
+
+**Safe Envelope — 2 tools**: `ingest_safe_envelope`, `list_safe_events`. With
+`AXONRELAY_SAFE_MODE=1` the instance is content-blind: every tool above that
+accepts free text refuses with a fixed message, and the envelope — opaque
+identifiers, closed enums, a source-produced artifact commitment, timestamps,
+nothing else — is the only write path ([ADR-010](docs/adr-010-safe-envelope.md),
+[schema](docs/schemas/safe-envelope-v1.json)). Without the flag this is the
+full-text local PoC.
+
+**Identity and scopes.** With `AXONRELAY_REQUIRE_AUTH=1` every HTTP caller
+presents a credential (`python -m app.credentials issue`) that names the Actor
+the server records for it and carries scopes; every tool and every REST route is
+mapped to one, and a structural test refuses an unmapped surface
+([ADR-011](docs/adr-011-caller-identity.md)). Unset, and over stdio, calls run as
+the operator.
 
 Full tool reference and Claude Code setup: **[docs/mcp-server.md](docs/mcp-server.md)**.
 
@@ -173,6 +220,7 @@ Interactive OpenAPI docs at `http://localhost:8000/docs` once the backend is up
 | `GET` | `/actors` `/actors/{id}` `/actors/me` | Actors |
 | `GET`/`POST`/`PUT`/`DELETE` | `/agents` `/agents/{id}` | AI agent definitions |
 | `GET`/`POST`/`PUT`/`DELETE` | `/tasks` `/tasks/{id}` | Tasks |
+| `POST`/`GET` | `/envelopes` | Safe Envelope ingestion and listing (content-blind; the only write path under `AXONRELAY_SAFE_MODE`) |
 | `POST` | `/tasks/{id}/run` | Run on Platform until interrupt/completion |
 | `GET` | `/tasks/pending/approvals` | The unified approval inbox |
 | `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | Approve / reject |
@@ -207,7 +255,7 @@ cp .env.example .env                    # works as-is on a laptop; add LANGGRAPH
 docker compose up -d postgres           # Postgres on 127.0.0.1:5432
 python -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt
-(cd backend && alembic upgrade head)    # migrations through 008; seeds the "self" Actor
+(cd backend && alembic upgrade head)    # migrations through 012; seeds the "self" Actor
 ```
 
 Or, with the venv active, `make dev` runs the last three and starts the MCP
@@ -253,6 +301,10 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | LLM credentials |
 | `WRITER_MODEL` / `REVIEWER_MODEL` | `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` | Per-role models |
 | `DISCORD_*` | — | Mobile approval via Discord (Phase 2.6, not yet wired) |
+| `AXONRELAY_REQUIRE_AUTH` | — | `1` requires a per-caller credential on every HTTP call and records the credential's Actor ([ADR-011](docs/adr-011-caller-identity.md)); stdio stays loopback-trusted |
+| `AXONRELAY_SAFE_MODE` | — | `1` runs the instance content-blind: free-text surfaces refuse, the Safe Envelope is the only write path ([ADR-010](docs/adr-010-safe-envelope.md)) |
+| `AXONRELAY_SAFE_PUBLIC_IDENTIFIERS` | — | `1` accepts envelopes with `identifier_policy: public` (`owner/repo` slugs); otherwise identifiers must be opaque |
+| `AXONRELAY_REQUEST_STATE_KEY` | — | 32+ bytes keying the sealed handle that resumes a half-finished interactive approval on MCP 2026-07-28 ([ADR-013](docs/adr-013-mcp-2026-interaction.md)); unset, the key is process-local and a restart makes the client ask again |
 
 See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
@@ -262,12 +314,12 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (26 tools / 3 resources), LangGraph Platform client, migrations through 008. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (28 tools / 3 resources), LangGraph Platform client, migrations through 012. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
 - 🚧 **Infra**: legacy `infra/` (AWS EC2 DNS) and `Caddyfile` removed. The cutover to Cloudflare Tunnel + Tailscale + Vercel/Pages is templated and documented in [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md); the account-side steps (DNS switch, EC2 decommission) remain a manual operator action.
-- 🚧 **Tests**: 156 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, the MCP tool surface) plus 18 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and on resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
+- 🚧 **Tests**: 396 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, the MCP tool surface) plus 36 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and on resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
 
 Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md). Coordination design: [docs/coordination-spec.md](docs/coordination-spec.md).
 
@@ -276,9 +328,15 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 ## Docs
 
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — pivot spec (Actor model, scope, dogfood scenarios)
+- [docs/regulatory-positioning.md](docs/regulatory-positioning.md) — what AxonRelay is *not* (no compliance or certification claims), the EU AI Act application dates with primary sources and the date they were checked, and the docs review checklist
 - [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: presence, territory claims, relays
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — why the coordination layer has no message broker
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — why `gitsafe` stays opt-in instead of shadowing `git` on PATH
+- [docs/adr-009-artifact-commitment.md](docs/adr-009-artifact-commitment.md) — why every approval names the draft version and content commitment it decided on, and what that does not prove
+- [docs/adr-010-safe-envelope.md](docs/adr-010-safe-envelope.md) — the content-blind mode: what the Safe Envelope admits, what every other surface refuses, and how rejected values stay out of storage, logs and errors
+- [docs/adr-011-caller-identity.md](docs/adr-011-caller-identity.md) — per-caller credentials and the six scopes: how the recorded Actor stops being a request parameter, and why stdio stays loopback-trusted
+- [docs/adr-012-metadata-minimization.md](docs/adr-012-metadata-minimization.md) — what a shared board may say about a machine, the retention windows, and a threat model naming what stays observable
+- [docs/adr-013-mcp-2026-interaction.md](docs/adr-013-mcp-2026-interaction.md) — the two MCP interaction models an approval can travel on, how the decision stays bound to the draft that was shown across rounds, and why a replayed round cannot append twice
 - [docs/step2-plan.md](docs/step2-plan.md) — migration plan (Phase 2.1–2.6)
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP server connection guide & tool reference
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord mobile-approval setup (account side only; the backend side is not built yet)
