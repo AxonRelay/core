@@ -74,13 +74,6 @@ def approval_to_dict(approval: models.Approval) -> dict:
         "artifact_commitment": approval.artifact_commitment,
         "artifact_commitment_algorithm": approval.artifact_commitment_algorithm,
         "producer_actor_id": approval.producer_actor_id,
-        # Delivery state, so a decision that never reached the graph is
-        # findable rather than only inferable. `resumed_at` records the one
-        # attempt, not its outcome: an entry stamped here may still have been
-        # lost in flight, and comparing it against the thread is what settles
-        # that (app/mcp/server.py, `_deliver`).
-        "delivery_attempted_at": approval.resumed_at.isoformat() if approval.resumed_at else None,
-        "carried_edit": bool(approval.edited_artifact),
     }
 
 
