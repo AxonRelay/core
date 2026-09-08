@@ -71,17 +71,30 @@ unique index は、ロックをすり抜けた二重書き込みの最後の砦�
 
 **台帳に行があることは、graph が判断を受け取った証拠ではない。** `record_approval` の
 commit 後に `resume_thread` が落ちれば、task は承認待ちのまま行だけが残る
-（`app/service.py` の projection はこの隙間を前提に書かれている）。そこで
-`_shown_artifact` は、**問いを組み立てる前に**この状態を見つける: task が承認待ちで、
-最新の承認がこの呼び出し元のもので、最新 draft に束縛されているなら、判断は記録済みで
-未 resume である。このとき何も尋ねず、記録済みエントリから resume をやり直す
+（`app/service.py` の projection はこの隙間を前提に書かれている）。
+
+この状態を**推測してはいけない**。「届かなかった」と「届いた上で graph が同じ draft に
+再 interrupt した」は、task の status からは完全に同一に見える。推測すると、前者を
+見逃せば task は永久に停まり、後者を取り違えれば reviewer の**新しい問いを奪って**
+古い判断を黙って再送する。だから `approvals.resumed_at` に**記録する**（migration 013、
+既存行は `created_at` で backfill——履歴を未配送と見なせば古い判断を再送してしまう）。
+
+`_shown_artifact` は問いを組み立てる前にこれを読む: task が承認待ちで、最新の承認が
+この呼び出し元のもので、`resumed_at` が NULL なら、判断は記録済みで未配送である。
+このとき何も尋ねず、記録済みエントリから resume をやり直す
 （`_resume_recorded_decision`）。
 
 尋ね直しでは駄目な理由は編集付き承認にある。編集は承認より先に draft v2 として
 commit されるので、やり直しを「最新 draft について尋ね直す」と、reviewer は**自分が
 書いた文面**を見せられ、答えれば 1 つの判断に対して 2 件目のエントリが増える。
-分離できない残余は、差戻しループが同じ draft のまま承認待ちに戻ってくる場合で、
-そこでのやり直しは同じ draft への同じ判断の再送になる。
+やり直しが元の呼び出しに忠実であるために `edited_artifact` も記録する。draft の
+producer では答えにならない——たまたま最新 draft を以前に書いた reviewer は、この承認で
+編集した reviewer と見分けがつかない。
+
+やり直しの権利は条件付き UPDATE で**取り合う**（`claim_resume`）。同時に届いた 2 つの
+再送が両方 `resumed_at IS NULL` を見て両方 resume する、というのは書き込み側で row
+lock が防いでいるのと同じ欠陥の 1 段あとの再演である。Platform 呼び出しが失敗したら
+claim は返す——失われた resume が恒久的な損失になってはいけない。
 
 キーは**ハッシュの外**に置く。名指すのはリクエストであって、証明対象のイベントでは
 ない。したがって `hash_version` は動かず、既存エントリはすべてそのまま検証できる。
@@ -139,6 +152,9 @@ form elicitation を宣言していないクライアントには**何も尋ね�
   見よと案内する。
 - resume が落ちたあとのやり直しは、`decision_key` ではなく `_shown_artifact` の
   `recorded_unresumed` が受ける。`decision_key` が受けるのは同時実行の競合である。
+- 配送済みの判断のあと graph が同じ draft に再 interrupt した場合は、reviewer は
+  通常どおり新しい問いを受け取る。`resumed_at` を記録しているので、この状態は
+  未配送と混ざらない。
 - `review_pending_task` が「承認待ちでない」ときにエラーではなく
   `status="stale_decision"` を返すようになった。これは競合の通常の結末であり、
   回答ラウンドでも起こりうる。`approve_task` / `reject_task` は従来どおりエラー。
