@@ -16,7 +16,6 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    false,
 )
 from sqlalchemy.orm import relationship, validates
 
@@ -245,19 +244,11 @@ class Approval(Base):
 
     # Retry de-duplication (migration 013). A caller that can re-send the same
     # decision - the 2026-07-28 multi-round tools/call replays its whole
-    # request, `request_state` included - names the decision once here, and the
-    # unique index makes a second append impossible rather than unlikely.
-    # Deliberately NOT inside the hash: it identifies the *request*, not the
-    # attested event, so adding it needs no new hash_version.
+    # request - names the decision once here, and the unique index makes a
+    # second append impossible rather than unlikely. Inside the v3 hash
+    # payload (app/ledger.py): the server acts on it, so a value verification
+    # could not see could be cleared to defeat the de-duplication.
     decision_key = Column(String(64))
-
-    # When the graph was told about this decision, and whether the decision
-    # carried the reviewer's own edited text. Both record what would otherwise
-    # be inferred from the task's status and the draft's producer - inferences
-    # that are wrong in exactly the states recovery cares about. Outside the
-    # hash for the same reason as decision_key.
-    resumed_at = Column(DateTime)
-    edited_artifact = Column(Boolean, nullable=False, server_default=false(), default=False)
 
     __table_args__ = (UniqueConstraint("task_id", "decision_key", name="uq_approval_decision_key"),)
 

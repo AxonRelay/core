@@ -391,45 +391,20 @@ async def run_task(task_id: int) -> dict:
         return task_to_dict(task)
 
 
-def _with_undelivered(payload: dict, task_id: int, *, exclude: int | None = None) -> dict:
-    """Attach any decision that was recorded and then lost before it was sent.
-
-    Recovery only re-drives the newest such entry, because an older one has
-    been superseded and delivering it now would answer a question it was not
-    made about. Silence would be the worse failure: an entry sitting in the
-    ledger that the graph never heard, with nothing pointing at it.
-
-    Read here rather than carried from the resolver's snapshot, and attached to
-    every answer rather than only the deciding ones. A snapshot taken before
-    the reviewer answered can be minutes stale by the time it is reported as
-    current fact, and a decline is exactly as good a moment to learn that
-    something is stranded as an approval is.
-
-    The one answer this cannot reach is the input-required round itself: that
-    result is built by the SDK from the resolvers, and the tool body does not
-    run. It is reported on the round that follows.
-    """
-    with _session() as db:
-        stranded = [a.id for a in crud.undelivered_approvals(db, task_id) if a.id != exclude]
-    if stranded:
-        payload["undelivered"] = stranded
-        payload["undelivered_note"] = (
-            "These recorded decisions were never delivered to the graph and were superseded before "
-            "they could be. They are not re-sent automatically - delivering one now would answer a "
-            "question it was not made about. Read them with get_task and decide what the thread needs."
-        )
-    return payload
-
-
 async def _deliver(task: models.Task, resume_payload: dict[str, Any], approval_id: int) -> dict:
     """Make the one delivery attempt this decision gets, and name the doubt if it fails.
 
-    The claim is already taken, so a failure here leaves the entry marked
-    attempted and no second attempt will be made automatically. That is the
-    safe half of an unavoidable ambiguity - a call that times out after
-    Platform accepted it is indistinguishable from one it never received - but
-    it is only safe if the operator is told, in terms they can act on, rather
-    than left with a traceback.
+    Nothing re-sends it. `resume_thread` is a plain LangGraph resume with no
+    idempotency key, so a second delivery does not repeat the first - it
+    answers whichever interrupt the graph has reached by then, which can be a
+    question no human has seen. An automatic retry cannot tell a call that
+    never arrived from one that was accepted and then timed out, so it would
+    be guessing about exactly that.
+
+    What the server owes here is not a retry but an honest report: the decision
+    is in the ledger, the graph did not confirm it, and a person can re-drive
+    it with the direct tools. That records a second entry, which is the truth -
+    somebody decided to send it again.
     """
     try:
         return await langgraph_client.resume_thread(task.thread_id, resume_payload)
@@ -443,8 +418,8 @@ async def _deliver(task: models.Task, resume_payload: dict[str, Any], approval_i
             raise
         raise ToolError(
             f"Decision {approval_id} is recorded in the ledger, but the graph did not confirm it "
-            f"({type(e).__name__}). It will not be re-sent on its own: a second delivery would answer "
-            "whichever question the graph has reached by now. Check the thread, then re-drive it with "
+            f"({type(e).__name__}). Nothing re-sends it: a second delivery would answer whichever "
+            "question the graph has reached by now. Check the thread, then re-drive it with "
             f"{' / '.join(compat.FALLBACK_TOOLS)} if it never arrived."
         ) from None
 
@@ -514,11 +489,14 @@ async def _apply_decision(
             payload = task_to_dict(task)
             payload["approval"] = approval_to_dict(e.approval)
             payload["replayed"] = True
-            if e.approval.resumed_at is not None and task.status == models.TaskStatusEnum.WAITING_APPROVAL:
+            if task.status == models.TaskStatusEnum.WAITING_APPROVAL:
+                # Still waiting after an identical decision was recorded: this
+                # may well be a reviewer answering a repeated question rather
+                # than a client retrying. Nothing here can tell, so say so.
                 payload["note"] = (
-                    "An identical decision is already recorded and was delivered to the graph, and this task "
-                    "is waiting again. If this is a new decision on a repeated question rather than a retry, "
-                    f"record it with {' / '.join(compat.FALLBACK_TOOLS)}."
+                    "An identical decision is already recorded on this task, and it is waiting again. "
+                    "If this is a new decision on a repeated question rather than a retry, record it with "
+                    f"{' / '.join(compat.FALLBACK_TOOLS)}, which take no key."
                 )
             return payload
         except crud.StaleArtifactError as e:
@@ -537,21 +515,6 @@ async def _apply_decision(
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
-        # Claim the one delivery attempt before making it. Recorded rather
-        # than inferred from the task's status, which cannot tell "never sent"
-        # from "sent, and the graph interrupted again"; and taken *before* the
-        # call, because a second delivery does not land harmlessly - it
-        # satisfies whichever interrupt the graph has reached by then.
-        #
-        # The claim can be lost even here, where the entry was just written: a
-        # retry that arrived while this call was between its ledger commit and
-        # this line will have found the unstamped row and taken it. Sending
-        # anyway would be exactly the double delivery the claim exists to stop.
-        if not crud.claim_delivery(db, approval.id):
-            payload = task_to_dict(task)
-            payload["approval"] = approval_to_dict(approval)
-            payload["replayed"] = True
-            return payload
         result = await _deliver(task, resume_payload, approval.id)
         _sync_state(db, task, result)
         db.refresh(task)
@@ -632,10 +595,7 @@ class _ShownArtifact(BaseModel):
 
     * `ready` - `version` / `commitment` / `content` name the pinned draft;
     * `no_artifact` - the task is waiting, but has no draft to decide on;
-    * `not_waiting` - the task is not (or is no longer) WAITING_APPROVAL;
-    * `recorded_unresumed` - this caller's decision is already in the ledger
-      but the task is still parked, so the graph never received it;
-      `approval_id` names the entry to re-drive.
+    * `not_waiting` - the task is not (or is no longer) WAITING_APPROVAL.
 
     `not_waiting` is a state and not an exception because it is the ordinary
     outcome of a race, and it can happen on *any* round: from 2026-07-28 this
@@ -644,9 +604,8 @@ class _ShownArtifact(BaseModel):
     """
 
     task_id: int
-    state: Literal["ready", "no_artifact", "not_waiting", "recorded_unresumed"] = "ready"
+    state: Literal["ready", "no_artifact", "not_waiting"] = "ready"
     reason: str = ""
-    approval_id: int | None = None
     title: str = ""
     feedback: str | None = None
     version: int | None = None
@@ -690,27 +649,6 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
         # creating a version. What is shown and what is recorded must be the
         # same object.
         drafts = crud.get_drafts(db, task_id)
-        # Before showing anything: has this caller already decided, without the
-        # graph hearing about it? `record_approval` commits, then the Platform
-        # call can fail — the ledger entry stands while the task stays parked.
-        # Asking again here would be wrong twice over: the reviewer would be
-        # re-shown a draft they have already ruled on (their own edit, if they
-        # made one, since that edit is now the latest version), and answering
-        # would append a second entry for one decision. Repair instead.
-        #
-        # `resumed_at` is the whole discriminator, and it has to be recorded
-        # rather than inferred: a rejection that WAS delivered and made the
-        # graph interrupt again on the same draft leaves the task in a state
-        # identical to a lost resume, and replaying the old decision there
-        # would rob the reviewer of the new question.
-        newest = crud.latest_approval(db, task_id) if drafts else None
-        if newest is not None and newest.resumed_at is None and newest.reviewer_actor_id == authz.acting_actor_id(db):
-            return _ShownArtifact(
-                task_id=task_id,
-                state="recorded_unresumed",
-                approval_id=newest.id,
-                reason="A decision by this reviewer is recorded but was never delivered to the graph.",
-            )
         if not drafts:
             return _ShownArtifact(
                 task_id=task_id,
@@ -817,59 +755,6 @@ def _scope_to_reviewer(decision_key: str | None, reviewer_actor_id: int | None) 
     return hashlib.sha256(f"{decision_key}:{reviewer_actor_id}".encode()).hexdigest()
 
 
-async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
-    """Hand a decision that is already in the ledger to the graph, again.
-
-    The recovery half of "a ledger row is not evidence the graph received the
-    decision". Everything the resume needs is in the recorded entry, so no new
-    entry is written and the reviewer is not asked anything: the decision was
-    made, it just did not arrive.
-
-    Only reachable when `resumed_at IS NULL`, which by construction means
-    nothing was ever sent for this entry: the claim is taken before the
-    Platform call, so an entry that was attempted carries a stamp whether or
-    not the call succeeded. That invariant is what makes re-driving safe here.
-
-    Delivery is therefore **at most once**, and that is the right direction.
-    `langgraph_client.resume_thread` is a plain LangGraph resume with no
-    idempotency key, so a second delivery does not simply repeat the first -
-    it answers whatever interrupt the graph has reached by then, which can be
-    a question no human has seen. An approval ledger cannot let that happen
-    invisibly. A decision stranded as attempted-but-unconfirmed is worse for
-    liveness and better for the property the ledger exists to hold, and it is
-    visible: `undelivered` in the tool's answer, and a person can re-drive it.
-    """
-    with _session() as db:
-        task = crud.get_task(db, task_id)
-        approval = db.query(models.Approval).filter(models.Approval.id == approval_id).one_or_none()
-        if task is None or approval is None:  # pragma: no cover - torn between rounds
-            raise ToolError(f"Task {task_id} changed while its recorded decision was being resumed")
-        if not crud.claim_delivery(db, approval_id):
-            # Somebody else took the attempt between the resolver's read and
-            # this one. Two deliveries is the outcome to avoid; stand down.
-            db.refresh(approval)
-            payload = task_to_dict(task)
-            payload["approval"] = approval_to_dict(approval)
-            payload["replayed"] = True
-            return payload
-
-        resume_payload: dict[str, Any] = {"decision": approval.action, "human_comment": approval.comment}
-        if approval.action == "approved":
-            # Faithful to the original call: the producer of the bound draft
-            # cannot answer this, because a reviewer who happened to author
-            # the latest draft earlier looks exactly like one who edited it as
-            # part of this approval.
-            bound = next((d for d in crud.get_drafts(db, task_id) if d.version == approval.artifact_version), None)
-            resume_payload["modified_draft"] = bound.content if (approval.edited_artifact and bound) else None
-        result = await _deliver(task, resume_payload, approval_id)
-        _sync_state(db, task, result)
-        db.refresh(task)
-        payload = task_to_dict(task)
-        payload["approval"] = approval_to_dict(approval)
-        payload["replayed"] = True
-        return payload
-
-
 @mcp.tool()
 async def review_pending_task(
     task_id: int,
@@ -899,49 +784,38 @@ async def review_pending_task(
     returns the decision it already recorded, marked `replayed: true`, instead
     of appending a second one.
     """
-    if shown.state == "recorded_unresumed":
-        payload = await _resume_recorded_decision(task_id, shown.approval_id)
-        return _with_undelivered(payload, task_id, exclude=shown.approval_id)
     if shown.state == "not_waiting":
-        return _with_undelivered(
-            {
-                "status": "stale_decision",
-                "task_id": task_id,
-                # Careful in both directions. "This call recorded nothing" is
-                # always true; "nothing was recorded" is not, because replaying an
-                # answered round lands here once that decision moved the task on -
-                # and "your decision stands" is not either, because the task may
-                # have been carried off by somebody else before this one arrived.
-                # Name what is certain and say where to look for the rest.
-                "reason": (
-                    f"{shown.reason} This call recorded nothing and showed nothing. "
-                    "Read get_task or verify_task_ledger for the decisions that stand on it."
-                ),
-            },
-            task_id,
-        )
+        return {
+            "status": "stale_decision",
+            "task_id": task_id,
+            # Careful in both directions. "This call recorded nothing" is
+            # always true; "nothing was recorded" is not, because replaying an
+            # answered round lands here once that decision moved the task on -
+            # and "your decision stands" is not either, because the task may
+            # have been carried off by somebody else before this one arrived.
+            # Name what is certain and say where to look for the rest.
+            "reason": (
+                f"{shown.reason} This call recorded nothing and showed nothing. "
+                "Read get_task or verify_task_ledger for the decisions that stand on it."
+            ),
+        }
     if shown.state == "no_artifact":
-        return _with_undelivered({"status": "no_artifact", "task_id": task_id, "reason": shown.reason}, task_id)
+        return {"status": "no_artifact", "task_id": task_id, "reason": shown.reason}
     if not compat.client_can_elicit(ctx.client_capabilities):
-        return _with_undelivered(
-            {
-                "status": "elicitation_unsupported",
-                "task_id": task_id,
-                "reason": (
-                    "This client did not declare form elicitation, so nothing was shown and nothing is recorded. "
-                    f"Read the draft with get_drafts and decide with {' / '.join(compat.FALLBACK_TOOLS)}, "
-                    "passing artifact_version and expected_commitment to bind the decision to what you read."
-                ),
-                "fallback_tools": list(compat.FALLBACK_TOOLS),
-                "artifact_version": shown.version,
-                "expected_commitment": shown.commitment,
-            },
-            task_id,
-        )
+        return {
+            "status": "elicitation_unsupported",
+            "task_id": task_id,
+            "reason": (
+                "This client did not declare form elicitation, so nothing was shown and nothing is recorded. "
+                f"Read the draft with get_drafts and decide with {' / '.join(compat.FALLBACK_TOOLS)}, "
+                "passing artifact_version and expected_commitment to bind the decision to what you read."
+            ),
+            "fallback_tools": list(compat.FALLBACK_TOOLS),
+            "artifact_version": shown.version,
+            "expected_commitment": shown.commitment,
+        }
     if not isinstance(decision, AcceptedElicitation):
-        return _with_undelivered(
-            {"status": "no_decision", "elicitation_action": decision.action, "task_id": task_id}, task_id
-        )
+        return {"status": "no_decision", "elicitation_action": decision.action, "task_id": task_id}
 
     answer = decision.data
     # Staleness, part 1: the task may have left WAITING_APPROVAL while we
@@ -953,26 +827,20 @@ async def review_pending_task(
     with _session() as db:
         current = crud.get_task(db, task_id)
         if not current or current.status != models.TaskStatusEnum.WAITING_APPROVAL:
-            return _with_undelivered(
-                {
-                    "status": "stale_decision",
-                    "task_id": task_id,
-                    "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
-                },
-                task_id,
-            )
+            return {
+                "status": "stale_decision",
+                "task_id": task_id,
+                "reason": "Task changed since it was shown; no decision recorded. Re-run review_pending_task.",
+            }
 
-    return _with_undelivered(
-        await _apply_decision(
-            task_id,
-            action="approved" if answer.approve else "rejected",
-            comment=answer.comment or None,
-            modified_draft=(answer.modified_draft or None) if answer.approve else None,
-            artifact_version=shown.version,
-            expected_commitment=shown.commitment,
-            decision_key=_decision_key(shown, answer),
-        ),
+    return await _apply_decision(
         task_id,
+        action="approved" if answer.approve else "rejected",
+        comment=answer.comment or None,
+        modified_draft=(answer.modified_draft or None) if answer.approve else None,
+        artifact_version=shown.version,
+        expected_commitment=shown.commitment,
+        decision_key=_decision_key(shown, answer),
     )
 
 

@@ -115,25 +115,16 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 - 同じラウンドの再送は台帳側で吸収される（migration 013）。承認も、編集が作る
   はずだった draft 版も二重には入らない。キーには reviewer も含まれるので、
   別の承認権者が同じ判断に至っても別のエントリになる
+- `decision_key` は hash payload v3 の中にある（[ADR-013](./adr-013-mcp-2026-interaction.md)）。
+  サーバが動作の根拠にする値なので、検証が見られない場所には置かない
 - 判断が通って task が承認待ちを離れたあとの再送は `stale_decision`。文面は
   「このラウンドは何も記録していない」とだけ言い、立っている判断は
   `get_task` / `verify_task_ledger` で読めと案内する
-- 記録済みだが graph に届いていない場合（`resumed_at` が NULL）は、何も尋ねずに
-  記録済みエントリから resume をやり直して `replayed: true` を返す。台帳に行が
-  あることは graph が判断を受け取った証拠ではないため。配送済みの判断のあと graph が
-  同じ draft に再 interrupt した場合は、これと混ざらず通常どおり新しい問いになる
-- **graph への配送は at-most-once**。試行権は Platform 呼び出しの前に確保するので、
-  `resumed_at` の意味は「届いた」ではなく「試みた」。2 回目の配送は、そのとき graph が
-  到達している interrupt に答えてしまう（＝誰も見ていない問いへの判断になりうる）ため
-- 配送が確認できなかった場合は自動再送しない。「台帳には記録済み・graph は未確認」と
-  `approve_task` / `reject_task` での送り方を返す
-- 配送されないまま追い越された判断は応答の `undelivered` に出る（遅れて送ると別の問いに
-  答えてしまうので、自動では送らない）。承認・差戻しだけでなく decline / cancel /
-  `stale_decision` / `elicitation_unsupported` の応答にも付く。唯一付かないのは
-  input-required ラウンド自体で、そこは SDK が結果を組み立てるため tool 本体が走らない
 - 配送済みの判断と**同じ draft・同じ文言**の判断は再送と区別できないため拒否され、
-  `replayed: true` と `note`（`approve_task` / `reject_task` を使えという案内）が返る。
-  2 件目の判断を記録したい場合はその 2 つを使う
+  `replayed: true` と `note`（`approve_task` / `reject_task` を使えという案内）が返る
+- **graph への配送はやり直さない**。2 回目の配送は、そのとき graph が到達している
+  interrupt に答えてしまう。確認が取れなかった場合は `ToolError` で「台帳には記録済み・
+  graph は未確認・送り直すなら `approve_task` / `reject_task`」と返る
 
 ### 呼び出し元 identity と scope（任意）
 

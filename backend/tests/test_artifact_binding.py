@@ -475,8 +475,14 @@ def test_the_unique_index_is_the_backstop_for_a_race(db, self_actor):
     assert [a.id for a in crud.get_approvals(db, task.id)] == [recorded.id]
 
 
-def test_the_decision_key_is_outside_the_hash(db, self_actor):
-    """It names the request, not the attested event, so it must not move the chain."""
+def test_the_decision_key_is_inside_the_hash(db, self_actor):
+    """The server acts on it, so verification has to be able to see it.
+
+    Editing a recorded decision costs a rewrite of every later entry. A control
+    field outside the payload would cost nothing - and clearing it defeats the
+    replay de-duplication - so it is hashed like everything else the entry
+    asserts.
+    """
     task, draft = _task_with_draft(db)
     keyed = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1")
     expected = ledger.compute_entry_hash(
@@ -486,6 +492,7 @@ def test_the_decision_key_is_outside_the_hash(db, self_actor):
         action="approved",
         comment=None,
         created_at=keyed.created_at,
+        decision_key="k1",
         artifact=ledger.ArtifactBinding(
             ref=ledger.artifact_ref(task.id, draft.version),
             version=draft.version,
@@ -496,6 +503,11 @@ def test_the_decision_key_is_outside_the_hash(db, self_actor):
     )
     assert keyed.entry_hash == expected
     assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+    # And clearing it is detected, which is the whole point.
+    keyed.decision_key = None
+    db.commit()
+    assert crud.verify_approval_chain(db, task.id)["valid"] is False
 
 
 def test_two_reviewers_reaching_the_same_verdict_are_two_entries(db, self_actor):
@@ -523,6 +535,7 @@ def test_two_reviewers_reaching_the_same_verdict_are_two_entries(db, self_actor)
         db, task.id, reviewer_b.id, "rejected", decision_key=_scope_to_reviewer(round_key, reviewer_b.id)
     )
     assert second.id != first.id
+    assert second.decision_key != first.decision_key
     assert [a.reviewer_actor_id for a in crud.get_approvals(db, task.id)] == [self_actor.id, reviewer_b.id]
     assert second.prev_hash == first.entry_hash
     assert crud.verify_approval_chain(db, task.id)["valid"] is True
