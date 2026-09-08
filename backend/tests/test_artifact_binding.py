@@ -22,6 +22,7 @@ import hashlib
 from datetime import datetime
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app import crud, ledger, models
@@ -245,12 +246,65 @@ def test_downgrading_the_payload_version_marker_is_detected(db, self_actor, rela
     assert verdict["broken_at"] == victim.id
 
 
-def test_a_future_payload_version_does_not_flag_v2_rows(db, self_actor, monkeypatch):
-    """Dispatch is on the row's own version, not on equality with the current one."""
+def test_a_future_payload_version_does_not_flag_older_rows(db, self_actor, monkeypatch):
+    """Dispatch is on the row's own version, not on equality with the current one.
+
+    Recording under today's version and then advancing the module's current
+    version must leave the row verifiable: it is recomputed as what it is, not
+    as what the code now writes. Pinned against a version beyond the newest
+    payload so the test keeps its meaning after the next bump.
+    """
     task, _ = _task_with_draft(db)
-    crud.record_approval(db, task.id, self_actor.id, "approved", "a")
-    monkeypatch.setattr(ledger, "ENTRY_HASH_VERSION", 3)
+    recorded = crud.record_approval(db, task.id, self_actor.id, "approved", "a", decision_key="k1")
+    assert recorded.hash_version == ledger.ENTRY_HASH_VERSION
+    monkeypatch.setattr(ledger, "ENTRY_HASH_VERSION", ledger.ENTRY_HASH_VERSION + 1)
     assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+
+def test_a_v2_row_verifies_without_the_decision_key_field(db, self_actor, monkeypatch):
+    """The v3 field must be absent from a v2 payload, not hashed as null.
+
+    Recomputing an older row with `decision_key=None` in the payload would
+    change its bytes and turn every migrated entry invalid at once.
+    """
+    task, draft = _task_with_draft(db)
+    monkeypatch.setattr(ledger, "ENTRY_HASH_VERSION", 2)
+    v2 = crud.record_approval(db, task.id, self_actor.id, "approved", "a")
+    assert v2.hash_version == 2
+    monkeypatch.undo()
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+
+def test_a_decision_key_planted_on_a_pre_v3_row_is_detected(db, self_actor, monkeypatch):
+    """Free to plant, because that row's hash does not cover the field.
+
+    The harm is not the row itself: the unique index over (task_id,
+    decision_key) would then refuse the genuine decision that key belongs to.
+    Verification dispatches on the row's own version, so this is caught there
+    rather than by the hash.
+    """
+    task, draft = _task_with_draft(db)
+    monkeypatch.setattr(ledger, "ENTRY_HASH_VERSION", 2)
+    legacy = crud.record_approval(db, task.id, self_actor.id, "approved", "a")
+    monkeypatch.undo()
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+    # The database refuses it outright.
+    legacy.decision_key = "a key this payload never hashed"
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+    # And if that constraint were ever dropped, verification still catches it.
+    db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    legacy = crud.get_approvals(db, task.id)[0]
+    legacy.decision_key = "a key this payload never hashed"
+    db.commit()
+    db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+
+    report = crud.verify_approval_chain(db, task.id)
+    assert report["valid"] is False
+    assert report["broken_at"] == legacy.id
 
 
 def test_the_hash_covers_the_binding(db):
