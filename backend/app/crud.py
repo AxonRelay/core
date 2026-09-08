@@ -357,45 +357,6 @@ class DuplicateDecisionError(LedgerError):
         self.approval = approval
 
 
-def claim_delivery(db: Session, approval_id: int) -> bool:
-    """Claim the single attempt at telling the graph about this decision.
-
-    A conditional UPDATE, committed *before* the Platform call, so the column
-    means "an attempt was made" rather than "it arrived". That direction is
-    deliberate: `resume_thread` is a plain LangGraph resume with no idempotency
-    key, and a second delivery does not land harmlessly - it satisfies whatever
-    interrupt the graph has reached by then, which may be a question no human
-    has seen. An entry stranded as attempted-but-unsure is recoverable by a
-    person and visible in the ledger; an unreviewed decision applied to a fresh
-    interrupt is neither.
-
-    Returns False when somebody else holds the attempt.
-    """
-    updated = (
-        db.query(models.Approval)
-        .filter(models.Approval.id == approval_id, models.Approval.resumed_at.is_(None))
-        .update({models.Approval.resumed_at: datetime.utcnow()}, synchronize_session=False)
-    )
-    db.commit()
-    return updated == 1
-
-
-def undelivered_approvals(db: Session, task_id: int):
-    """Entries on this task for which delivery was never attempted, oldest first.
-
-    Normally empty. A non-empty list that is not just the newest entry means a
-    decision was recorded and then lost before anything was sent - it must be
-    surfaced rather than quietly re-driven, because a superseded decision
-    delivered late would answer the wrong question.
-    """
-    return (
-        db.query(models.Approval)
-        .filter(models.Approval.task_id == task_id, models.Approval.resumed_at.is_(None))
-        .order_by(models.Approval.id.asc())
-        .all()
-    )
-
-
 def latest_approval(db: Session, task_id: int):
     """The newest approval entry on a task, or None — the head of its hash chain."""
     return (
@@ -575,7 +536,6 @@ def record_approval(
         db.flush()
 
     target = shown
-    edited = modified_draft is not None
     if modified_draft is not None:
         # Always a new version, even for identical text: the graph appends
         # the modified draft to its own state unconditionally, and the
@@ -602,6 +562,7 @@ def record_approval(
         comment=comment,
         created_at=now,
         artifact=binding,
+        decision_key=decision_key,
     )
     db_approval = models.Approval(
         task_id=task_id,
@@ -618,7 +579,6 @@ def record_approval(
         artifact_commitment_algorithm=binding.commitment_algorithm,
         producer_actor_id=binding.producer_actor_id,
         decision_key=decision_key,
-        edited_artifact=edited,
     )
     db.add(db_approval)
     db.commit()
@@ -694,6 +654,9 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             created_at=approval.created_at,
             artifact=artifact,
             version=approval.hash_version,
+            # Dispatched the same way: a v2 row is recomputed without the field
+            # rather than with a null one, so it verifies as it was written.
+            decision_key=approval.decision_key,
         )
         if approval.prev_hash != prev_hash or approval.entry_hash != expected:
             return _report(False, approval.id)
