@@ -357,34 +357,6 @@ class DuplicateDecisionError(LedgerError):
         self.approval = approval
 
 
-def claim_resume(db: Session, approval_id: int) -> bool:
-    """Claim the right to tell the graph about this decision. True if we got it.
-
-    A conditional UPDATE rather than a read-then-write: two retries arriving
-    together would both see `resumed_at IS NULL` and both drive the graph.
-    Whoever's UPDATE matches the row owns the resume; the other is told no and
-    returns without touching Platform.
-
-    Held only for the duration of the call - `release_resume` puts it back if
-    the resume fails, so a lost Platform call stays recoverable.
-    """
-    updated = (
-        db.query(models.Approval)
-        .filter(models.Approval.id == approval_id, models.Approval.resumed_at.is_(None))
-        .update({models.Approval.resumed_at: datetime.utcnow()}, synchronize_session=False)
-    )
-    db.commit()
-    return updated == 1
-
-
-def release_resume(db: Session, approval_id: int) -> None:
-    """Give back a resume claim whose Platform call did not succeed."""
-    db.query(models.Approval).filter(models.Approval.id == approval_id).update(
-        {models.Approval.resumed_at: None}, synchronize_session=False
-    )
-    db.commit()
-
-
 def latest_approval(db: Session, task_id: int):
     """The newest approval entry on a task, or None — the head of its hash chain."""
     return (

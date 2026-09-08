@@ -447,13 +447,22 @@ async def _apply_decision(
                 decision_key=_scope_to_reviewer(decision_key, reviewer_actor_id),
             )
         except crud.DuplicateDecisionError as e:
-            # Another round recorded exactly this decision and owns the resume
-            # that follows it. Answer with what stands; do not drive the graph
-            # a second time.
+            # Either a replay of a round already recorded, or a genuinely new
+            # decision that happens to be identical to it (`_decision_key`
+            # explains why those cannot be told apart). Answer with what stands
+            # and do not drive the graph again — but say enough that a reviewer
+            # in the second case can see it and record their decision through
+            # the direct tools, which take no key.
             db.rollback()
             payload = task_to_dict(task)
             payload["approval"] = approval_to_dict(e.approval)
             payload["replayed"] = True
+            if e.approval.resumed_at is not None and task.status == models.TaskStatusEnum.WAITING_APPROVAL:
+                payload["note"] = (
+                    "An identical decision is already recorded and was delivered to the graph, and this task "
+                    "is waiting again. If this is a new decision on a repeated question rather than a retry, "
+                    f"record it with {' / '.join(compat.FALLBACK_TOOLS)}."
+                )
             return payload
         except crud.StaleArtifactError as e:
             db.rollback()
@@ -474,8 +483,12 @@ async def _apply_decision(
         result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
         # Delivered. Recorded rather than inferred from the task's status,
         # which cannot tell "never delivered" from "delivered, and the graph
-        # interrupted again" (app/mcp/server.py, `_shown_artifact`).
+        # interrupted again" (`_shown_artifact`). Committed on its own, before
+        # the projection: if `_sync_state` fails, the decision has still
+        # reached the graph, and a retry that re-delivered it would be the
+        # double-apply this column exists to prevent.
         approval.resumed_at = datetime.utcnow()
+        db.commit()
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)
@@ -687,22 +700,26 @@ def _decision_key(shown: _ShownArtifact, decision: _ApprovalDecision) -> str:
     """A stable name for *this* decision on *this* draft.
 
     A 2026-07-28 answer round replays the whole `tools/call`, so the body can
-    run more than once for one human decision — a client retry after a dropped
-    response is the ordinary case, not the exotic one. The key is derived from
-    what was decided and what it was decided on, which makes every replay of a
-    round produce the same name and the ledger reject the second append
-    (app/crud.py, migration 013).
+    run more than once for one human decision - a client retry after a dropped
+    response is the ordinary case. The key is derived from what was decided and
+    what it was decided on, so every replay of a round produces the same name
+    and the ledger refuses the second append (app/crud.py, migration 013).
 
-    It deliberately carries no nonce and no request id: a nonce would make a
-    replay look new, which is the whole failure being prevented.
+    **A limit worth stating plainly.** One case is genuinely undecidable here: a
+    reviewer rejects a draft, the graph is told, it parks again on the *same*
+    draft, and the reviewer rejects the new question in the same words. That is
+    two decisions - but it is byte-for-byte identical to a replay of the first,
+    and nothing the server can see separates them. `requestState` looks like the
+    round's identity and is not: the SDK hands the handler the *unsealed* state,
+    which is a pure function of the recorded answers and the rendered question,
+    so two identical rounds carry identical state. A request id would separate
+    them, but it also separates a replay from itself, which is the failure this
+    key exists to prevent.
 
-    This half names the *decision*; `_scope_to_reviewer` adds the *decider*,
-    because a task can have more than one authorised approver and two people
-    reaching the same verdict on the same draft are two ledger entries, not one.
-    The residual case this cannot separate is the same reviewer recording a
-    byte-identical decision twice on the same draft version — which needs the
-    task to return to WAITING_APPROVAL without a new draft, and which nothing
-    in the payload distinguishes from a retry.
+    So the collision is resolved toward refusing: a silently duplicated entry in
+    an approval ledger is worse than a refused write the caller is told about.
+    The refusal names the way through - `approve_task` / `reject_task` take no
+    key and record the second decision distinctly.
     """
     payload = json.dumps(
         {
@@ -744,20 +761,24 @@ async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
     entry is written and the reviewer is not asked anything: the decision was
     made, it just did not arrive.
 
-    The claim is taken first, as a conditional UPDATE. Two retries arriving
-    together would otherwise both find `resumed_at IS NULL` and both drive the
-    graph - the same defect the row lock prevents on the write side, one step
-    later. A claim whose Platform call then fails is given back, so a lost
-    resume stays recoverable rather than becoming permanent.
+    Delivery to the graph is **at least once**, and cannot be made exactly
+    once from this side: `langgraph_client.resume_thread` carries no
+    idempotency key, so nothing here can tell Platform "you have seen this
+    decision". A claim taken before the call would only move the failure - a
+    process that dies holding it strands the decision as permanently
+    delivered, and a call that times out after Platform accepted it looks
+    identical to one it never got. So the stamp is written only after a call
+    returns, and two recoverers racing means the graph is told twice rather
+    than not at all. What stays exactly once is the ledger, which is the
+    record this system exists to keep.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
         approval = db.query(models.Approval).filter(models.Approval.id == approval_id).one_or_none()
         if task is None or approval is None:  # pragma: no cover - torn between rounds
             raise ToolError(f"Task {task_id} changed while its recorded decision was being resumed")
-        if not crud.claim_resume(db, approval_id):
-            # Somebody else is delivering it. Answer with what stands.
-            db.refresh(task)
+        if approval.resumed_at is not None:
+            # Delivered between the resolver's read and this one; nothing to do.
             payload = task_to_dict(task)
             payload["approval"] = approval_to_dict(approval)
             payload["replayed"] = True
@@ -771,11 +792,9 @@ async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
             # part of this approval.
             bound = next((d for d in crud.get_drafts(db, task_id) if d.version == approval.artifact_version), None)
             resume_payload["modified_draft"] = bound.content if (approval.edited_artifact and bound) else None
-        try:
-            result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
-        except Exception:
-            crud.release_resume(db, approval_id)
-            raise
+        result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
+        approval.resumed_at = datetime.utcnow()
+        db.commit()
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)

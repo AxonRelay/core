@@ -788,7 +788,13 @@ def test_recovering_a_decision_that_carried_no_edit_sends_no_edit(connect, waiti
 
 
 def test_only_one_retry_delivers_a_recovered_decision(connect, waiting_task, mcp_db, monkeypatch):
-    """The resume claim is a conditional UPDATE, so a second recoverer stands down."""
+    """Once delivery is recorded, a further recoverer stands down.
+
+    Delivery to the graph is at-least-once and cannot be made exactly-once
+    from here (`resume_thread` carries no idempotency key), so what is pinned
+    is the part that can be: a recoverer that sees `resumed_at` set does not
+    call Platform again.
+    """
     attempts = []
 
     async def _resume(thread_id, payload):
@@ -816,8 +822,13 @@ def test_only_one_retry_delivers_a_recovered_decision(connect, waiting_task, mcp
     assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
 
 
-def test_a_failed_recovery_gives_the_claim_back(waiting_task, mcp_db, monkeypatch):
-    """A claim that outlived its failed Platform call would make the loss permanent."""
+def test_a_failed_delivery_leaves_the_decision_recoverable(waiting_task, mcp_db, monkeypatch):
+    """Nothing is stamped until Platform answers.
+
+    Marking delivery before the call would strand the decision as permanently
+    delivered whenever the call then failed - the loss this whole path exists
+    to undo.
+    """
     failures = []
 
     async def _resume(thread_id, payload):
@@ -873,6 +884,55 @@ def test_a_duplicate_key_never_drives_the_graph_twice(waiting_task, mcp_db, monk
     assert second["approval"]["id"] == first["approval"]["id"]
     assert len(resumes) == 1, "the loser of the race must not resume the graph"
     assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
+
+
+def test_a_repeated_identical_verdict_is_refused_with_a_way_through(connect, waiting_task, mcp_db, monkeypatch):
+    """The one case the key cannot decide, resolved toward the ledger.
+
+    A rejection is delivered, the graph parks again on the same draft, and the
+    reviewer rejects the new question in the same words. That is two decisions,
+    and it is byte-identical to a replay of the first - `requestState` does not
+    separate them either, because the SDK hands the handler the unsealed state,
+    which is a pure function of the answers and the rendered question.
+
+    Refusing is the safe half of an undecidable choice (a silently duplicated
+    entry in an approval ledger is worse than a refused write), so what is
+    pinned here is that the refusal is visible and names the way through.
+    """
+
+    async def _resume(thread_id, payload):
+        return {"next": ["human_approval"], "values": {"drafts": [DRAFT]}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        async with connect(elicitation_callback=_unused_callback) as session:
+            answers = []
+            for _ in range(2):
+                asked = await _first_round(session, waiting_task.id)
+                assert isinstance(asked, types.InputRequiredResult), "each parked question is asked"
+                answers.append(_payload(await _answer(session, waiting_task.id, asked, _accept(approve=False))))
+            return answers
+
+    first, second = asyncio.run(go())
+    assert "replayed" not in first
+    assert second["replayed"] is True
+    assert second["approval"]["id"] == first["approval"]["id"]
+    note = second.get("note", "")
+    assert "repeated question" in note and "reject_task" in note, "the refusal must name the way through"
+
+    # The ledger holds one entry, and the escape hatch really does record the second.
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
+
+    async def escape():
+        async with connect() as session:
+            return _payload(await session.call_tool("reject_task", {"task_id": waiting_task.id}))
+
+    asyncio.run(escape())
+    approvals = crud.get_approvals(mcp_db, waiting_task.id)
+    assert [a.action for a in approvals] == ["rejected", "rejected"]
+    assert approvals[1].prev_hash == approvals[0].entry_hash
+    assert crud.verify_approval_chain(mcp_db, waiting_task.id)["valid"] is True
 
 
 # ------------------------------------------------- authorization and the handle
@@ -955,3 +1015,31 @@ async def _unused_callback(ctx, params):  # pragma: no cover - a guard, not a pa
     not use it.
     """
     raise AssertionError(f"standalone elicitation on a modern connection: {params.message!r}")
+
+
+def test_delivery_is_recorded_even_if_the_projection_fails(waiting_task, mcp_db, monkeypatch):
+    """The stamp is committed on its own, before the projection.
+
+    If it rode the projection's commit, a failure there would leave the
+    decision looking undelivered - and the retry would deliver it a second
+    time, which is the double-apply the column exists to prevent.
+    """
+
+    async def _resume(thread_id, payload):
+        return {"values": {"drafts": [DRAFT], "final_output": "shipped"}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    def _explode(db, task, result):
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(mcp_server, "_sync_state", _explode)
+
+    async def go():
+        with pytest.raises(RuntimeError):
+            await mcp_server._apply_decision(waiting_task.id, action="approved", comment="ok")
+
+    asyncio.run(go())
+    approval = crud.latest_approval(mcp_db, waiting_task.id)
+    assert approval is not None
+    assert approval.resumed_at is not None, "the graph got the decision; a retry must not re-deliver it"
