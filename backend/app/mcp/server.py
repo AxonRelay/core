@@ -412,79 +412,60 @@ async def _apply_decision(
     latest draft, nothing is recorded and the call returns
     status="stale_decision".
 
-    A `decision_key` makes the write idempotent: a replayed round finds its own
-    entry, returns the same payload the first round did with `replayed: true`
-    added, and neither appends to the ledger nor resumes the graph again. The
-    key is scoped to the reviewer here, where the authenticated caller is
-    known - see `_scope_to_reviewer`. A replay whose task never left
-    WAITING_APPROVAL re-drives the resume rather than reporting success: the
-    ledger entry alone is not evidence that the graph got the decision.
+    A `decision_key` makes the write idempotent. The lookup happens inside
+    `record_approval`, under the task row lock, so exactly one of two racing
+    rounds is told it wrote the entry; the other is refused with
+    `DuplicateDecisionError` and returns without resuming the graph. Deciding
+    that here, before the lock, would let both believe they wrote it and apply
+    one decision to the graph twice.
     """
     with _session() as db:
         task = crud.get_task(db, task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
 
-        # Authorization first, before this call can learn anything or return
-        # anything: the replay path answers with a recorded decision, and a
-        # caller who may not decide on this task should not reach it either.
+        # Authorization first, before this call can learn anything or change
+        # anything.
         authz.check_may_approve(db, task_id)
         # The recorded reviewer is the authenticated caller, never a parameter.
         reviewer_actor_id = authz.acting_actor_id(db)
-        scoped_key = _scope_to_reviewer(decision_key, reviewer_actor_id)
 
-        already = crud.find_decision(db, task_id, scoped_key) if scoped_key is not None else None
-        if already is not None and task.status != models.TaskStatusEnum.WAITING_APPROVAL:
-            # A completed replay: the first attempt recorded *and* got the
-            # graph moving, so there is nothing left to do. Shaped like the
-            # first round's answer, because that is what it is — `status`
-            # stays the task's own status rather than becoming an outcome
-            # word, and `replayed` is what says nothing new happened.
-            payload = task_to_dict(task)
-            payload["approval"] = approval_to_dict(already)
-            payload["replayed"] = True
-            return payload
-
-        if already is None and task.status != models.TaskStatusEnum.WAITING_APPROVAL:
+        if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
             raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
 
-        if already is not None:
-            # Recorded, but the task never left WAITING_APPROVAL — the resume
-            # below did not land the first time (a Platform timeout after the
-            # ledger commit is the ordinary way to get here; app/service.py's
-            # projection is written for exactly that gap). Retrying must
-            # therefore re-drive the resume, or one dropped response parks the
-            # task forever with a decision recorded against it. The residual
-            # ambiguity is a revision loop that comes straight back to
-            # WAITING_APPROVAL on the same draft: that is indistinguishable
-            # from a failed resume, and re-driving it re-sends the same
-            # decision about the same draft.
-            approval = already
-        else:
-            try:
-                approval = crud.record_approval(
-                    db,
-                    task_id=task_id,
-                    reviewer_actor_id=reviewer_actor_id,
-                    action=action,
-                    comment=comment,
-                    artifact_version=artifact_version,
-                    expected_commitment=expected_commitment,
-                    modified_draft=modified_draft if action == "approved" else None,
-                    decision_key=scoped_key,
-                )
-            except crud.StaleArtifactError as e:
-                db.rollback()
-                return {"status": "stale_decision", "task_id": task_id, "reason": str(e)}
-            except crud.ArtifactRequiredError as e:
-                db.rollback()
-                return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
-            except crud.LedgerError as e:
-                db.rollback()
-                raise ToolError(str(e)) from None
-            except authz.AuthzError as e:
-                db.rollback()
-                raise ToolError(str(e)) from None
+        try:
+            approval = crud.record_approval(
+                db,
+                task_id=task_id,
+                reviewer_actor_id=reviewer_actor_id,
+                action=action,
+                comment=comment,
+                artifact_version=artifact_version,
+                expected_commitment=expected_commitment,
+                modified_draft=modified_draft if action == "approved" else None,
+                decision_key=_scope_to_reviewer(decision_key, reviewer_actor_id),
+            )
+        except crud.DuplicateDecisionError as e:
+            # Another round recorded exactly this decision and owns the resume
+            # that follows it. Answer with what stands; do not drive the graph
+            # a second time.
+            db.rollback()
+            payload = task_to_dict(task)
+            payload["approval"] = approval_to_dict(e.approval)
+            payload["replayed"] = True
+            return payload
+        except crud.StaleArtifactError as e:
+            db.rollback()
+            return {"status": "stale_decision", "task_id": task_id, "reason": str(e)}
+        except crud.ArtifactRequiredError as e:
+            db.rollback()
+            return {"status": "no_artifact", "task_id": task_id, "reason": str(e)}
+        except crud.LedgerError as e:
+            db.rollback()
+            raise ToolError(str(e)) from None
+        except authz.AuthzError as e:
+            db.rollback()
+            raise ToolError(str(e)) from None
 
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
@@ -494,8 +475,6 @@ async def _apply_decision(
         db.refresh(task)
         payload = task_to_dict(task)
         payload["approval"] = approval_to_dict(approval)
-        if already is not None:
-            payload["replayed"] = True
         return payload
 
 
@@ -571,17 +550,21 @@ class _ShownArtifact(BaseModel):
 
     * `ready` - `version` / `commitment` / `content` name the pinned draft;
     * `no_artifact` - the task is waiting, but has no draft to decide on;
-    * `not_waiting` - the task is not (or is no longer) WAITING_APPROVAL.
+    * `not_waiting` - the task is not (or is no longer) WAITING_APPROVAL;
+    * `recorded_unresumed` - this caller's decision is already in the ledger
+      but the task is still parked, so the graph never received it;
+      `approval_id` names the entry to re-drive.
 
-    The last one is a state and not an exception because it is the ordinary
+    `not_waiting` is a state and not an exception because it is the ordinary
     outcome of a race, and it can happen on *any* round: from 2026-07-28 this
     resolver re-runs when the reviewer answers, so a task that moved on while
     they were reading would otherwise turn the answer into a crash.
     """
 
     task_id: int
-    state: Literal["ready", "no_artifact", "not_waiting"] = "ready"
+    state: Literal["ready", "no_artifact", "not_waiting", "recorded_unresumed"] = "ready"
     reason: str = ""
+    approval_id: int | None = None
     title: str = ""
     feedback: str | None = None
     version: int | None = None
@@ -625,6 +608,25 @@ def _shown_artifact(task_id: int) -> _ShownArtifact:
         # creating a version. What is shown and what is recorded must be the
         # same object.
         drafts = crud.get_drafts(db, task_id)
+        # Before showing anything: has this caller already decided, without the
+        # graph hearing about it? `record_approval` commits, then the Platform
+        # call can fail — the ledger entry stands while the task stays parked.
+        # Asking again here would be wrong twice over: the reviewer would be
+        # re-shown a draft they have already ruled on (their own edit, if they
+        # made one, since that edit is now the latest version), and answering
+        # would append a second entry for one decision. Repair instead.
+        newest = crud.get_approvals(db, task_id)[-1:] if drafts else []
+        if (
+            newest
+            and newest[0].reviewer_actor_id == authz.acting_actor_id(db)
+            and newest[0].artifact_version == drafts[-1].version
+        ):
+            return _ShownArtifact(
+                task_id=task_id,
+                state="recorded_unresumed",
+                approval_id=newest[0].id,
+                reason="A decision by this reviewer is already recorded against the latest draft.",
+            )
         if not drafts:
             return _ShownArtifact(
                 task_id=task_id,
@@ -662,7 +664,7 @@ def _ask_approval(
     translate back into "use approve_task instead".
     """
     if shown.state != "ready":
-        return CancelledElicitation()
+        return CancelledElicitation()  # nothing to decide, or nothing to ask about
     if not compat.client_can_elicit(ctx.client_capabilities):
         return CancelledElicitation()
     message = (
@@ -727,6 +729,34 @@ def _scope_to_reviewer(decision_key: str | None, reviewer_actor_id: int | None) 
     return hashlib.sha256(f"{decision_key}:{reviewer_actor_id}".encode()).hexdigest()
 
 
+async def _resume_recorded_decision(task_id: int, approval_id: int) -> dict:
+    """Hand a decision that is already in the ledger to the graph, again.
+
+    The recovery half of "a ledger row is not evidence the graph received the
+    decision". Everything the resume needs is in the recorded entry, so no new
+    entry is written and the reviewer is not asked anything: the decision was
+    made, it just did not arrive. A reviewer's edit is recognised by the bound
+    draft's producer, which is how `record_approval` stamps it.
+    """
+    with _session() as db:
+        task = crud.get_task(db, task_id)
+        approval = db.query(models.Approval).filter(models.Approval.id == approval_id).one_or_none()
+        if task is None or approval is None:  # pragma: no cover - torn between rounds
+            raise ToolError(f"Task {task_id} changed while its recorded decision was being resumed")
+        resume_payload: dict[str, Any] = {"decision": approval.action, "human_comment": approval.comment}
+        if approval.action == "approved":
+            bound = next((d for d in crud.get_drafts(db, task_id) if d.version == approval.artifact_version), None)
+            edited = bound is not None and bound.producer_actor_id == approval.reviewer_actor_id
+            resume_payload["modified_draft"] = bound.content if edited else None
+        result = await langgraph_client.resume_thread(task.thread_id, resume_payload)
+        _sync_state(db, task, result)
+        db.refresh(task)
+        payload = task_to_dict(task)
+        payload["approval"] = approval_to_dict(approval)
+        payload["replayed"] = True
+        return payload
+
+
 @mcp.tool()
 async def review_pending_task(
     task_id: int,
@@ -756,17 +786,21 @@ async def review_pending_task(
     returns the decision it already recorded, marked `replayed: true`, instead
     of appending a second one.
     """
+    if shown.state == "recorded_unresumed":
+        return await _resume_recorded_decision(task_id, shown.approval_id)
     if shown.state == "not_waiting":
         return {
             "status": "stale_decision",
             "task_id": task_id,
-            # Careful not to overclaim: "this round recorded nothing" is true,
-            # "nothing was recorded" is not - replaying an answered round lands
-            # here once the first round's decision has moved the task on.
+            # Careful in both directions. "This call recorded nothing" is
+            # always true; "nothing was recorded" is not, because replaying an
+            # answered round lands here once that decision moved the task on -
+            # and "your decision stands" is not either, because the task may
+            # have been carried off by somebody else before this one arrived.
+            # Name what is certain and say where to look for the rest.
             "reason": (
-                f"{shown.reason} This call recorded nothing and nothing was shown. "
-                "If you already answered, that decision stands - read it with get_task or "
-                "verify_task_ledger rather than deciding again."
+                f"{shown.reason} This call recorded nothing and showed nothing. "
+                "Read get_task or verify_task_ledger for the decisions that stand on it."
             ),
         }
     if shown.state == "no_artifact":

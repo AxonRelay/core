@@ -416,11 +416,15 @@ def test_a_decision_key_makes_the_write_idempotent(db, self_actor):
     first = crud.record_approval(
         db, task.id, self_actor.id, "approved", comment="ok", decision_key="k1", artifact_version=draft.version
     )
-    again = crud.record_approval(
-        db, task.id, self_actor.id, "approved", comment="ok", decision_key="k1", artifact_version=draft.version
-    )
-    assert again.id == first.id
-    assert again.entry_hash == first.entry_hash
+    # Refused rather than answered: a caller that cannot tell "I wrote this"
+    # from "somebody already had" will go on to do the work that follows the
+    # write - here, resuming the graph - twice for one decision.
+    with pytest.raises(crud.DuplicateDecisionError) as exc:
+        crud.record_approval(
+            db, task.id, self_actor.id, "approved", comment="ok", decision_key="k1", artifact_version=draft.version
+        )
+    assert exc.value.approval.id == first.id
+    assert exc.value.approval.entry_hash == first.entry_hash
     assert [a.id for a in crud.get_approvals(db, task.id)] == [first.id]
 
 
@@ -428,7 +432,8 @@ def test_a_replayed_key_does_not_append_the_edit_either(db, self_actor):
     """The draft version an edit would create is inside the idempotent region."""
     task, draft = _task_with_draft(db)
     crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1", modified_draft="edited")
-    crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1", modified_draft="edited")
+    with pytest.raises(crud.DuplicateDecisionError):
+        crud.record_approval(db, task.id, self_actor.id, "approved", decision_key="k1", modified_draft="edited")
     assert [d.version for d in crud.get_drafts(db, task.id)] == [1, 2]
     assert len(crud.get_approvals(db, task.id)) == 1
 
@@ -530,6 +535,7 @@ def test_the_same_reviewer_replaying_still_collapses(db, self_actor):
     task, draft = _task_with_draft(db)
     key = _scope_to_reviewer("one round", self_actor.id)
     first = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key=key)
-    again = crud.record_approval(db, task.id, self_actor.id, "approved", decision_key=key)
-    assert again.id == first.id
+    with pytest.raises(crud.DuplicateDecisionError) as exc:
+        crud.record_approval(db, task.id, self_actor.id, "approved", decision_key=key)
+    assert exc.value.approval.id == first.id
     assert len(crud.get_approvals(db, task.id)) == 1

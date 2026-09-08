@@ -343,6 +343,20 @@ class CommitmentMismatchError(LedgerError):
     """A supplied commitment does not match the artifact content."""
 
 
+class DuplicateDecisionError(LedgerError):
+    """This decision key is already recorded; `approval` is the entry that holds it.
+
+    Raised rather than returned so a caller cannot mistake "somebody already
+    wrote this" for "I wrote this". The difference decides who owns the work
+    that follows the ledger write — resuming the graph — and two racing rounds
+    both believing they wrote it is how one decision gets applied twice.
+    """
+
+    def __init__(self, approval) -> None:
+        super().__init__(f"decision {approval.decision_key} is already recorded on task {approval.task_id}")
+        self.approval = approval
+
+
 def find_decision(db: Session, task_id: int, decision_key: str):
     """The approval already recorded under `decision_key`, or None.
 
@@ -463,12 +477,12 @@ def record_approval(
       **before** the approval is written, and the approval binds to that new
       version.
     * `decision_key` makes the write idempotent: if this task already carries
-      an approval under that key, the existing row is returned and **nothing
-      is appended** - not the approval, and not the `modified_draft` version
-      it would have created. A replayed round therefore reads as the decision
-      it repeats rather than as a second one. The lookup happens under the
-      task row lock, and migration 013's unique index is the backstop for two
-      rounds that race past it on separate connections.
+      an approval under that key, `DuplicateDecisionError` is raised carrying
+      that entry and **nothing is appended** - not the approval, and not the
+      `modified_draft` version it would have created. The lookup happens under
+      the task row lock, so of two racing rounds exactly one is told it wrote;
+      migration 013's unique index is the backstop if they reach the table on
+      separate connections anyway.
 
     created_at is set explicitly here (not via the column default) so the value
     that is hashed is exactly the value persisted.
@@ -492,7 +506,7 @@ def record_approval(
     if decision_key is not None:
         already = find_decision(db, task_id, decision_key)
         if already is not None:
-            return already
+            raise DuplicateDecisionError(already)
 
     shown = _latest_draft(db, task_id)
     if shown is None:

@@ -403,7 +403,10 @@ def test_replaying_an_answered_round_records_one_decision(connect, waiting_task,
     first, replay = asyncio.run(go())
     assert first["approval"]["action"] == "approved"
     assert replay["status"] == "stale_decision"
-    assert "that decision stands" in replay["reason"], "a replay must not be told its decision was lost"
+    reason = replay["reason"]
+    assert "recorded nothing" in reason, "this call really did record nothing"
+    assert "verify_task_ledger" in reason, "and must point at where the standing decision can be read"
+    assert "decisions that stand on it" in reason, "without claiming this caller's own answer is one of them"
 
     assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
     assert [d.version for d in crud.get_drafts(mcp_db, waiting_task.id)] == [1]
@@ -674,6 +677,78 @@ def test_a_task_with_no_draft_is_answered_without_asking_anything(connect, mcp_d
     assert not isinstance(result, types.InputRequiredResult)
     assert _payload(result)["status"] == "no_artifact"
     assert asked == []
+
+
+def test_a_failed_resume_on_an_edited_draft_is_repaired_too(connect, waiting_task, mcp_db, monkeypatch):
+    """The edit case is the one a re-ask gets wrong.
+
+    An approval carrying an edit commits that edit as v2 before the entry binds
+    to it. If the retry were re-asked, it would be asked about v2 - the
+    reviewer's own text - and answering would append a second entry for one
+    decision. The recorded-but-unresumed state has to be recognised before any
+    question is rendered.
+    """
+    attempts = []
+
+    async def _resume(thread_id, payload):
+        attempts.append(payload)
+        if len(attempts) == 1:
+            raise TimeoutError("Platform did not answer")
+        return {"values": {"drafts": [DRAFT, payload["modified_draft"]], "final_output": "shipped"}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        async with connect(elicitation_callback=_unused_callback) as session:
+            asked = await _first_round(session, waiting_task.id)
+            answer = _accept(approve=True, modified_draft="edited by the reviewer")
+            failed = await _answer(session, waiting_task.id, asked, answer)
+            assert failed.is_error
+            return await _answer(session, waiting_task.id, asked, answer)
+
+    repaired = asyncio.run(go())
+    assert not isinstance(repaired, types.InputRequiredResult), "the reviewer must not be re-asked about their own edit"
+    payload = _payload(repaired)
+    assert payload["replayed"] is True
+    assert payload["approval"]["artifact_version"] == 2
+    # The repair carries the edit the recorded entry bound to, not a fresh one.
+    assert attempts[1]["modified_draft"] == "edited by the reviewer"
+    assert [d.version for d in crud.get_drafts(mcp_db, waiting_task.id)] == [1, 2]
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
+
+
+def test_a_duplicate_key_never_drives_the_graph_twice(waiting_task, mcp_db, monkeypatch):
+    """Two rounds racing to record one decision: the loser must not resume.
+
+    The lock inside `record_approval` is what settles who wrote the entry.
+    Deciding it before the lock - looking the key up, seeing nothing, and
+    proceeding - lets both callers believe they wrote it and apply one
+    decision to the graph twice. Driven through `_apply_decision` directly
+    because the tool's repair path intercepts a replay before this point.
+    """
+    resumes = []
+
+    async def _resume(thread_id, payload):
+        resumes.append(payload)
+        return {"next": ["human_approval"], "values": {"drafts": [DRAFT]}}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _resume)
+
+    async def go():
+        first = await mcp_server._apply_decision(
+            waiting_task.id, action="rejected", comment="no", decision_key="one round"
+        )
+        second = await mcp_server._apply_decision(
+            waiting_task.id, action="rejected", comment="no", decision_key="one round"
+        )
+        return first, second
+
+    first, second = asyncio.run(go())
+    assert "replayed" not in first
+    assert second["replayed"] is True
+    assert second["approval"]["id"] == first["approval"]["id"]
+    assert len(resumes) == 1, "the loser of the race must not resume the graph"
+    assert len(crud.get_approvals(mcp_db, waiting_task.id)) == 1
 
 
 # ------------------------------------------------- authorization and the handle

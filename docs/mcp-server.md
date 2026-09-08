@@ -115,10 +115,12 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 - 同じラウンドの再送は台帳側で吸収される（migration 013）。承認も、編集が作る
   はずだった draft 版も二重には入らない。キーには reviewer も含まれるので、
   別の承認権者が同じ判断に至っても別のエントリになる
-- 判断が通って task が承認待ちを離れたあとの再送は `stale_decision`（1 回目の判断は
-  立っている。文面もそう言う）。まだ承認待ちなら resume をやり直して
-  `replayed: true` を返す——台帳に行があることは graph が判断を受け取った証拠では
-  ないため
+- 判断が通って task が承認待ちを離れたあとの再送は `stale_decision`。文面は
+  「このラウンドは何も記録していない」とだけ言い、立っている判断は
+  `get_task` / `verify_task_ledger` で読めと案内する
+- 記録済みだが task がまだ承認待ちのままなら（resume が落ちた場合）、何も尋ねずに
+  記録済みエントリから resume をやり直して `replayed: true` を返す。台帳に行が
+  あることは graph が判断を受け取った証拠ではないため
 
 ### 呼び出し元 identity と scope（任意）
 
