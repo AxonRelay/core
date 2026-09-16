@@ -20,6 +20,7 @@ def project_run_state(
     task: models.Task,
     values: dict[str, Any],
     waiting_for_human: bool,
+    approval_episode_id: str | None = None,
 ) -> None:
     """Project a LangGraph Platform run's state into the Postgres ledger.
 
@@ -51,4 +52,6 @@ def project_run_state(
         status=new_status,
         current_draft=current_draft,
         feedback=feedback,
+        approval_episode_id=approval_episode_id if waiting_for_human else None,
+        set_approval_episode_id=True,
     )

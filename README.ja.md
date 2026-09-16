@@ -67,7 +67,7 @@ AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（inte
         MCP（ローカルは stdio / Tailscale・Tunnel 経由の Streamable HTTP）
                               ▼
               AxonRelay Backend（FastAPI + MCP サーバ同居）
-                 │   - MCP : 26 tools + 3 resources（メインインターフェース）
+                 │   - MCP : 30 tools + 3 resources（メインインターフェース）
                  │   - REST: /tasks /agents /coordination（読み取り中心）
                  │   - Postgres: 台帳 ＋ 調整ボード
                  │
@@ -132,13 +132,18 @@ DRAFT → WAITING_REVIEW → WAITING_APPROVAL → APPROVED → COMPLETED
 ### MCP サーバ（一次）
 
 **台帳系 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
-`list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
+`list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`,
+`resolve_approval_delivery`
 （MCP elicitation による対話的承認）, `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`。
 
 **調整系 12 tools**: `register_session`, `heartbeat_session`, `end_session`,
 `get_board`, `check_conflicts`, `claim_territory`, `release_territory`,
 `claim_git_resource`, `check_git_resource`, `send_relay`, `read_inbox`, `ack_relay`。
+
+**Evidence Clip 実験 3 tools**: `get_context_pack`, `evaluate_evidence_clip`,
+`validate_evidence_references`。ローカルAI連携で明示選択した引用を
+Taskへ結び、Draftから安定した `[E-id]` で参照する。汎用RAGではなく評価中のPoC。
 
 `refs/stash` はリポジトリ単位の ref なので、**兄弟 worktree が1つの stash スタックを共有する** —
 片方の `git stash pop` が、もう片方が退避した作業を奪える。守るべきパスが存在しない。
@@ -166,7 +171,8 @@ backend を起動すると `http://localhost:8000/docs` に OpenAPI の対話 UI
 | `GET`/`POST`/`PUT`/`DELETE` | `/tasks` `/tasks/{id}` | タスク |
 | `POST` | `/tasks/{id}/run` | Platform で interrupt/完了まで実行 |
 | `GET` | `/tasks/pending/approvals` | 統一承認受信箱 |
-| `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | 承認 / 差戻し |
+| `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | レビューした `approval_episode_id` を伴う承認 / 差戻し |
+| `POST` | `/approvals/{id}/delivery/resolve` | Platform確認後に曖昧な配送結果を明示解決 |
 | `GET` | `/tasks/{id}/drafts` | ドラフト履歴 |
 | `GET` | `/tasks/{id}/ledger/verify` | 承認 hash chain の改ざん検証 |
 | `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | タスク割り当て |
@@ -253,12 +259,12 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（26 tools / 3 resources）、LangGraph Platform クライアント、migration 008 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（30 tools / 3 resources）、LangGraph Platform クライアント、migration 009 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）
 - 🚧 **Infra**: 旧 `infra/`（AWS EC2 DNS）と `Caddyfile` を撤去済み。Cloudflare Tunnel + Tailscale + Vercel/Pages への切替はテンプレ化＋**[deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md)** に手順化（DNS 切替・EC2 解約などアカウント側操作は手動のオペレータ作業）。**調整ボードを実際に使うには同ドキュメント §3（Tailscale + 共有 MCP エンドポイント）が必要** — コードは入っているが、まだどこでも稼働していない。
-- 🚧 **Tests**: SQLite 156 ケース（台帳の不変条件・並行書き込み安全性・run-state 投影の idempotency・調整レイヤー・パス重なり判定・git 資源 claim・MCP tool surface）に加え、実マイグレーションを適用し実コネクションで承認台帳と資源 claim を競合させる Postgres スキーマ整合 18 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
+- 🚧 **Tests**: ローカル 219 ケース（台帳・配送の不変条件、Evidence Clip と Context Pack、並行書き込み安全性、run-state 投影の idempotency、調整レイヤー、パス重なり判定、git 資源 claim、MCP surface）に加え、実マイグレーションを適用し実コネクションで承認台帳と資源 claim を競合させる Postgres スキーマ整合 23 ケース。両方 CI で実行（Postgres ジョブは `postgres:16` サービス）。ローカルでは `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`。
 
 ロードマップと移行計画: [docs/step2-plan.md](docs/step2-plan.md)。ピボットの背景とスコープ: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md)。調整レイヤーの設計: [docs/coordination-spec.md](docs/coordination-spec.md)。
 
@@ -272,6 +278,10 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — `gitsafe` を PATH ラッパにせず明示 opt-in に留める理由
 - [docs/step2-plan.md](docs/step2-plan.md) — 移行計画（Phase 2.1–2.6）
 - [docs/mcp-server.md](docs/mcp-server.md) — MCP サーバ接続ガイド & tool リファレンス
+- [docs/evidence-clips-mvp.md](docs/evidence-clips-mvp.md) — ローカルAI × 出典付き Evidence Clip の評価実験（Chromeは最初のadapter）
+- [docs/memory-workspace-vision.md](docs/memory-workspace-vision.md) — `memory.md`型の私的・一時・長期・共有記憶ワークスペース構想
+- [docs/memory-operations-spec.md](docs/memory-operations-spec.md) — 原記憶を保持する日次統合サイクルと最小構造
+- [docs/memory-design-evidence.md](docs/memory-design-evidence.md) — 脳科学の示唆とCS実装を分けた設計根拠
 - [docs/discord-setup-guide.md](docs/discord-setup-guide.md) — Discord モバイル承認セットアップ（アカウント側の手順のみ。backend 側は未実装）
 - [deploy/DEPLOYMENT.ja.md](deploy/DEPLOYMENT.ja.md) — **デプロイ手順（日本語）**。ホスティング切替と、調整ボードに必要な共有 MCP エンドポイントの立て方（[English](deploy/DEPLOYMENT.md)）
 - [SETUP_POSTGRES.md](SETUP_POSTGRES.md) — PostgreSQL セットアップ & マイグレーション

@@ -73,7 +73,7 @@ preserves and dogfoods.
            MCP (stdio locally · Streamable HTTP over Tailscale/Tunnel)
                               ▼
               AxonRelay Backend (FastAPI + MCP server, co-located)
-                 │   - MCP: 26 tools + 3 resources  (primary interface)
+                 │   - MCP: 30 tools + 3 resources  (primary interface)
                  │   - REST: /tasks /agents /coordination  (read-heavy)
                  │   - Postgres: the ledger + the coordination board
                  │
@@ -139,7 +139,8 @@ Design, semantics, and the per-turn protocol agents follow:
 ### MCP server (primary)
 
 **Ledger — 14 tools**: `list_tasks`, `create_task`, `get_task`, `run_task`,
-`list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`
+`list_pending_approvals`, `approve_task`, `reject_task`, `review_pending_task`,
+`resolve_approval_delivery`
 (interactive approval via MCP elicitation), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
 
@@ -147,6 +148,11 @@ Design, semantics, and the per-turn protocol agents follow:
 `end_session`, `get_board`, `check_conflicts`, `claim_territory`,
 `release_territory`, `claim_git_resource`, `check_git_resource`, `send_relay`,
 `read_inbox`, `ack_relay`.
+
+**Evidence Clip experiment — 3 tools**: `get_context_pack`, `evaluate_evidence_clip`, and
+`validate_evidence_references`. They attach explicitly selected quotes to a
+Task and make Draft citations such as `[E-123]` verifiable. This remains a
+bounded experiment, not a general RAG layer.
 
 `refs/stash` is a per-repository ref, so sibling git worktrees share one stash
 stack and `git stash pop` in one can consume work parked in another — with no
@@ -175,7 +181,8 @@ Interactive OpenAPI docs at `http://localhost:8000/docs` once the backend is up
 | `GET`/`POST`/`PUT`/`DELETE` | `/tasks` `/tasks/{id}` | Tasks |
 | `POST` | `/tasks/{id}/run` | Run on Platform until interrupt/completion |
 | `GET` | `/tasks/pending/approvals` | The unified approval inbox |
-| `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | Approve / reject |
+| `POST` | `/tasks/{id}/approve` `/tasks/{id}/reject` | Approve / reject with the reviewed `approval_episode_id` |
+| `POST` | `/approvals/{id}/delivery/resolve` | Explicitly resolve an ambiguous Platform delivery after inspection |
 | `GET` | `/tasks/{id}/drafts` | Draft history |
 | `GET` | `/tasks/{id}/ledger/verify` | Verify the tamper-evident approval hash chain |
 | `GET`/`POST`/`DELETE` | `/tasks/{id}/assignments` | Task assignments |
@@ -262,12 +269,17 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (26 tools / 3 resources), LangGraph Platform client, migrations through 008. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (30 tools / 3 resources), LangGraph Platform client, migrations through 009. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)
+
+The proposed layered-memory operating model is in
+[docs/memory-operations-spec.md](docs/memory-operations-spec.md); its
+neuroscience/CS evidence boundary is in
+[docs/memory-design-evidence.md](docs/memory-design-evidence.md).
 - 🚧 **Infra**: legacy `infra/` (AWS EC2 DNS) and `Caddyfile` removed. The cutover to Cloudflare Tunnel + Tailscale + Vercel/Pages is templated and documented in [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md); the account-side steps (DNS switch, EC2 decommission) remain a manual operator action.
-- 🚧 **Tests**: 156 SQLite cases (ledger invariants, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, the MCP tool surface) plus 18 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and on resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
+- 🚧 **Tests**: 219 local cases (ledger/outbox invariants, Evidence Clips and Context Packs, concurrent-writer safety, projection idempotency, the coordination layer, path-overlap rules, git resource claims, and the MCP surface) plus 23 Postgres schema-parity cases that apply the real migration chain and race real connections on the approval ledger and resource claims. Both run in CI; the Postgres job uses a `postgres:16` service. Run it locally with `AXONRELAY_TEST_POSTGRES_URL=... pytest tests/test_postgres_schema.py`.
 
 Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rationale and scope: [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md). Coordination design: [docs/coordination-spec.md](docs/coordination-spec.md).
 

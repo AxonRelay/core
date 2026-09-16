@@ -7,6 +7,11 @@ from sqlalchemy.orm import Session
 
 from app import ledger, models
 
+
+class DecisionConflictError(ValueError):
+    """One approval episode was already bound to another human decision."""
+
+
 # ========== Actor Operations ==========
 
 
@@ -280,6 +285,8 @@ def update_task(
     status: models.TaskStatusEnum | None = None,
     current_draft: str | None = None,
     feedback: str | None = None,
+    approval_episode_id: str | None = None,
+    set_approval_episode_id: bool = False,
 ):
     task = get_task(db, task_id)
     if not task:
@@ -295,6 +302,8 @@ def update_task(
         task.current_draft = current_draft
     if feedback is not None:
         task.feedback = feedback
+    if set_approval_episode_id:
+        task.approval_episode_id = approval_episode_id
 
     db.commit()
     db.refresh(task)
@@ -352,6 +361,11 @@ def record_approval(
     reviewer_actor_id: int | None,
     action: str,
     comment: str | None = None,
+    approved_content: str | None = None,
+    approved_draft_sha256: str | None = None,
+    evidence_manifest: list[dict] | None = None,
+    approval_episode_id: str | None = None,
+    decision_key: str | None = None,
 ):
     """Record an approval / rejection event, chained to the task's prior entry.
 
@@ -371,10 +385,35 @@ def record_approval(
     writers at the database level anyway. On Postgres it is a real `SELECT ...
     FOR UPDATE`.
     """
+    if decision_key and not approval_episode_id:
+        raise ValueError("new decisions require an approval episode identity")
+    if action == "approved" and approval_episode_id:
+        if approved_content is None or approved_draft_sha256 is None:
+            raise ValueError("new approved decisions require reconstructable approved content and its SHA-256")
+        if ledger.hash_text(approved_content) != approved_draft_sha256:
+            raise ValueError("approved content does not match approved_draft_sha256")
+
     now = datetime.utcnow()
     # Lock the task row *before* reading the chain head, so a concurrent
     # approval on the same task waits here rather than racing us to the tail.
     db.query(models.Task).filter(models.Task.id == task_id).with_for_update().first()
+    if approval_episode_id:
+        existing = (
+            db.query(models.Approval)
+            .filter(
+                models.Approval.task_id == task_id,
+                models.Approval.approval_episode_id == approval_episode_id,
+            )
+            .first()
+        )
+        if existing:
+            if existing.decision_key != decision_key:
+                raise DecisionConflictError("this approval episode already contains a different decision")
+            return existing
+    if decision_key:
+        existing = db.query(models.Approval).filter(models.Approval.decision_key == decision_key).first()
+        if existing:
+            return existing
     last = (
         db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
     )
@@ -386,12 +425,21 @@ def record_approval(
         action=action,
         comment=comment,
         created_at=now,
+        approved_draft_sha256=approved_draft_sha256,
+        evidence_manifest=evidence_manifest,
+        approval_episode_id=approval_episode_id,
+        decision_key=decision_key,
     )
     db_approval = models.Approval(
         task_id=task_id,
         reviewer_actor_id=reviewer_actor_id,
         action=action,
         comment=comment,
+        approved_content=approved_content,
+        approved_draft_sha256=approved_draft_sha256,
+        evidence_manifest=evidence_manifest,
+        approval_episode_id=approval_episode_id,
+        decision_key=decision_key,
         created_at=now,
         prev_hash=prev_hash,
         entry_hash=entry_hash,
@@ -400,6 +448,48 @@ def record_approval(
     db.commit()
     db.refresh(db_approval)
     return db_approval
+
+
+def claim_approval_delivery(db: Session, approval: models.Approval) -> bool:
+    """Atomically claim a retryable decision for one delivery attempt.
+
+    Only ``pending`` and definitely-not-accepted ``failed`` decisions may be
+    retried. ``delivering`` and ``unknown`` are deliberately not reclaimable:
+    doing so could send the same human decision twice after an ambiguous
+    network failure.
+    """
+    claimed = (
+        db.query(models.Approval)
+        .filter(
+            models.Approval.id == approval.id,
+            models.Approval.delivery_status.in_(("pending", "failed")),
+        )
+        .update(
+            {models.Approval.delivery_status: "delivering", models.Approval.delivery_error: None},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    db.refresh(approval)
+    return claimed == 1
+
+
+def mark_approval_delivery(db: Session, approval: models.Approval, status: str, error: str | None = None) -> None:
+    if status not in {"pending", "delivering", "delivered", "failed", "unknown", "legacy"}:
+        raise ValueError("invalid delivery status")
+    approval.delivery_status = status
+    approval.delivery_error = error
+    db.commit()
+    db.refresh(approval)
+
+
+def record_approval_delivery_run_id(db: Session, approval_id: int, run_id: str) -> None:
+    """Persist the downstream run identity as soon as Platform allocates it."""
+    db.query(models.Approval).filter(models.Approval.id == approval_id).update(
+        {models.Approval.delivery_run_id: run_id},
+        synchronize_session=False,
+    )
+    db.commit()
 
 
 def get_approvals(db: Session, task_id: int):
@@ -429,6 +519,11 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             legacy += 1
             continue
         seen_hashed = True
+        if approval.action == "approved" and approval.approval_episode_id is not None:
+            if approval.approved_content is None or approval.approved_draft_sha256 is None:
+                return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
+            if ledger.hash_text(approval.approved_content) != approval.approved_draft_sha256:
+                return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}
         expected = ledger.compute_entry_hash(
             prev_hash,
             task_id=approval.task_id,
@@ -436,6 +531,10 @@ def verify_approval_chain(db: Session, task_id: int) -> dict:
             action=approval.action,
             comment=approval.comment,
             created_at=approval.created_at,
+            approved_draft_sha256=approval.approved_draft_sha256,
+            evidence_manifest=approval.evidence_manifest,
+            approval_episode_id=approval.approval_episode_id,
+            decision_key=approval.decision_key,
         )
         if approval.prev_hash != prev_hash or approval.entry_hash != expected:
             return {"valid": False, "broken_at": approval.id, "count": len(approvals), "legacy": legacy}

@@ -12,7 +12,7 @@ it with a decision payload via the LangGraph SDK.
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 
 from agent.llm import reviewer_llm, writer_llm
 from agent.state import AgentState
@@ -52,7 +52,9 @@ async def writer_node(state: AgentState) -> dict:
     response = await writer_llm().ainvoke(
         [SystemMessage(content=WRITER_SYSTEM), HumanMessage(content="\n".join(parts))]
     )
-    new_draft = response.content if isinstance(response.content, str) else str(response.content)
+    new_draft = (
+        response.content if isinstance(response.content, str) else str(response.content)
+    )
 
     return {
         "drafts": drafts + [new_draft],
@@ -74,13 +76,14 @@ async def reviewer_node(state: AgentState) -> dict:
             SystemMessage(content=REVIEWER_SYSTEM),
             HumanMessage(
                 content=(
-                    f"# Task\n{state.get('title', '')}\n\n"
-                    f"## Draft to review\n{latest}"
+                    f"# Task\n{state.get('title', '')}\n\n## Draft to review\n{latest}"
                 )
             ),
         ]
     )
-    comment = response.content if isinstance(response.content, str) else str(response.content)
+    comment = (
+        response.content if isinstance(response.content, str) else str(response.content)
+    )
     reviewer_comments = state.get("reviewer_comments", [])
     return {"reviewer_comments": reviewer_comments + [comment]}
 
@@ -104,20 +107,24 @@ def human_approval_node(state: AgentState) -> dict:
         {
             "task_id": state.get("task_id"),
             "latest_draft": drafts[-1] if drafts else None,
-            "latest_reviewer_comment": reviewer_comments[-1] if reviewer_comments else None,
+            "latest_reviewer_comment": reviewer_comments[-1]
+            if reviewer_comments
+            else None,
             "iteration": state.get("iteration", 0),
         }
     )
 
     decision = payload.get("decision") if isinstance(payload, dict) else None
     human_comment = payload.get("human_comment") if isinstance(payload, dict) else None
-    modified_draft = payload.get("modified_draft") if isinstance(payload, dict) else None
+    modified_draft = (
+        payload.get("modified_draft") if isinstance(payload, dict) else None
+    )
 
     update: dict = {"decision": decision, "human_comment": human_comment}
 
     # If the human edited the draft directly, append it as the latest version
     # so the finalize node uses it.
-    if modified_draft:
+    if modified_draft is not None:
         update["drafts"] = drafts + [modified_draft]
         update["modified_draft"] = modified_draft
 

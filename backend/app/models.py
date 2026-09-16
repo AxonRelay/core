@@ -6,9 +6,11 @@ from datetime import datetime
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -63,6 +65,29 @@ class TaskStatusEnum(enum.StrEnum):
     NEEDS_REVISION = "needs_revision"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+
+
+class EvidenceSourceTypeEnum(enum.StrEnum):
+    """Operator-declared sensitivity boundary for a captured source."""
+
+    PUBLIC = "public"
+    PERSONAL = "personal"
+
+
+class EvidenceStatusEnum(enum.StrEnum):
+    """Review state for an AI-annotated evidence clip."""
+
+    CANDIDATE = "candidate"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+
+class EvidenceFeedbackVerdictEnum(enum.StrEnum):
+    """Small, evaluation-oriented feedback vocabulary."""
+
+    RELEVANT = "relevant"
+    IRRELEVANT = "irrelevant"
+    MISLEADING = "misleading"
 
 
 # =============================================================================
@@ -143,6 +168,7 @@ class Task(Base):
 
     current_draft = Column(Text)
     feedback = Column(Text)
+    approval_episode_id = Column(String(255), index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -152,6 +178,7 @@ class Task(Base):
     drafts = relationship("Draft", back_populates="task", cascade="all, delete-orphan")
     approvals = relationship("Approval", back_populates="task", cascade="all, delete-orphan")
     external_links = relationship("ExternalLink", back_populates="task", cascade="all, delete-orphan")
+    evidence_clips = relationship("EvidenceClip", back_populates="task", cascade="all, delete-orphan")
 
 
 class Draft(Base):
@@ -172,12 +199,32 @@ class Approval(Base):
     """Approval / rejection history for tasks."""
 
     __tablename__ = "approvals"
+    __table_args__ = (
+        UniqueConstraint("task_id", "approval_episode_id", name="uq_approval_task_episode"),
+        CheckConstraint(
+            "decision_key IS NULL OR approval_episode_id IS NOT NULL",
+            name="ck_approval_decision_has_episode",
+        ),
+        CheckConstraint(
+            "approval_episode_id IS NULL OR action <> 'approved' OR "
+            "(approved_content IS NOT NULL AND approved_draft_sha256 IS NOT NULL)",
+            name="ck_approval_approved_payload",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
     reviewer_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"))
     action = Column(String(20), nullable=False)
     comment = Column(Text)
+    approved_content = Column(Text)
+    approved_draft_sha256 = Column(String(64))
+    evidence_manifest = Column(JSON)
+    approval_episode_id = Column(String(255), index=True)
+    decision_key = Column(String(64), unique=True, index=True)
+    delivery_status = Column(String(20), nullable=False, default="pending")
+    delivery_run_id = Column(String(255), index=True)
+    delivery_error = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Tamper-evident hash chain (see app/ledger.py). prev_hash links to the
@@ -202,6 +249,66 @@ class ExternalLink(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     task = relationship("Task", back_populates="external_links")
+
+
+class EvidenceClip(Base):
+    """An immutable, user-selected source excerpt attached to one task.
+
+    Browser-owned provenance (URL/title/quote) is kept separate from optional
+    model-produced annotations. The server never fetches the URL.
+    """
+
+    __tablename__ = "evidence_clips"
+    __table_args__ = (
+        UniqueConstraint("task_id", "source_url", "quote_sha256", name="uq_evidence_task_source_quote"),
+        Index("ix_evidence_task_captured", "task_id", "captured_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    captured_by_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), index=True)
+
+    source_url = Column(String(2000), nullable=False)
+    source_title = Column(String(500), nullable=False)
+    source_type = Column(Enum(EvidenceSourceTypeEnum), nullable=False)
+    quote = Column(Text, nullable=False)
+    quote_sha256 = Column(String(64), nullable=False, index=True)
+    locator = Column(JSON)
+
+    annotations = Column(JSON)
+    extractor = Column(String(100))
+    extractor_version = Column(String(100))
+    prompt_version = Column(String(100))
+    inference_location = Column(String(20), nullable=False, default="none")
+    extraction_ms = Column(Float)
+    status = Column(Enum(EvidenceStatusEnum), nullable=False, default=EvidenceStatusEnum.CANDIDATE, index=True)
+    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    task = relationship("Task", back_populates="evidence_clips")
+    captured_by = relationship("Actor")
+    feedback_events = relationship(
+        "EvidenceFeedback", back_populates="evidence_clip", cascade="all, delete-orphan", order_by="EvidenceFeedback.id"
+    )
+
+    @property
+    def evidence_ref(self) -> str:
+        return f"E-{self.id}"
+
+
+class EvidenceFeedback(Base):
+    """Append-only evaluation event for an EvidenceClip."""
+
+    __tablename__ = "evidence_feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+    evidence_clip_id = Column(Integer, ForeignKey("evidence_clips.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), index=True)
+    verdict = Column(Enum(EvidenceFeedbackVerdictEnum), nullable=False, index=True)
+    comment = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    evidence_clip = relationship("EvidenceClip", back_populates="feedback_events")
+    actor = relationship("Actor")
 
 
 # =============================================================================

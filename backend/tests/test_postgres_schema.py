@@ -35,7 +35,7 @@ from sqlalchemy import Enum, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
-from app import coordination, crud, models
+from app import coordination, crud, evidence, models
 
 TEST_URL = os.environ.get("AXONRELAY_TEST_POSTGRES_URL")
 
@@ -54,9 +54,13 @@ MODEL_ENUMS = [
     models.ClaimResourceEnum,
     models.ClaimStatusEnum,
     models.RelayKindEnum,
+    models.EvidenceSourceTypeEnum,
+    models.EvidenceStatusEnum,
+    models.EvidenceFeedbackVerdictEnum,
 ]
 
 COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts"}
+EVIDENCE_TABLES = {"evidence_clips", "evidence_feedback"}
 
 
 def _expected_head() -> str:
@@ -153,6 +157,13 @@ class TestMigrationChain:
             }
         assert present >= COORDINATION_TABLES
 
+    def test_the_evidence_tables_exist(self, migrated_engine):
+        with migrated_engine.connect() as conn:
+            present = {
+                r[0] for r in conn.execute(text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")).all()
+            }
+        assert present >= EVIDENCE_TABLES
+
     def test_the_workspace_identity_constraint_is_enforced(self, migrated_engine):
         """(host, repo, clone_path) must be unique — sibling clones rely on it."""
         with migrated_engine.connect() as conn:
@@ -208,6 +219,29 @@ class TestWritesActuallyLand:
             pg_session.add(task)
             pg_session.commit()
             assert task.status == status
+
+    def test_evidence_and_feedback_enums_are_accepted(self, pg_session):
+        actor = models.Actor(type=models.ActorTypeEnum.HUMAN, name="evidence-reviewer")
+        task = models.Task(thread_id="parity-evidence", title="evidence")
+        pg_session.add_all([actor, task])
+        pg_session.commit()
+
+        clip = evidence.create_clip(
+            pg_session,
+            task_id=task.id,
+            captured_by_actor_id=actor.id,
+            source_url="https://example.test/evidence",
+            source_title="Evidence",
+            source_type="personal",
+            quote="An exact source excerpt.",
+        )
+        event = evidence.record_feedback(pg_session, clip.id, actor.id, "relevant")
+
+        assert clip.source_type == models.EvidenceSourceTypeEnum.PERSONAL
+        # Usage feedback is an observation, not an authorization to promote
+        # candidate evidence into trusted memory.
+        assert clip.status == models.EvidenceStatusEnum.CANDIDATE
+        assert event.verdict == models.EvidenceFeedbackVerdictEnum.RELEVANT
 
 
 class TestConcurrentApprovals:

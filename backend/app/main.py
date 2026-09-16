@@ -8,7 +8,10 @@ User / Project / OAuth endpoints have been removed in this pivot. A single
 human Actor (name="self") represents the operator.
 """
 
+import hmac
+import os
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +19,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from app import coordination, crud, langgraph_client, models, service
+from app import coordination, crud, evidence, langgraph_client, ledger, models, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.ratelimit import client_key
@@ -25,9 +28,12 @@ from app.schema import (
     AgentDefinitionCreateRequest,
     AgentDefinitionResponse,
     AgentDefinitionUpdateRequest,
-    ApprovalResponse,
+    ApprovalDeliveryResolutionRequest,
+    ApprovalSummaryResponse,
     ApproveRequest,
     DraftResponse,
+    EvidenceClipCreateRequest,
+    EvidenceFeedbackRequest,
     RejectRequest,
     TaskAssignmentCreateRequest,
     TaskAssignmentResponse,
@@ -59,8 +65,24 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+
+def _require_capture_token(request: Request) -> None:
+    """Authenticate the private Evidence REST surface.
+
+    Evidence capture and retrieval are disabled unless the operator explicitly
+    configures a token. This prevents a loopback page from reading personal
+    context merely because it can reach the API.
+    """
+    expected = os.getenv("AXONRELAY_CAPTURE_TOKEN", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Evidence capture is disabled")
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, supplied = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Invalid capture token", headers={"WWW-Authenticate": "Bearer"})
 
 
 @app.get("/")
@@ -287,12 +309,92 @@ async def delete_task_endpoint(request: Request, task_id: int, db: Session = Dep
 # ========== Platform-driven Run / State Sync ==========
 
 
-def _sync_state_to_db(db: Session, task: models.Task, values: dict, waiting_for_human: bool) -> None:
+def _sync_state_to_db(
+    db: Session,
+    task: models.Task,
+    values: dict,
+    waiting_for_human: bool,
+    approval_episode_id: str | None = None,
+) -> None:
     """Project Platform thread state into the Postgres ledger.
 
     Thin wrapper over the shared service so the HTTP and MCP paths cannot drift.
     """
-    service.project_run_state(db, task, values, waiting_for_human)
+    service.project_run_state(db, task, values, waiting_for_human, approval_episode_id)
+
+
+async def _project_current_platform_state(db: Session, task: models.Task, approval: models.Approval) -> None:
+    """Repair/replay the local projection after a confirmed delivery."""
+    try:
+        state = await langgraph_client.get_state(task.thread_id)
+        values = langgraph_client.extract_values(state)
+        waiting = langgraph_client.is_waiting_for_human(state)
+        episode_id = langgraph_client.extract_approval_episode_id(state) or (f"local:{uuid4()}" if waiting else None)
+        _sync_state_to_db(db, task, values, waiting, episode_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Decision {approval.id} was delivered, but the local task projection could not be refreshed: {exc}",
+        ) from exc
+
+
+async def _deliver_recorded_decision(
+    db: Session,
+    task: models.Task,
+    approval: models.Approval,
+    payload: dict,
+) -> None:
+    """Deliver once or reconcile a prior attempt, then refresh projection."""
+    if approval.delivery_status == "delivered":
+        await _project_current_platform_state(db, task, approval)
+        return
+
+    if approval.delivery_status in {"delivering", "unknown"}:
+        if not approval.delivery_run_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Decision {approval.id} may already be delivered; inspect Platform before resolving it",
+            )
+        try:
+            await langgraph_client.join_run(task.thread_id, approval.delivery_run_id)
+        except Exception as exc:
+            crud.mark_approval_delivery(db, approval, "unknown", str(exc))
+            raise HTTPException(
+                status_code=502,
+                detail=f"Decision {approval.id} delivery is still unknown: {exc}",
+            ) from exc
+        crud.mark_approval_delivery(db, approval, "delivered")
+        await _project_current_platform_state(db, task, approval)
+        return
+
+    if not crud.claim_approval_delivery(db, approval):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Decision {approval.id} delivery is already {approval.delivery_status}; automatic retry is unsafe",
+        )
+
+    try:
+        await langgraph_client.resume_thread(
+            task.thread_id,
+            payload,
+            decision_key=approval.decision_key,
+            on_run_created=lambda run_id: crud.record_approval_delivery_run_id(db, approval.id, run_id),
+        )
+    except langgraph_client.AmbiguousDeliveryError as exc:
+        db.refresh(approval)
+        crud.mark_approval_delivery(db, approval, "unknown", str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Decision {approval.id} delivery outcome is unknown: {exc}",
+        ) from exc
+    except langgraph_client.PlatformNotConfiguredError as exc:
+        crud.mark_approval_delivery(db, approval, "failed", str(exc))
+        raise HTTPException(
+            status_code=503, detail=f"Decision {approval.id} recorded but not delivered: {exc}"
+        ) from exc
+
+    crud.mark_approval_delivery(db, approval, "delivered")
+    await _project_current_platform_state(db, task, approval)
 
 
 @app.post("/tasks/{task_id}/run", response_model=TaskWithAssignmentsResponse)
@@ -320,7 +422,8 @@ async def run_task_endpoint(request: Request, task_id: int, db: Session = Depend
 
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)
-    _sync_state_to_db(db, task, values, waiting)
+    episode_id = langgraph_client.extract_approval_episode_id(result) or (f"local:{uuid4()}" if waiting else None)
+    _sync_state_to_db(db, task, values, waiting, episode_id)
     db.refresh(task)
     return task
 
@@ -343,7 +446,7 @@ async def list_pending_approvals_endpoint(
 # ========== Approve / Reject ==========
 
 
-@app.post("/tasks/{task_id}/approve", response_model=ApprovalResponse)
+@app.post("/tasks/{task_id}/approve", response_model=ApprovalSummaryResponse)
 @limiter.limit("30/minute")
 async def approve_task_endpoint(
     request: Request, task_id: int, approve_data: ApproveRequest, db: Session = Depends(get_db)
@@ -356,34 +459,63 @@ async def approve_task_endpoint(
 
     self_actor = crud.get_self_actor(db)
     reviewer_actor_id = self_actor.id if self_actor else None
+    if not task.approval_episode_id or approve_data.approval_episode_id != task.approval_episode_id:
+        raise HTTPException(
+            status_code=409, detail="Approval episode changed; review the current draft before deciding"
+        )
 
-    approval = crud.record_approval(
-        db,
-        task_id=task_id,
-        reviewer_actor_id=reviewer_actor_id,
-        action="approved",
-        comment=approve_data.comment,
+    approved_content = (
+        approve_data.modified_draft if approve_data.modified_draft is not None else (task.current_draft or "")
     )
+    reference_check = evidence.validate_draft_references(
+        db,
+        task_id,
+        approved_content,
+    )
+    unavailable = reference_check["missing"] + reference_check["tampered"] + reference_check["rejected"]
+    if unavailable:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Draft cites unavailable Evidence IDs: {', '.join(unavailable)}",
+        )
 
     try:
-        result = await langgraph_client.resume_thread(
-            task.thread_id,
-            {
-                "decision": "approved",
-                "human_comment": approve_data.comment,
-                "modified_draft": approve_data.modified_draft,
-            },
+        approval = crud.record_approval(
+            db,
+            task_id=task_id,
+            reviewer_actor_id=reviewer_actor_id,
+            action="approved",
+            comment=approve_data.comment,
+            approved_content=approved_content,
+            approved_draft_sha256=evidence.hash_quote(approved_content),
+            evidence_manifest=reference_check["manifest"],
+            approval_episode_id=task.approval_episode_id,
+            decision_key=ledger.compute_decision_key(
+                task_id=task_id,
+                approval_episode_id=task.approval_episode_id,
+                action="approved",
+                comment=approve_data.comment,
+                approved_draft_sha256=evidence.hash_quote(approved_content),
+                evidence_manifest=reference_check["manifest"],
+            ),
         )
-    except langgraph_client.PlatformNotConfiguredError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+    except crud.DecisionConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
-    values = langgraph_client.extract_values(result)
-    waiting = langgraph_client.is_waiting_for_human(result)
-    _sync_state_to_db(db, task, values, waiting)
+    await _deliver_recorded_decision(
+        db,
+        task,
+        approval,
+        {
+            "decision": "approved",
+            "human_comment": approve_data.comment,
+            "modified_draft": approve_data.modified_draft,
+        },
+    )
     return approval
 
 
-@app.post("/tasks/{task_id}/reject", response_model=ApprovalResponse)
+@app.post("/tasks/{task_id}/reject", response_model=ApprovalSummaryResponse)
 @limiter.limit("30/minute")
 async def reject_task_endpoint(
     request: Request, task_id: int, reject_data: RejectRequest, db: Session = Depends(get_db)
@@ -396,32 +528,69 @@ async def reject_task_endpoint(
 
     self_actor = crud.get_self_actor(db)
     reviewer_actor_id = self_actor.id if self_actor else None
+    if not task.approval_episode_id or reject_data.approval_episode_id != task.approval_episode_id:
+        raise HTTPException(
+            status_code=409, detail="Approval episode changed; review the current draft before deciding"
+        )
 
     comment_parts = [reject_data.comment, reject_data.reason]
     combined_comment = " | ".join(p for p in comment_parts if p) or None
 
-    approval = crud.record_approval(
-        db,
+    decision_key = ledger.compute_decision_key(
         task_id=task_id,
-        reviewer_actor_id=reviewer_actor_id,
+        approval_episode_id=task.approval_episode_id,
         action="rejected",
         comment=combined_comment,
+        approved_draft_sha256=None,
+        evidence_manifest=None,
     )
-
     try:
-        result = await langgraph_client.resume_thread(
-            task.thread_id,
-            {
-                "decision": "rejected",
-                "human_comment": combined_comment,
-            },
+        approval = crud.record_approval(
+            db,
+            task_id=task_id,
+            reviewer_actor_id=reviewer_actor_id,
+            action="rejected",
+            comment=combined_comment,
+            approval_episode_id=task.approval_episode_id,
+            decision_key=decision_key,
         )
-    except langgraph_client.PlatformNotConfiguredError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+    except crud.DecisionConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
-    values = langgraph_client.extract_values(result)
-    waiting = langgraph_client.is_waiting_for_human(result)
-    _sync_state_to_db(db, task, values, waiting)
+    await _deliver_recorded_decision(
+        db,
+        task,
+        approval,
+        {
+            "decision": "rejected",
+            "human_comment": combined_comment,
+        },
+    )
+    return approval
+
+
+@app.post("/approvals/{approval_id}/delivery/resolve", response_model=ApprovalSummaryResponse)
+@limiter.limit("10/minute")
+async def resolve_approval_delivery_endpoint(
+    request: Request,
+    approval_id: int,
+    resolution: ApprovalDeliveryResolutionRequest,
+    db: Session = Depends(get_db),
+):
+    """Resolve an ambiguous delivery after the operator checks Platform."""
+    approval = db.get(models.Approval, approval_id)
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    if approval.delivery_status not in {"unknown", "delivering"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Approval {approval_id} is {approval.delivery_status}; only unknown/delivering can be resolved",
+        )
+    if resolution.outcome == "confirmed_not_delivered":
+        crud.mark_approval_delivery(db, approval, "failed", "operator confirmed no Platform run was accepted")
+        return approval
+    crud.mark_approval_delivery(db, approval, "delivered", "operator confirmed Platform delivery")
+    await _project_current_platform_state(db, approval.task, approval)
     return approval
 
 
@@ -437,7 +606,7 @@ async def get_drafts_endpoint(request: Request, task_id: int, db: Session = Depe
     return crud.get_drafts(db, task_id)
 
 
-@app.get("/tasks/{task_id}/approvals", response_model=list[ApprovalResponse])
+@app.get("/tasks/{task_id}/approvals", response_model=list[ApprovalSummaryResponse])
 @limiter.limit("60/minute")
 async def get_approvals_endpoint(request: Request, task_id: int, db: Session = Depends(get_db)):
     """Approval / rejection history for a task (read-only, for the dashboard)."""
@@ -445,6 +614,109 @@ async def get_approvals_endpoint(request: Request, task_id: int, db: Session = D
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return crud.get_approvals(db, task_id)
+
+
+# ========== Evidence Clips ==========
+
+
+@app.post("/tasks/{task_id}/evidence-clips")
+@limiter.limit("30/minute")
+async def create_evidence_clip_endpoint(
+    request: Request,
+    task_id: int,
+    clip_data: EvidenceClipCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """Capture an explicitly selected excerpt from the browser.
+
+    It requires a dedicated bearer token and never fetches the supplied URL.
+    """
+    _require_capture_token(request)
+    actor = crud.get_self_actor(db)
+    try:
+        clip = evidence.create_clip(
+            db,
+            task_id=task_id,
+            captured_by_actor_id=actor.id if actor else None,
+            **clip_data.model_dump(),
+        )
+    except ValueError as exc:
+        status = 404 if "not found" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    return evidence.clip_to_dict(clip)
+
+
+@app.get("/tasks/{task_id}/evidence-clips")
+@limiter.limit("60/minute")
+async def list_evidence_clips_endpoint(
+    request: Request,
+    task_id: int,
+    include_rejected: bool = False,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    _require_capture_token(request)
+    if not crud.get_task(db, task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return [
+        evidence.clip_to_dict(clip)
+        for clip in evidence.list_clips(
+            db,
+            task_id,
+            include_rejected=include_rejected,
+            skip=skip,
+            limit=limit,
+        )
+    ]
+
+
+@app.get("/tasks/{task_id}/context-pack")
+@limiter.limit("60/minute")
+async def context_pack_endpoint(
+    request: Request,
+    task_id: int,
+    query: str = "",
+    limit: int = 5,
+    char_budget: int = 8000,
+    db: Session = Depends(get_db),
+):
+    _require_capture_token(request)
+    try:
+        return evidence.get_context_pack(db, task_id, query, limit, char_budget)
+    except ValueError as exc:
+        status = 404 if "not found" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@app.post("/evidence-clips/{clip_id}/feedback")
+@limiter.limit("30/minute")
+async def evidence_feedback_endpoint(
+    request: Request,
+    clip_id: int,
+    feedback_data: EvidenceFeedbackRequest,
+    db: Session = Depends(get_db),
+):
+    _require_capture_token(request)
+    actor = crud.get_self_actor(db)
+    try:
+        event = evidence.record_feedback(
+            db,
+            clip_id,
+            actor.id if actor else None,
+            feedback_data.verdict,
+            feedback_data.comment,
+        )
+    except ValueError as exc:
+        status = 404 if "not found" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    return {
+        "id": event.id,
+        "evidence_ref": event.evidence_clip.evidence_ref,
+        "verdict": str(event.verdict),
+        "comment": event.comment,
+        "created_at": event.created_at.isoformat(),
+    }
 
 
 # ========== Ledger Integrity ==========

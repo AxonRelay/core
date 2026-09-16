@@ -74,14 +74,25 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `get_drafts(task_id)` | ドラフト履歴 |
 | `create_task(title, description?, assignments?)` | 新規タスク + Platform thread 確保 |
 | `run_task(task_id)` | Platform 上で graph 実行 → 承認待ちまで |
-| `approve_task(task_id, comment?, modified_draft?)` | 承認（任意で edit） |
-| `reject_task(task_id, comment?, reason?)` | 差戻し（revision loop） |
+| `approve_task(task_id, approval_episode_id, comment?, modified_draft?)` | 承認（任意で edit）。レビューしたTaskの episode IDが必須 |
+| `reject_task(task_id, approval_episode_id, comment?, reason?)` | 差戻し（revision loop）。レビューしたTaskの episode IDが必須 |
 | `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。elicitation 非対応クライアントは `approve_task`/`reject_task` を使う |
+| `resolve_approval_delivery(approval_id, outcome)` | `unknown` / `delivering` の配送をPlatform確認後に明示解決。`confirmed_delivered` または `confirmed_not_delivered` のみ |
 | `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy}`。`legacy` は hash chain 導入前の行数） |
 | `list_agents(agent_type?, is_active?)` | AI Actor 一覧 |
 | `create_agent(name, agent_type, ...)` | AI Actor 定義 |
 | `update_agent(agent_id, ...)` | AI Actor 更新 |
 | `get_self_actor()` | オペレータ Human Actor |
+
+### Evidence Clip 実験
+
+| Tool | 用途 |
+|---|---|
+| `get_context_pack(task_id, query?, limit?, char_budget?)` | 出典と`E-id`を保った決定的検索。LLM要約は行わない |
+| `evaluate_evidence_clip(clip_id, verdict, comment?)` | `relevant` / `irrelevant` / `misleading` を追記 |
+| `validate_evidence_references(task_id, draft)` | Draft中の`[E-id]`が同じTaskの有効なEvidenceか検証 |
+
+評価設計と信頼境界は [evidence-clips-mvp.md](./evidence-clips-mvp.md)。
 
 ### 調整レイヤー (Phase 3)
 

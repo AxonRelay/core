@@ -23,6 +23,7 @@ LEDGER_TOOLS = {
     "run_task",
     "approve_task",
     "reject_task",
+    "resolve_approval_delivery",
     "review_pending_task",
     "list_agents",
     "create_agent",
@@ -41,6 +42,12 @@ COORDINATION_TOOLS = {
     "send_relay",
     "read_inbox",
     "ack_relay",
+}
+
+EVIDENCE_TOOLS = {
+    "get_context_pack",
+    "evaluate_evidence_clip",
+    "validate_evidence_references",
 }
 
 
@@ -66,6 +73,10 @@ def test_every_ledger_tool_is_registered(tools):
 
 def test_every_coordination_tool_is_registered(tools):
     assert set(tools) >= COORDINATION_TOOLS
+
+
+def test_every_evidence_tool_is_registered(tools):
+    assert set(tools) >= EVIDENCE_TOOLS
 
 
 def test_no_tool_was_registered_twice(server):

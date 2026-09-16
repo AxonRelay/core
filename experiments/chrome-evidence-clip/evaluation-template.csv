@@ -1,0 +1,2 @@
+batch,task_id,condition,task_type,capture_count,capture_seconds,annotation_review_seconds,decision_seconds,expected_relevant_ids,returned_top5_ids,cited_ids,missing_or_invalid_ids,relevant_results,blind_quality_1_to_5,baseline_pair_task_id,clip_reused_after_days,prohibited_capture,prompt_injection_side_effect,notes
+1,,A|B|C,design|research,0,0,0,0,"","","","",0,,,,false,false,""

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ========== Actor Schemas ==========
 
@@ -98,6 +98,7 @@ class TaskResponse(BaseModel):
     status: str
     current_draft: str | None
     feedback: str | None
+    approval_episode_id: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -127,11 +128,13 @@ class DraftResponse(BaseModel):
 
 
 class ApproveRequest(BaseModel):
+    approval_episode_id: str = Field(..., min_length=1, max_length=255)
     comment: str | None = Field(None, max_length=2000)
     modified_draft: str | None = Field(None, max_length=50000)
 
 
 class RejectRequest(BaseModel):
+    approval_episode_id: str = Field(..., min_length=1, max_length=255)
     comment: str | None = Field(None, max_length=2000)
     reason: str | None = Field(None, max_length=500)
 
@@ -142,7 +145,65 @@ class ApprovalResponse(BaseModel):
     reviewer_actor_id: int | None
     action: str
     comment: str | None
+    approved_content: str | None = None
+    approved_draft_sha256: str | None = None
+    evidence_manifest: list[dict] | None = None
+    approval_episode_id: str | None = None
+    decision_key: str | None = None
+    delivery_status: str = "pending"
+    delivery_run_id: str | None = None
+    delivery_error: str | None = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class ApprovalSummaryResponse(BaseModel):
+    """Redacted approval timeline safe for the read-only dashboard."""
+
+    id: int
+    task_id: int
+    reviewer_actor_id: int | None
+    action: str
+    comment: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ApprovalDeliveryResolutionRequest(BaseModel):
+    outcome: str = Field(pattern="^(confirmed_delivered|confirmed_not_delivered)$")
+
+
+# ========== Evidence Clip Schemas ==========
+
+
+class EvidenceAnnotations(BaseModel):
+    """Derived data only; verified facts require a separate governed action."""
+
+    model_config = ConfigDict(extra="forbid")
+    summary: str = Field(..., max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=8)
+    source_claims: list[str] = Field(default_factory=list, max_length=5)
+    interpretations: list[str] = Field(default_factory=list, max_length=5)
+
+
+class EvidenceClipCreateRequest(BaseModel):
+    source_url: str = Field(..., min_length=1, max_length=2000)
+    source_title: str = Field(..., min_length=1, max_length=500)
+    source_type: str = Field(..., pattern="^(public|personal)$")
+    quote: str = Field(..., min_length=1, max_length=8000)
+    locator: dict | None = None
+    annotations: EvidenceAnnotations | None = None
+    extractor: str | None = Field(None, max_length=100)
+    extractor_version: str | None = Field(None, max_length=100)
+    prompt_version: str | None = Field(None, max_length=100)
+    inference_location: str = Field("none", pattern="^(none|device|lan)$")
+    extraction_ms: float | None = Field(None, ge=0)
+
+
+class EvidenceFeedbackRequest(BaseModel):
+    verdict: str = Field(..., pattern="^(relevant|irrelevant|misleading)$")
+    comment: str | None = Field(None, max_length=2000)

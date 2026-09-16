@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+from sqlalchemy import text
+
 from app import crud, ledger, models
 
 
@@ -103,3 +105,202 @@ def test_models_has_hash_columns():
     # Guards the migration/model staying in sync with the ledger.
     cols = models.Approval.__table__.columns.keys()
     assert "prev_hash" in cols and "entry_hash" in cols
+
+
+def test_approval_hash_binds_the_validated_draft_and_evidence_manifest(db, self_actor):
+    task = _task(db)
+    manifest = [{"evidence_ref": "E-1", "quote_sha256": "a" * 64, "source_url": "https://example.test"}]
+    approval = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "approved",
+        "ship",
+        approved_draft_sha256="b" * 64,
+        evidence_manifest=manifest,
+    )
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+
+    approval.evidence_manifest = [{**manifest[0], "quote_sha256": "c" * 64}]
+    db.commit()
+    assert crud.verify_approval_chain(db, task.id)["broken_at"] == approval.id
+
+
+def test_approved_content_is_reconstructable_and_tamper_evident(db, self_actor):
+    task = _task(db)
+    content = "The exact approved draft [E-1]."
+    approval = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "approved",
+        approved_content=content,
+        approved_draft_sha256=ledger.hash_text(content),
+        evidence_manifest=[],
+        approval_episode_id="checkpoint:content-tamper",
+        decision_key="d" * 64,
+    )
+
+    assert approval.approved_content == content
+    assert crud.verify_approval_chain(db, task.id)["valid"] is True
+    approval.approved_content = "silently changed"
+    db.commit()
+    assert crud.verify_approval_chain(db, task.id)["broken_at"] == approval.id
+
+
+def test_nulling_reconstructable_approved_content_is_detected(db, self_actor):
+    task = _task(db)
+    content = "Approved bytes must remain reconstructable."
+    approval = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "approved",
+        approved_content=content,
+        approved_draft_sha256=ledger.hash_text(content),
+        evidence_manifest=[],
+        approval_episode_id="checkpoint:null-test",
+        decision_key="c" * 64,
+    )
+
+    # Simulate storage corruption / a privileged writer bypassing the schema
+    # constraint. Verification must still detect the missing payload.
+    db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    db.execute(text("UPDATE approvals SET approved_content = NULL WHERE id = :id"), {"id": approval.id})
+    db.commit()
+    db.expire_all()
+
+    assert crud.verify_approval_chain(db, task.id)["broken_at"] == approval.id
+
+
+def test_nulling_decision_key_cannot_bypass_approved_content_verification(db, self_actor):
+    task = _task(db)
+    content = "Original approved bytes."
+    approval = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "approved",
+        approved_content=content,
+        approved_draft_sha256=ledger.hash_text(content),
+        approval_episode_id="checkpoint:key-tamper",
+        decision_key="9" * 64,
+    )
+    db.execute(text("PRAGMA ignore_check_constraints = ON"))
+    db.execute(
+        text("UPDATE approvals SET decision_key = NULL, approved_content = 'rewritten' WHERE id = :id"),
+        {"id": approval.id},
+    )
+    db.commit()
+    db.expire_all()
+
+    assert crud.verify_approval_chain(db, task.id)["broken_at"] == approval.id
+
+
+def test_decision_key_makes_delivery_retry_reuse_the_same_ledger_event(db, self_actor):
+    task = _task(db)
+    content = "same approval"
+    first = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "approved",
+        approved_content=content,
+        approved_draft_sha256=ledger.hash_text(content),
+        approval_episode_id="checkpoint:retry",
+        decision_key="e" * 64,
+    )
+    crud.mark_approval_delivery(db, first, "failed", "offline")
+    retry = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "approved",
+        approved_content=content,
+        approved_draft_sha256=ledger.hash_text(content),
+        approval_episode_id="checkpoint:retry",
+        decision_key="e" * 64,
+    )
+
+    assert retry.id == first.id
+    assert retry.delivery_status == "failed"
+    assert db.query(models.Approval).count() == 1
+
+
+def test_one_approval_episode_cannot_record_conflicting_decisions(db, self_actor):
+    task = _task(db)
+    crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "rejected",
+        approval_episode_id="checkpoint:one-choice",
+        decision_key="1" * 64,
+    )
+
+    try:
+        crud.record_approval(
+            db,
+            task.id,
+            self_actor.id,
+            "rejected",
+            comment="different decision payload",
+            approval_episode_id="checkpoint:one-choice",
+            decision_key="2" * 64,
+        )
+    except ValueError as error:
+        assert "already contains a different decision" in str(error)
+    else:
+        raise AssertionError("conflicting decision should be rejected")
+
+
+def test_tampering_with_approval_episode_identity_breaks_the_chain(db, self_actor):
+    task = _task(db)
+    approval = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "rejected",
+        approval_episode_id="checkpoint:original",
+        decision_key="3" * 64,
+    )
+    approval.approval_episode_id = "checkpoint:rewritten"
+    db.commit()
+
+    assert crud.verify_approval_chain(db, task.id)["broken_at"] == approval.id
+
+
+def test_identical_decisions_in_different_approval_episodes_have_distinct_keys():
+    common = {
+        "task_id": 1,
+        "action": "approved",
+        "comment": "ship",
+        "approved_draft_sha256": "a" * 64,
+        "evidence_manifest": [],
+    }
+    first = ledger.compute_decision_key(approval_episode_id="checkpoint:first", **common)
+    retry = ledger.compute_decision_key(approval_episode_id="checkpoint:first", **common)
+    later_episode = ledger.compute_decision_key(approval_episode_id="checkpoint:second", **common)
+
+    assert retry == first
+    assert later_episode != first
+
+
+def test_delivery_claim_is_atomic_and_unknown_is_not_automatically_retryable(db, self_actor):
+    task = _task(db)
+    approval = crud.record_approval(
+        db,
+        task.id,
+        self_actor.id,
+        "rejected",
+        approval_episode_id="checkpoint:claim",
+        decision_key="f" * 64,
+    )
+
+    assert crud.claim_approval_delivery(db, approval) is True
+    assert approval.delivery_status == "delivering"
+    assert crud.claim_approval_delivery(db, approval) is False
+
+    crud.mark_approval_delivery(db, approval, "unknown", "run may have started")
+    assert crud.claim_approval_delivery(db, approval) is False
+    assert approval.delivery_status == "unknown"
