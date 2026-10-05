@@ -15,7 +15,25 @@ load_dotenv(find_dotenv(usecwd=True))
 # The default is the host's view of the compose-published port. Inside the
 # compose network the backend container gets its own URL (hostname
 # `postgres`) from docker-compose.yml, so this default is never used there.
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay")
+
+
+def with_explicit_driver(url: str) -> str:
+    """Pin a bare ``postgresql://`` URL to the psycopg2 driver we install.
+
+    SQLAlchemy 2.1 changed the default driver for ``postgresql://`` from
+    psycopg2 to psycopg (v3). requirements.txt ships psycopg2-binary, and the
+    URLs in compose, CI and existing ``.env`` files are all bare, so without
+    this every engine fails at creation with ``No module named 'psycopg'``.
+    A URL that already names a driver is left alone.
+    """
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg2://" + url[len("postgresql://") :]
+    return url
+
+
+DATABASE_URL = with_explicit_driver(
+    os.getenv("DATABASE_URL", "postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay")
+)
 
 # SQLAlchemy engine
 engine = create_engine(

@@ -36,8 +36,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 from app import coordination, crud, models
+from app.database import with_explicit_driver
 
 TEST_URL = os.environ.get("AXONRELAY_TEST_POSTGRES_URL")
+if TEST_URL:
+    TEST_URL = with_explicit_driver(TEST_URL)
 
 pytestmark = pytest.mark.skipif(
     not TEST_URL,
