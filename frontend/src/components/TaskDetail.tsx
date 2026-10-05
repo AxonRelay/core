@@ -21,15 +21,11 @@ export function TaskDetail({ taskId }: { taskId: number }) {
 
   // Each section fetches independently so a single failed sub-request doesn't
   // blank the whole pane (the task header still renders if drafts/approvals fail).
+  // App keys this component by task id, so switching tasks remounts it with
+  // fresh state; resetting state here would cascade renders.
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
-    setError(null);
-    setTask(null);
-    setDrafts([]);
-    setDraftsError(null);
-    setApprovals([]);
-    setApprovalsError(null);
 
     api
       .getTask(taskId, controller.signal)

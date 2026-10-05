@@ -12,7 +12,6 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setError(null);
     api
       .listTasks(statusFilter === "all" ? undefined : statusFilter, controller.signal)
       .then((ts) => {
@@ -38,10 +37,13 @@ export default function App() {
           selectedId={selectedId}
           statusFilter={statusFilter}
           onSelect={setSelectedId}
-          onFilter={setStatusFilter}
+          onFilter={(f) => {
+            setError(null);
+            setStatusFilter(f);
+          }}
         />
         {selectedId != null ? (
-          <TaskDetail taskId={selectedId} />
+          <TaskDetail key={selectedId} taskId={selectedId} />
         ) : (
           <section className="detail">
             <p className="muted">Select a task.</p>
