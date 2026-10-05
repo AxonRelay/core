@@ -24,10 +24,13 @@ def with_explicit_driver(url: str) -> str:
     psycopg2 to psycopg (v3). requirements.txt ships psycopg2-binary, and the
     URLs in compose, CI and existing ``.env`` files are all bare, so without
     this every engine fails at creation with ``No module named 'psycopg'``.
-    A URL that already names a driver is left alone.
+    The ``postgres://`` alias that hosting providers hand out is rewritten
+    too, since SQLAlchemy has no dialect by that name. A URL that already
+    names a driver is left alone.
     """
-    if url.startswith("postgresql://"):
-        return "postgresql+psycopg2://" + url[len("postgresql://") :]
+    for bare in ("postgresql://", "postgres://"):
+        if url.startswith(bare):
+            return "postgresql+psycopg2://" + url[len(bare) :]
     return url
 
 
