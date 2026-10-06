@@ -684,3 +684,21 @@ def test_the_authorization_header_survives_the_cors_preflight():
 
     cors = next(m for m in app.user_middleware if "CORS" in str(m))
     assert "Authorization" in cors.kwargs["allow_headers"]
+
+
+def test_refusing_another_actors_claim_leaves_it_held(mcp_db, self_actor, enforced):
+    """The ownership check runs before the release commits, so a refusal changes nothing."""
+    from app import coordination
+
+    agent = _make_ai(mcp_db)
+    _session_for(mcp_db, agent, clone="/mine")
+    theirs = _session_for(mcp_db, self_actor, clone="/theirs")
+    result = coordination.claim_territory(mcp_db, session_id=theirs.id, paths=["backend/app"])
+    claim = result["claim"]
+
+    with authz.bind(_as_credential(mcp_db, agent)), pytest.raises(authz.ActorMismatch):
+        server.release_territory(claim_id=claim.id)
+
+    mcp_db.expire_all()
+    still = mcp_db.query(models.Claim).filter(models.Claim.id == claim.id).one()
+    assert still.status == models.ClaimStatusEnum.HELD
