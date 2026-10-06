@@ -189,14 +189,20 @@ def register_session(
     focus_code: models.FocusCodeEnum | None = None,
     label: str | None = None,
     git_dir: str | None = None,
+    actor: models.Actor | None = None,
 ) -> models.Session:
     """Start or resume this actor's session in this workspace.
 
     Idempotent: an actor that is already active in the workspace resumes that
     session (refreshing branch / focus / heartbeat) instead of forking a second
     one, so its claims and unread relays survive an agent restart.
+
+    ``actor`` pins the session to that exact row. Pass it whenever the caller's
+    identity is known (a credential): Actor names are not unique, so resolving
+    by name and type could land on a different Actor that shares the name.
     """
-    actor = get_or_create_actor(db, actor_name, actor_type)
+    if actor is None:
+        actor = get_or_create_actor(db, actor_name, actor_type)
     workspace = get_or_create_workspace(db, host=host, repo=repo, clone_path=clone_path, label=label, git_dir=git_dir)
 
     now = datetime.utcnow()

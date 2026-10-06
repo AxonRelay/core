@@ -307,6 +307,26 @@ def check_claimed_actor(name: str | None) -> None:
         raise ActorMismatch("this credential acts as its own Actor; omit the name or pass that Actor's name")
 
 
+def credential_actor(db: Session, claimed_type: models.ActorTypeEnum) -> models.Actor | None:
+    """The credential's own Actor row, or None for a loopback caller.
+
+    A surface that would otherwise look an Actor up by name must use this row
+    instead: names are not unique, and the credential is bound to an id. A
+    claimed type that differs from that Actor's is refused like a differing
+    name (`check_claimed_actor`), not quietly corrected.
+    """
+    principal = _current.get()
+    if principal is None or principal.source != "credential" or principal.actor_id is None:
+        return None
+    actor = db.query(models.Actor).filter(models.Actor.id == principal.actor_id).first()
+    if actor is None:
+        raise ActorMismatch("this credential's Actor no longer exists")
+    if actor.type != claimed_type:
+        logger.info("authz refused an actor type that does not match the credential")
+        raise ActorMismatch("this credential acts as its own Actor; its type is not a parameter")
+    return actor
+
+
 def check_session_owner(db: Session, session_id: int | None) -> None:
     """Refuse a call that drives another Actor's coordination session.
 
