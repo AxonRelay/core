@@ -97,21 +97,34 @@ async def refresh_from_platform(
     but because Platform itself says the graph is waiting for a human. If the
     graph already answered and moved on, the projection shows that instead.
 
-    The read happens outside any lock (it is a network call), so the snapshot
-    is applied only if no decision was recorded meanwhile: the latest approval
-    is compared under the task lock against the one seen before reading, and
-    the projection is written in that same locked transaction. A newer
-    decision means the snapshot may predate it - projecting it could reopen a
-    task that decision just closed, or add drafts behind it - so it is
-    dropped whole.
+    The task lock is held from before the read until the projection commits,
+    and the latest approval is compared against the one the caller expected:
+    a decision recorded since means the caller's view is stale - projecting
+    could reopen a task that decision closed, or add drafts behind it - so
+    nothing is applied.
     """
     before = (
         expected_latest_approval_id if expected_latest_approval_id is not None else _latest_approval_id(db, task.id)
     )
-    db.rollback()  # end the read transaction; the network call holds no lock
-    state = await langgraph_client.get_state(task.thread_id)
+    db.rollback()
+    # The lock is taken *before* the Platform read and held across it, so
+    # refreshes of one task, and decisions on it, are serialized with the read
+    # itself. Checking only afterwards would let two refreshes that read in one
+    # order commit in the other: an older "waiting" snapshot landing over a
+    # newer "completed" one would reopen a finished task. A refresh is a rare
+    # recovery step, so a decision waiting out one Platform read is cheap.
     crud.lock_task(db, task.id)
     if _latest_approval_id(db, task.id) != before:
+        db.rollback()
+        return False
+    try:
+        state = await langgraph_client.get_state(task.thread_id)
+    except BaseException:
+        db.rollback()
+        raise
+    if _latest_approval_id(db, task.id) != before:
+        # Cannot happen while the lock holds on Postgres; SQLite has no row
+        # locks, so check again rather than rely on it.
         db.rollback()
         return False
     # Still under the lock: the whole snapshot - drafts and status - lands in

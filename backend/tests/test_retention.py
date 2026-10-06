@@ -220,6 +220,25 @@ def test_an_ended_sessions_unacked_receipt_does_not_hold_a_delivered_relay(db, a
     assert retention.sweep(db).relays == 1
 
 
+def test_an_ack_from_outside_the_audience_is_not_a_delivery(db, agent):
+    """ack_relay once accepted any session; such a receipt must not expire a relay early."""
+    sender = _session(db, "/sender")
+    outsider = _session(db, "/outsider")
+    target = models.Actor(type=models.ActorTypeEnum.AI, name="nobody-online")
+    db.add(target)
+    db.commit()
+    relay = coordination.send_relay(db, from_session_id=sender.id, subject="s", to_actor_id=target.id)
+    db.add(
+        models.RelayReceipt(
+            relay_id=relay.id, session_id=outsider.id, read_at=datetime.utcnow(), acked_at=datetime.utcnow()
+        )
+    )
+    db.commit()
+    _aged(db, relay, "created_at", retention.ACKED_RELAY_DAYS + 1)
+
+    assert retention.sweep(db).relays == 0
+
+
 def test_a_broadcast_takes_the_long_window_even_when_its_readers_sessions_go(db, agent):
     sender = _session(db, "/sender")
     reader = coordination.register_session(

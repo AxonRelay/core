@@ -882,3 +882,37 @@ def test_an_agent_cannot_force_its_way_over_another_actors_claim(mcp_db, self_ac
 
     mcp_db.expire_all()
     assert mcp_db.get(models.Claim, held.id).status == models.ClaimStatusEnum.HELD
+
+
+def test_an_agent_cannot_force_a_territory_claim_either(mcp_db, self_actor, enforced):
+    from app import coordination
+
+    agent = _make_ai(mcp_db)
+    mine = _session_for(mcp_db, agent, clone="/mine")
+    theirs = _session_for(mcp_db, self_actor, clone="/theirs")
+    held = coordination.claim_territory(mcp_db, session_id=theirs.id, paths=["backend/app"], repo="r")["claim"]
+    writer = authz.Principal(
+        actor_id=agent.id,
+        actor_name=agent.name,
+        scopes=frozenset({authz.Scope.COORDINATION_WRITE}),
+        source="credential",
+        credential_id=1,
+    )
+
+    with authz.bind(writer), pytest.raises(authz.ApprovalNotPermitted):
+        server.claim_territory(session_id=mine.id, paths=["backend/app"], repo="r", force=True)
+
+    mcp_db.expire_all()
+    assert mcp_db.get(models.Claim, held.id).status == models.ClaimStatusEnum.HELD
+
+
+def test_check_conflicts_answers_for_its_own_session(mcp_db, self_actor, enforced):
+    """A read-only question; it must work for a credential asking about its own session."""
+    agent = _make_ai(mcp_db)
+    mine = _session_for(mcp_db, agent, clone="/mine")
+    reader = authz.Principal(
+        actor_id=agent.id, actor_name=agent.name, scopes=authz.ALL_SCOPES, source="credential", credential_id=1
+    )
+    with authz.bind(reader):
+        result = server.check_conflicts(repo="r", paths=["backend/app"], session_id=mine.id)
+    assert isinstance(result, dict)

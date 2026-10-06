@@ -96,7 +96,7 @@ migration は既存の自由文からコードを**推測しない**。文から
 
 receipt は relay を**読んだ** session にしか無いので、「receipt が全部 ack 済み」は
 まだ開いていない宛先について何も言わない。だから「配達済み」は、宛先に含まれる
-**終了していない session すべて**が ack した receipt を持つこと、と定義する。
+**終了していない session すべて**が ack した receipt を持つこと（かつ宛先の誰かが ack していること）、と定義する。宛先外の session の ack は数えない。
 broadcast の宛先にはまだ始まっていない session も含まれるので、常に 180 日の窓で消える。
 Postgres では sweep の最初に `sessions` と `relay_receipts` を SHARE でロックし、判定と削除を
 1 つの一貫した状態の上で行う。途中で登録された session が宛先から漏れて、その session が

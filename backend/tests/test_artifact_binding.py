@@ -306,6 +306,29 @@ def test_a_refresh_lands_its_whole_snapshot_in_one_locked_transaction(db, self_a
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
 
 
+def test_a_refresh_holds_the_task_lock_across_its_platform_read(db, self_actor, monkeypatch):
+    """Locking only after the read would let two refreshes commit out of order."""
+    from app import langgraph_client, service
+
+    task, draft = _waiting(db)
+    order: list[str] = []
+    real_lock = crud.lock_task
+
+    def _lock(session, task_id):
+        order.append("lock")
+        return real_lock(session, task_id)
+
+    async def _read(*a, **k):
+        order.append("read")
+        return {"values": {"drafts": [draft.content]}, "next": ["human_approval"]}
+
+    monkeypatch.setattr(crud, "lock_task", _lock)
+    monkeypatch.setattr(langgraph_client, "get_state", _read)
+    asyncio.run(service.refresh_from_platform(db, task))
+
+    assert order[:2] == ["lock", "read"]
+
+
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):
     task, shown = _task_with_draft(db, "original")
 
