@@ -306,8 +306,8 @@ def test_a_refresh_lands_its_whole_snapshot_in_one_locked_transaction(db, self_a
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
 
 
-def test_a_refresh_holds_the_task_lock_across_its_platform_read(db, self_actor, monkeypatch):
-    """Locking only after the read would let two refreshes commit out of order."""
+def test_a_refresh_holds_no_lock_across_its_platform_read(db, self_actor, monkeypatch):
+    """A synchronous row lock held over an await can stall the worker; the read happens first."""
     from app import langgraph_client, service
 
     task, draft = _waiting(db)
@@ -326,7 +326,40 @@ def test_a_refresh_holds_the_task_lock_across_its_platform_read(db, self_actor, 
     monkeypatch.setattr(langgraph_client, "get_state", _read)
     asyncio.run(service.refresh_from_platform(db, task))
 
-    assert order[:2] == ["lock", "read"]
+    assert order[:2] == ["read", "lock"]
+
+
+def test_an_older_snapshot_never_lands_over_a_newer_state(db, self_actor):
+    """Two refreshes committing out of order, or a late delivery result: the version decides."""
+    from app import service
+
+    task, draft = _waiting(db)
+    read_at = service.current_state_version(db, task)
+
+    # Meanwhile a newer snapshot is projected: the graph finished.
+    assert service.apply_snapshot(
+        db, task, {"drafts": [draft.content], "final_output": draft.content}, False, expected_version=read_at
+    )
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.COMPLETED
+
+    # The older "waiting" snapshot arrives last and is dropped.
+    assert not service.apply_snapshot(db, task, {"drafts": [draft.content]}, True, expected_version=read_at)
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.COMPLETED
+
+
+def test_a_late_delivery_result_does_not_reopen_a_task_a_newer_decision_closed(db, self_actor):
+    from app import service
+
+    task, draft = _waiting(db)
+    first = crud.record_approval(db, task.id, self_actor.id, "rejected", "no", claim_waiting=True)
+    assert crud.reopen_decision(db, task.id, first.id)  # e.g. a refresh saw the graph waiting again
+    crud.record_approval(db, task.id, self_actor.id, "approved", "yes", claim_waiting=True)
+
+    # The first decision's delivery result, delayed, says "waiting".
+    assert not service.apply_snapshot(
+        db, task, {"drafts": [draft.content]}, True, expected_version=first.task_state_version
+    )
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
 
 
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):

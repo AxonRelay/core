@@ -45,6 +45,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.add_column("tasks", sa.Column("state_version", sa.Integer(), nullable=False, server_default="0"))
     op.add_column("approvals", sa.Column("decision_key", sa.String(length=64), nullable=True))
     op.create_unique_constraint("uq_approval_decision_key", "approvals", ["task_id", "decision_key"])
     # A key only means anything on a payload that hashes it. Planted on a
@@ -95,3 +96,4 @@ def downgrade() -> None:
     op.drop_constraint("ck_approval_decision_key_needs_v3", "approvals", type_="check")
     op.drop_constraint("uq_approval_decision_key", "approvals", type_="unique")
     op.drop_column("approvals", "decision_key")
+    op.drop_column("tasks", "state_version")

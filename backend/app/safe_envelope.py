@@ -239,15 +239,53 @@ class EnvelopeConflict(EnvelopeRejected):
         super().__init__(fields, "event_id already stored with different contents")
 
 
+#: Names a producer is likely to try and the schema deliberately has no slot
+#: for. An unknown key is reported by name only if it is one of these - a
+#: server-side constant - because the key of a JSON object is caller data like
+#: its value, and could carry the very content being kept out.
+KNOWN_EXCLUDED_FIELDS = frozenset(
+    {
+        "title",
+        "description",
+        "prompt",
+        "draft",
+        "content",
+        "feedback",
+        "comment",
+        "body",
+        "subject",
+        "message",
+        "command_output",
+        "output",
+        "file_contents",
+        "diff",
+        "url",
+        "path",
+        "clone_path",
+        "host",
+        "hostname",
+        "email",
+        "name",
+    }
+)
+UNKNOWN_FIELD = "(unknown field)"
+
+
 def _field_names(error: ValidationError) -> list[str]:
     """Top-level field names only: the envelope is flat, and pydantic appends
-    union-member or validator tags to ``loc`` that are not field names."""
+    union-member or validator tags to ``loc`` that are not field names.
+
+    A declared field is named. An undeclared one is named only when it is in
+    `KNOWN_EXCLUDED_FIELDS`; anything else is `(unknown field)`.
+    """
     names: list[str] = []
     for item in error.errors(include_input=False, include_url=False, include_context=False):
         loc = item.get("loc", ())
         # The first string in loc is the field (declared or unknown-and-
         # forbidden); later parts are pydantic's union / validator tags.
         first = next((str(part) for part in loc if isinstance(part, str)), "")
+        if item.get("type") == "extra_forbidden" and first not in KNOWN_EXCLUDED_FIELDS:
+            first = UNKNOWN_FIELD
         names.append(first or "(envelope)")
     return sorted(set(names))
 

@@ -624,8 +624,12 @@ def record_approval(
     db.add(db_approval)
     if claim_waiting:
         task.status = models.TaskStatusEnum.APPROVED if action == "approved" else models.TaskStatusEnum.REJECTED
+        task.state_version = (task.state_version or 0) + 1
     db.commit()
     db.refresh(db_approval)
+    # The version this decision left the task at, read inside the commit that
+    # set it: the delivery that follows may project its result only onto it.
+    db_approval.task_state_version = task.state_version
     return db_approval
 
 
@@ -650,6 +654,7 @@ def reopen_decision(db: Session, task_id: int, approval_id: int) -> bool:
     )
     if reopen:
         task.status = models.TaskStatusEnum.WAITING_APPROVAL
+        task.state_version = (task.state_version or 0) + 1
     db.commit()
     return reopen
 
