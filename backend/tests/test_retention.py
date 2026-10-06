@@ -181,6 +181,44 @@ def test_an_unacked_relay_survives_the_short_window(db, agent):
     assert retention.sweep(db).relays == 1
 
 
+def test_a_relay_waits_for_every_live_session_it_is_addressed_to(db, agent):
+    """Receipts exist only for sessions that read it; an unopened sibling session is still owed it."""
+    sender = _session(db, "/sender")
+    first = coordination.register_session(
+        db, actor_name="reader", host="h", repo="r", clone_path="/one", actor_type=models.ActorTypeEnum.AI
+    )
+    second = coordination.register_session(
+        db, actor_name="reader", host="h", repo="r", clone_path="/two", actor_type=models.ActorTypeEnum.AI
+    )
+    relay = coordination.send_relay(db, from_session_id=sender.id, subject="s", to_actor_id=first.actor_id)
+    coordination.read_inbox(db, session_id=first.id)
+    coordination.ack_relay(db, relay_id=relay.id, session_id=first.id)
+    _aged(db, relay, "created_at", retention.ACKED_RELAY_DAYS + 1)
+
+    assert retention.sweep(db).relays == 0, "the second session never opened it"
+
+    coordination.read_inbox(db, session_id=second.id)
+    coordination.ack_relay(db, relay_id=relay.id, session_id=second.id)
+    assert retention.sweep(db).relays == 1
+
+
+def test_a_broadcast_takes_the_long_window_even_when_its_readers_sessions_go(db, agent):
+    sender = _session(db, "/sender")
+    reader = coordination.register_session(
+        db, actor_name="reader", host="h", repo="r", clone_path="/reader", actor_type=models.ActorTypeEnum.AI
+    )
+    relay = coordination.send_relay(db, from_session_id=sender.id, subject="to everyone")
+    coordination.read_inbox(db, session_id=reader.id)
+    coordination.ack_relay(db, relay_id=relay.id, session_id=reader.id)
+    coordination.end_session(db, reader.id)
+    _aged(db, reader, "ended_at", retention.ENDED_SESSION_DAYS + 1)
+    _aged(db, relay, "created_at", retention.ACKED_RELAY_DAYS + 1)
+
+    assert retention.sweep(db).relays == 0
+    _aged(db, relay, "created_at", retention.UNACKED_RELAY_DAYS + 1)
+    assert retention.sweep(db).relays == 1
+
+
 def test_a_dry_run_reports_and_changes_nothing(db, agent):
     session = _session(db)
     coordination.end_session(db, session.id)
