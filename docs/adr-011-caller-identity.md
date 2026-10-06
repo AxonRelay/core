@@ -140,7 +140,8 @@ CORS の `allow_headers` に `Authorization` を含める。含めないとブ�
 | 性質 | |
 |---|---|
 | 強制下で、非 stdio の全呼び出しが認証済み identity を持つ | **する** |
-| 記録される Actor がリクエストパラメータで変えられない | **する** |
+| 記録される Actor がリクエストパラメータで変えられない | **する**（Safe Envelope の `actor_id` は producer が主張する opaque ref で、AxonRelay の Actor ではない。サーバは提出した credential の Actor を `submitted_by` として別に記録する——ADR-010） |
+| credential による判断が対象の draft を名指す | **する**（`artifact_version` か `expected_commitment` が必須。応答を失った再送が、誰も見ていない次の版への判断になるのを防ぐ。loopback は従来どおり省略可） |
 | MCP と REST が同じ scope 表・同じ判定を使う | **する**（対応をテストで固定） |
 | token が保存・エコー・ログに出ない | **する** |
 | stdio 呼び出し元の identity 検証 | **しない**。loopback 信頼（上記 4） |

@@ -200,29 +200,72 @@ def test_a_failed_delivery_reopens_only_its_own_decision(db, self_actor):
     assert second.id != first.id
 
 
-def test_an_mcp_decision_that_the_graph_did_not_confirm_can_be_re_driven(mcp_db, self_actor, monkeypatch):
+def test_an_unconfirmed_mcp_decision_stays_closed_until_platform_says_it_is_waiting(mcp_db, self_actor, monkeypatch):
+    """A failure after sending is ambiguous; the task reopens only on Platform's word."""
     from mcp.server.mcpserver.exceptions import ToolError
 
     from app import langgraph_client
 
-    task, _ = _waiting(mcp_db)
+    task, draft = _waiting(mcp_db)
     task.thread_id = "t-undelivered"
     mcp_db.commit()
 
-    async def _down(*a, **k):
-        raise ConnectionError("platform unreachable")
+    async def _timeout(*a, **k):
+        raise TimeoutError("no answer from Platform")
 
-    monkeypatch.setattr(langgraph_client, "resume_thread", _down)
-    with pytest.raises(ToolError):
-        asyncio.run(server.approve_task(task.id, comment="ship"))
-    assert crud.get_task(mcp_db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+    async def _unreadable(*a, **k):
+        raise ConnectionError("still down")
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _timeout)
+    monkeypatch.setattr(langgraph_client, "get_state", _unreadable)
+    with pytest.raises(ToolError, match="refresh_task"):
+        asyncio.run(server.approve_task(task.id, comment="ship", artifact_version=draft.version))
+    assert crud.get_task(mcp_db, task.id).status == models.TaskStatusEnum.APPROVED
+    with pytest.raises(ToolError):  # closed: a second decision cannot slip in blind
+        asyncio.run(server.reject_task(task.id, comment="no", artifact_version=draft.version))
+
+    async def _still_waiting(*a, **k):
+        return {"values": {"drafts": [draft.content]}, "next": ["human_approval"]}
 
     async def _up(*a, **k):
         return {}
 
+    monkeypatch.setattr(langgraph_client, "get_state", _still_waiting)
+    asyncio.run(server.refresh_task(task.id))
+    assert crud.get_task(mcp_db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+
     monkeypatch.setattr(langgraph_client, "resume_thread", _up)
-    asyncio.run(server.approve_task(task.id, comment="ship, again"))
-    assert len(crud.get_approvals(mcp_db, task.id)) == 2
+    asyncio.run(server.approve_task(task.id, comment="ship, again", artifact_version=draft.version))
+    assert [a.comment for a in crud.get_approvals(mcp_db, task.id)] == ["ship", "ship, again"]
+
+
+def test_a_decision_that_was_never_sent_reopens_at_once(client, db, self_actor):
+    """Platform not configured: nothing left the server, so there is no doubt to wait out."""
+    task, draft = _waiting(db)
+
+    response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ok", "artifact_version": draft.version})
+
+    assert response.status_code == 503
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+
+
+def test_an_unconfirmed_decision_whose_graph_moved_on_is_not_reopened(client, db, self_actor, monkeypatch):
+    from app import langgraph_client
+
+    task, draft = _waiting(db)
+
+    async def _timeout(*a, **k):
+        raise TimeoutError("no answer from Platform")
+
+    async def _finished(*a, **k):
+        return {"values": {"drafts": [draft.content], "final_output": draft.content}, "next": []}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _timeout)
+    monkeypatch.setattr(langgraph_client, "get_state", _finished)
+    with pytest.raises(TimeoutError):
+        client.post(f"/tasks/{task.id}/approve", json={"comment": "ok", "artifact_version": draft.version})
+
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.COMPLETED
 
 
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):

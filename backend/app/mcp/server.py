@@ -39,6 +39,7 @@ from mcp.server.mcpserver import (
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.request_state import RequestStateSecurity
 from pydantic import BaseModel, Field
+from pydantic import ValidationError as PydanticValidationError
 
 from app import authz, coordination, crud, langgraph_client, models, safe_envelope, service, territory
 from app.database import SessionLocal
@@ -199,6 +200,22 @@ class AuthorizationMiddleware:
         return None
 
 
+def _without_input_values(error: ToolError) -> ToolError:
+    """In safe mode, an argument-validation error names fields, never the values.
+
+    The SDK validates tool arguments before any tool code runs - so before
+    `_free_text_surface` can refuse - and its pydantic message carries
+    `input_value`. Outside safe mode that is a useful message to the caller
+    who sent it; in safe mode it is the one place a rejected value would still
+    leave the server, so it is replaced the way envelope rejections are.
+    """
+    cause = error.__cause__
+    if not safe_envelope.safe_mode() or not isinstance(cause, PydanticValidationError):
+        return error
+    fields = sorted({str(item["loc"][0]) for item in cause.errors(include_input=False) if item.get("loc")})
+    return ToolError(f"Error executing tool: invalid arguments: {', '.join(fields) or '(arguments)'}")
+
+
 def _uri_matches(template: str, uri: str) -> bool:
     """Does a concrete resource URI come from this template? ({placeholders} match one segment)."""
     pattern = "^" + re.sub(r"\{[^}]+\}", "[^/]+", re.escape(template).replace(r"\{", "{").replace(r"\}", "}")) + "$"
@@ -206,6 +223,28 @@ def _uri_matches(template: str, uri: str) -> bool:
 
 
 mcp.middleware.append(AuthorizationMiddleware())
+
+
+_sdk_call_tool = mcp.call_tool
+
+
+async def _call_tool_without_input_values(name, arguments, context=None, *args, **kwargs):
+    """`MCPServer.call_tool`, with safe mode's value-free argument errors (`_without_input_values`).
+
+    Wrapped here, not in the middleware: the SDK turns a raised ToolError into
+    an `is_error` result inside `call_next`, so by the time the middleware sees
+    it the value is already in the text.
+    """
+    try:
+        return await _sdk_call_tool(name, arguments, context, *args, **kwargs)
+    except ToolError as e:
+        scrubbed = _without_input_values(e)
+        if scrubbed is e:
+            raise
+        raise scrubbed from None
+
+
+mcp.call_tool = _call_tool_without_input_values
 
 
 def _free_text_surface() -> None:
@@ -394,7 +433,25 @@ async def run_task(task_id: int) -> dict:
         return task_to_dict(task)
 
 
-async def _deliver(task: models.Task, resume_payload: dict[str, Any], approval_id: int) -> dict:
+@mcp.tool()
+async def refresh_task(task_id: int) -> dict:
+    """Re-read a task's thread from Platform and project it into the ledger.
+
+    The recovery path when a decision was recorded but the graph did not
+    confirm it: the task stays closed to new decisions until Platform itself
+    says the graph is waiting again - which this reads. Re-sends nothing.
+    """
+    _free_text_surface()
+    with _session() as db:
+        task = crud.get_task(db, task_id)
+        if not task:
+            raise ValueError(f"Task {task_id} not found")
+        await service.refresh_from_platform(db, task)
+        db.refresh(task)
+        return task_to_dict(task)
+
+
+async def _deliver(db, task: models.Task, resume_payload: dict[str, Any], approval_id: int) -> dict:
     """Make the one delivery attempt this decision gets, and name the doubt if it fails.
 
     Nothing re-sends it. `resume_thread` is a plain LangGraph resume with no
@@ -419,10 +476,14 @@ async def _deliver(task: models.Task, resume_payload: dict[str, Any], approval_i
         # message - but it does not get to bypass the accounting above it.
         if not isinstance(e, Exception):
             raise
+        # Put the task where Platform says it is; reopened only if it is
+        # waiting again (or nothing was sent at all).
+        await service.settle_failed_delivery(db, task, approval_id, e)
         raise ToolError(
             f"Decision {approval_id} is recorded in the ledger, but the graph did not confirm it "
             f"({type(e).__name__}). Nothing re-sends it: a second delivery would answer whichever "
-            "question the graph has reached by now. Check the thread, then re-drive it with "
+            "question the graph has reached by now. The task accepts a new decision only once Platform "
+            "reports the graph waiting again; run refresh_task to re-read it, then re-drive with "
             f"{' / '.join(compat.FALLBACK_TOOLS)} if it never arrived."
         ) from None
 
@@ -463,6 +524,7 @@ async def _apply_decision(
         # Authorization first, before this call can learn anything or change
         # anything.
         authz.check_may_approve(db, task_id)
+        authz.check_decision_is_bound(artifact_version, expected_commitment)
         # The recorded reviewer is the authenticated caller, never a parameter.
         reviewer_actor_id = authz.acting_actor_id(db)
 
@@ -520,13 +582,7 @@ async def _apply_decision(
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
-        try:
-            result = await _deliver(task, resume_payload, approval.id)
-        except BaseException:
-            # Recorded but unconfirmed: reopen so the re-drive `_deliver`
-            # describes is possible. Nothing re-sends it.
-            crud.reopen_decision(db, task_id, approval.id)
-            raise
+        result = await _deliver(db, task, resume_payload, approval.id)
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)

@@ -117,6 +117,26 @@ def test_a_well_formed_envelope_is_accepted_and_stored_field_for_field(db, full_
     assert stored["occurred_at"] == "2026-09-07T01:02:03"  # naive UTC, like every other serializer
 
 
+def test_the_submitting_actor_is_recorded_beside_the_producers_claim(db, self_actor, full_text_mode):
+    """actor_id is what the producer asserts; who submitted it is what the server knows."""
+    from app import authz
+
+    agent = models.Actor(type=models.ActorTypeEnum.AI, name="producer-bot")
+    db.add(agent)
+    db.commit()
+    principal = authz.Principal(
+        actor_id=agent.id, actor_name=agent.name, scopes=authz.ALL_SCOPES, source="credential", credential_id=1
+    )
+    with authz.bind(principal):
+        event, _ = safe_envelope.ingest(db, _envelope(actor_id="someone_else_0123456"))
+
+    assert event.actor_ref == "someone_else_0123456"
+    assert event.submitted_by_actor_id == agent.id
+    stored = safe_envelope.event_to_dict(event)
+    assert stored["submitted_by_ref"] == agent.opaque_id and stored["submitted_by_ref"]
+    assert "producer-bot" not in json.dumps(stored)
+
+
 def test_resending_an_event_id_is_idempotent(db, full_text_mode):
     first, created = safe_envelope.ingest(db, _envelope())
     second, again = safe_envelope.ingest(db, _envelope())
@@ -331,6 +351,7 @@ REST_FREE_TEXT = [
     ("post", "/tasks", {"title": CANARY}),
     ("put", "/tasks/1", {"description": CANARY}),
     ("post", "/tasks/1/run", None),
+    ("post", "/tasks/1/refresh", None),
     ("post", "/tasks/1/approve", {"comment": CANARY, "modified_draft": CANARY}),
     ("post", "/tasks/1/reject", {"comment": CANARY, "reason": CANARY}),
     ("post", "/agents", {"name": "n", "agent_type": "writer", "description": CANARY}),
@@ -356,6 +377,7 @@ def test_safe_mode_refuses_every_rest_free_text_surface(client, db, safe_mode, o
 MCP_FREE_TEXT = [
     ("create_task", {"title": CANARY}),
     ("run_task", {"task_id": 1}),
+    ("refresh_task", {"task_id": 1}),
     ("approve_task", {"task_id": 1, "comment": CANARY, "modified_draft": CANARY}),
     ("reject_task", {"task_id": 1, "comment": CANARY, "reason": CANARY}),
     ("create_agent", {"name": "n", "agent_type": "writer", "description": CANARY}),
@@ -517,6 +539,7 @@ REST_REFUSED = {
     ("POST", "/tasks"),
     ("PUT", "/tasks/{task_id}"),
     ("POST", "/tasks/{task_id}/run"),
+    ("POST", "/tasks/{task_id}/refresh"),
     ("POST", "/tasks/{task_id}/approve"),
     ("POST", "/tasks/{task_id}/reject"),
     ("POST", "/agents"),
@@ -545,3 +568,27 @@ def test_every_rest_write_route_is_classified_for_safe_mode():
         }
     )
     assert unclassified == set(), f"classify these write routes for safe mode: {sorted(unclassified)}"
+
+
+def test_a_malformed_argument_is_not_echoed_back_in_safe_mode(mcp_db, safe_mode, caplog):
+    """The SDK validates arguments before any tool runs, and its error carries `input_value`."""
+    from mcp.client._memory import InMemoryTransport
+    from mcp.client.session import ClientSession
+
+    caplog.set_level(logging.DEBUG)
+
+    async def _call():
+        async with (
+            InMemoryTransport(server.mcp, raise_exceptions=False) as streams,
+            ClientSession(*streams[:2]) as session,
+        ):
+            await session.initialize()
+            return await session.call_tool("create_task", {"title": {"secret": CANARY}})
+
+    result = asyncio.run(_call())
+
+    assert result.is_error
+    text = " ".join(getattr(c, "text", "") for c in result.content)
+    assert CANARY not in text
+    assert "title" in text  # the field name is still reported
+    assert CANARY not in caplog.text

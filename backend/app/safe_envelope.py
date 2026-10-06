@@ -60,7 +60,7 @@ from pydantic import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import ledger, models
+from app import authz, ledger, models
 
 logger = logging.getLogger("axonrelay.safe_envelope")
 
@@ -304,6 +304,9 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
         occurred_at=envelope.occurred_at.astimezone(UTC).replace(tzinfo=None),
         received_at=datetime.utcnow(),
         producer_signature=envelope.producer_signature,
+        # Who actually submitted it - the credential's Actor (or the operator
+        # on loopback) - next to the producer's unverifiable actor_ref.
+        submitted_by_actor_id=authz.acting_actor_id(db),
     )
     db.add(event)
     try:
@@ -385,6 +388,8 @@ def list_events(
 
 def event_to_dict(event: models.SafeEvent) -> dict[str, Any]:
     """The stored envelope, field for field. Nothing here was ever free text."""
+    from app import disclosure  # disclosure imports this module
+
     return {
         "id": event.id,
         "schema_version": event.schema_version,
@@ -405,4 +410,6 @@ def event_to_dict(event: models.SafeEvent) -> dict[str, Any]:
         "occurred_at": event.occurred_at.isoformat(),
         "received_at": event.received_at.isoformat(),
         "producer_signature": event.producer_signature,
+        # Server-side attribution, as an opaque reference in either mode.
+        "submitted_by_ref": disclosure.actor_ref(event.submitted_by),
     }
