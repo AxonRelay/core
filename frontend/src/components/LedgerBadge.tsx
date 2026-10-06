@@ -3,14 +3,14 @@ import { api, isAbort } from "../api";
 import type { LedgerVerdict } from "../types";
 
 // Shows the tamper-evidence verdict for a task's approval hash chain.
+// Rendered inside TaskDetail, which is keyed by task id, so a task change
+// remounts this component with fresh state instead of resetting it here.
 export function LedgerBadge({ taskId }: { taskId: number }) {
   const [verdict, setVerdict] = useState<LedgerVerdict | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
-    setVerdict(null);
-    setError(null);
     api
       .verifyLedger(taskId, controller.signal)
       .then(setVerdict)

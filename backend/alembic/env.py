@@ -19,8 +19,10 @@ from app.database import DATABASE_URL, Base
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url with environment variable
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+# Override sqlalchemy.url with environment variable. Alembic's config is an
+# interpolating ConfigParser, so a percent-encoded password (``p%40ss``) must
+# have its ``%`` doubled or every migration fails with an interpolation error.
+config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
