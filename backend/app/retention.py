@@ -181,9 +181,11 @@ def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) 
         broadcast = relay.to_actor_id is None and relay.to_workspace_id is None and relay.to_repo is None
         if broadcast:
             continue
+        # Delivered: somebody it was for acked it, and every live session it
+        # is addressed to has. A receipt left unacked by a session that has
+        # since ended does not hold it back - that session will not read again.
         acked_by = {r.session_id for r in (relay.receipts or []) if r.acked_at is not None}
-        every_receipt_acked = all(r.acked_at is not None for r in (relay.receipts or []))
-        if acked_by and every_receipt_acked and audience.get(relay.id, set()) <= acked_by:
+        if acked_by and audience.get(relay.id, set()) <= acked_by:
             doomed_relays.append(relay)
 
     doomed_relay_ids = {r.id for r in doomed_relays}

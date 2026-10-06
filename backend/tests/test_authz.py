@@ -857,3 +857,28 @@ def test_acking_a_relay_addressed_to_someone_else_is_refused(db, self_actor):
     with pytest.raises(ValueError, match="not addressed"):
         coordination.ack_relay(db, relay_id=relay.id, session_id=outsider.id)
     assert db.query(models.RelayReceipt).count() == 0
+
+
+def test_an_agent_cannot_force_its_way_over_another_actors_claim(mcp_db, self_actor, enforced):
+    """force=true releases the conflicting claims; coordination:write alone must not reach that."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from app import coordination
+
+    agent = _make_ai(mcp_db)
+    mine = _session_for(mcp_db, agent, clone="/mine")
+    theirs = _session_for(mcp_db, self_actor, clone="/theirs")
+    held = coordination.claim_resource(mcp_db, session_id=theirs.id, resource=models.ClaimResourceEnum.REMOTE)["claim"]
+    writer = authz.Principal(
+        actor_id=agent.id,
+        actor_name=agent.name,
+        scopes=frozenset({authz.Scope.COORDINATION_WRITE}),
+        source="credential",
+        credential_id=1,
+    )
+
+    with authz.bind(writer), pytest.raises((authz.ApprovalNotPermitted, ToolError)):
+        server.claim_git_resource(session_id=mine.id, resource="remote", force=True)
+
+    mcp_db.expire_all()
+    assert mcp_db.get(models.Claim, held.id).status == models.ClaimStatusEnum.HELD
