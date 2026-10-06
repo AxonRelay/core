@@ -6,11 +6,14 @@ untouched and the guarantees are exactly what they were. Set it, and every
 HTTP request must carry ``Authorization: Bearer <token>`` or it is answered
 with 401 before the MCP layer sees it.
 
-Since ADR-011 the same header may instead carry a per-caller credential, and
-this gate admits either: the shared secret is the coarse "you may knock" layer,
-the credential is the identity, and the authorization middleware behind this
-one decides what that identity may do. Configuring both is layering, not a
-contradiction.
+Since ADR-011 the same header may instead carry a per-caller credential. The
+two do not stack - there is one header - so they are ordered: while per-caller
+authentication is enforced (``AXONRELAY_REQUIRE_AUTH``), this gate admits a live
+credential and nothing else, and the shared secret no longer opens anything.
+Admitting either would have been the worst of both: the shared secret would
+pass here only to be refused as an unknown credential behind it, and a
+credential would skip the secret the operator thought was still required.
+Configuring both logs a warning saying so.
 
 This is a shared secret, not OAuth. The MCP specification's authorization for
 HTTP transports is OAuth 2.1, and the SDK has hooks for it (``token_verifier``
@@ -22,11 +25,14 @@ docs/adr-008-optional-bearer-token.md.
 """
 
 import hmac
+import logging
 import os
 
 from starlette.responses import JSONResponse
 
 TOKEN_ENV = "AXONRELAY_MCP_TOKEN"
+
+logger = logging.getLogger(__name__)
 
 
 class BearerTokenMiddleware:
@@ -47,16 +53,12 @@ class BearerTokenMiddleware:
                 presented = value
                 break
 
-        if presented.startswith(b"Bearer ") and hmac.compare_digest(presented[7:].strip(), self._token):
-            await self.app(scope, receive, send)
-            return
-
-        if _is_a_valid_credential(presented):
-            # Per-caller credentials (ADR-011) travel in the same header. With
-            # both layers configured there is one header and two things it
-            # could be, so this gate admits either and the authorization
-            # middleware behind it still decides the scope. Without that, the
-            # two layers would be mutually exclusive rather than layered.
+        if _credentials_enforced():
+            # The credential supersedes the shared secret (module docstring).
+            admitted = _is_a_valid_credential(presented)
+        else:
+            admitted = presented.startswith(b"Bearer ") and hmac.compare_digest(presented[7:].strip(), self._token)
+        if admitted:
             await self.app(scope, receive, send)
             return
 
@@ -68,8 +70,14 @@ class BearerTokenMiddleware:
         await response(scope, receive, send)
 
 
+def _credentials_enforced() -> bool:
+    from app import authz
+
+    return authz.require_auth()
+
+
 def _is_a_valid_credential(presented: bytes) -> bool:
-    """Does this header carry a live credential? False unless per-caller auth is on.
+    """Does this header carry a live credential?
 
     Imported lazily: `app.authz` pulls in the models and the engine, and this
     module is deliberately importable on its own.
@@ -77,8 +85,6 @@ def _is_a_valid_credential(presented: bytes) -> bool:
     from app import authz
     from app.database import SessionLocal
 
-    if not authz.require_auth():
-        return False
     token = authz.bearer_token(presented.decode("latin-1", "replace"))
     if not token:
         return False
@@ -94,4 +100,10 @@ def wrap_if_configured(app):
     token = os.environ.get(TOKEN_ENV, "").strip()
     if not token:
         return app
+    if _credentials_enforced():
+        logger.warning(
+            "%s is set but per-caller authentication is enforced: only credentials are admitted, "
+            "and the shared token opens nothing",
+            TOKEN_ENV,
+        )
     return BearerTokenMiddleware(app, token)

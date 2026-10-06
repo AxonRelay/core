@@ -704,8 +704,8 @@ def test_every_coordination_tool_that_takes_a_session_id_checks_it():
 # ------------------------------------------------- the two bearer layers coexist
 
 
-def test_a_credential_passes_the_shared_token_gate(db, self_actor, monkeypatch, enforced):
-    """ADR-008's gate and ADR-011's identity share one header; configuring both must still work."""
+def test_under_enforcement_the_shared_token_gate_admits_credentials_only(db, self_actor, monkeypatch, enforced):
+    """ADR-008's secret and ADR-011's credential share one header, so they are ordered, not stacked."""
     from starlette.applications import Starlette
     from starlette.responses import PlainTextResponse
     from starlette.routing import Route
@@ -727,9 +727,30 @@ def test_a_credential_passes_the_shared_token_gate(db, self_actor, monkeypatch, 
     app = http_auth.wrap_if_configured(Starlette(routes=[Route("/mcp", ok, methods=["POST"])]))
     client = TestClient(app)
 
-    assert client.post("/mcp", headers={"Authorization": "Bearer shared-secret"}).status_code == 200
+    # The shared secret would only be refused downstream as an unknown credential.
+    assert client.post("/mcp", headers={"Authorization": "Bearer shared-secret"}).status_code == 401
     assert client.post("/mcp", headers={"Authorization": f"Bearer {token}"}).status_code == 200
     assert client.post("/mcp", headers={"Authorization": "Bearer neither"}).status_code == 401
+
+
+def test_without_enforcement_the_shared_token_gate_is_unchanged(db, self_actor, monkeypatch, unenforced):
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from app.mcp import http_auth
+
+    monkeypatch.setenv(http_auth.TOKEN_ENV, "shared-secret")
+    token, _ = _credential(db, self_actor, {authz.Scope.LEDGER_READ})
+
+    async def ok(request):
+        return PlainTextResponse("reached")
+
+    client = TestClient(http_auth.wrap_if_configured(Starlette(routes=[Route("/mcp", ok, methods=["POST"])])))
+
+    assert client.post("/mcp", headers={"Authorization": "Bearer shared-secret"}).status_code == 200
+    assert client.post("/mcp", headers={"Authorization": f"Bearer {token}"}).status_code == 401
 
 
 # ------------------------------------------------------------- open by decision

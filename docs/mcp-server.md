@@ -128,7 +128,7 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 
 ### 呼び出し元 identity と scope（任意）
 
-`AXONRELAY_REQUIRE_AUTH=1` のインスタンスでは、HTTP transport の全呼び出しに credential が要る（[ADR-011](./adr-011-caller-identity.md)）。stdio は常に loopback 信頼で、フラグの有無にかかわらず credential は不要。
+`AXONRELAY_REQUIRE_AUTH=1` のインスタンスでは、HTTP transport の全呼び出しに credential が要る（[ADR-011](./adr-011-caller-identity.md)）。このとき `AXONRELAY_MCP_TOKEN` の共有トークンでは通れない——同じヘッダに入るので、credential が優先する（両方設定すると起動時に警告）。stdio は常に loopback 信頼で、フラグの有無にかかわらず credential は不要。
 
 ```bash
 python -m app.credentials issue --actor self --scopes ledger:read,ledger:write,coordination:read,coordination:write
