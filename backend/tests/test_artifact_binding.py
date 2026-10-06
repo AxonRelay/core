@@ -431,6 +431,30 @@ def test_a_decision_is_not_reopened_once_anything_has_moved_the_task(db, self_ac
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
 
 
+def test_decision_statuses_cannot_be_set_by_hand(client, db, self_actor):
+    task, _ = _waiting(db)
+    for status in ("approved", "rejected", "waiting_approval", "completed"):
+        assert client.put(f"/tasks/{task.id}", json={"status": status}).status_code == 409, status
+    assert crud.get_approvals(db, task.id) == []
+
+
+def test_a_hand_cancellation_is_not_overwritten_by_a_late_delivery_result(client, db, self_actor):
+    from app import service
+
+    task, draft = _waiting(db)
+    decided = crud.record_approval(db, task.id, self_actor.id, "approved", "ok", claim_waiting=True)
+
+    assert client.put(f"/tasks/{task.id}", json={"status": "cancelled"}).status_code == 200
+    assert not service.apply_snapshot(
+        db,
+        task,
+        {"drafts": [draft.content], "final_output": draft.content},
+        False,
+        expected_version=decided.task_state_version,
+    )
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.CANCELLED
+
+
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):
     task, shown = _task_with_draft(db, "original")
 

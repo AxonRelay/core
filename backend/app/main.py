@@ -370,6 +370,11 @@ async def get_task_endpoint(request: Request, task_id: int, db: Session = Depend
     return task
 
 
+#: The statuses a caller may set directly. Everything else is the outcome of
+#: a recorded decision or of what Platform reports.
+MANUAL_TASK_STATUSES = frozenset({models.TaskStatusEnum.DRAFT, models.TaskStatusEnum.CANCELLED})
+
+
 @app.put("/tasks/{task_id}", response_model=TaskResponse)
 @limiter.limit("30/minute")
 async def update_task_endpoint(
@@ -385,6 +390,15 @@ async def update_task_endpoint(
             status_enum = models.TaskStatusEnum(task_data.status)
         except ValueError as e:
             raise HTTPException(status_code=400, detail="Invalid status") from e
+        if status_enum not in MANUAL_TASK_STATUSES:
+            # Approved / rejected / waiting / completed are what decisions and
+            # Platform projections establish. Setting them by hand would let a
+            # ledger:write credential mark an unreviewed task approved, or
+            # reopen a task closed while its decision is unconfirmed.
+            raise HTTPException(
+                status_code=409,
+                detail="that status is set by decisions and Platform projections; only draft or cancelled may be set",
+            )
 
     task = crud.update_task(
         db=db,
