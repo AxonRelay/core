@@ -306,7 +306,7 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
         producer_signature=envelope.producer_signature,
         # Who actually submitted it - the credential's Actor (or the operator
         # on loopback) - next to the producer's unverifiable actor_ref.
-        submitted_by_actor_id=authz.acting_actor_id(db),
+        submitted_by_ref=_submitter_ref(db),
     )
     db.add(event)
     try:
@@ -324,6 +324,15 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
     db.refresh(event)
     logger.info("safe_envelope stored action=%s outcome=%s", event.action.value, event.outcome.value)
     return event, True
+
+
+def _submitter_ref(db: Session) -> str | None:
+    """The submitting Actor's opaque reference, minted if it has none yet."""
+    from app import disclosure  # disclosure imports this module
+
+    actor_id = authz.acting_actor_id(db)
+    actor = db.get(models.Actor, actor_id) if actor_id is not None else None
+    return disclosure.ensure_opaque_id(db, actor) if actor is not None else None
 
 
 def _stored_values(envelope: SafeEnvelope) -> dict[str, Any]:
@@ -388,8 +397,6 @@ def list_events(
 
 def event_to_dict(event: models.SafeEvent) -> dict[str, Any]:
     """The stored envelope, field for field. Nothing here was ever free text."""
-    from app import disclosure  # disclosure imports this module
-
     return {
         "id": event.id,
         "schema_version": event.schema_version,
@@ -411,5 +418,5 @@ def event_to_dict(event: models.SafeEvent) -> dict[str, Any]:
         "received_at": event.received_at.isoformat(),
         "producer_signature": event.producer_signature,
         # Server-side attribution, as an opaque reference in either mode.
-        "submitted_by_ref": disclosure.actor_ref(event.submitted_by),
+        "submitted_by_ref": event.submitted_by_ref,
     }

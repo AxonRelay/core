@@ -98,6 +98,9 @@ receipt は relay を**読んだ** session にしか無いので、「receipt �
 まだ開いていない宛先について何も言わない。だから「配達済み」は、宛先に含まれる
 **終了していない session すべて**が ack した receipt を持つこと、と定義する。
 broadcast の宛先にはまだ始まっていない session も含まれるので、常に 180 日の窓で消える。
+Postgres では sweep の最初に `sessions` と `relay_receipts` を SHARE でロックし、判定と削除を
+1 つの一貫した状態の上で行う。途中で登録された session が宛先から漏れて、その session が
+読む前に relay が「配達済み」として消えることがないように。
 
 sweep が触れてよいテーブルは `sessions` / `claims` / `relays` / `relay_receipts`
 の 4 つだけ。`approvals` / `drafts` / `tasks` / `task_assignments` /

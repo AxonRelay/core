@@ -268,6 +268,22 @@ def test_an_unconfirmed_decision_whose_graph_moved_on_is_not_reopened(client, db
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.COMPLETED
 
 
+def test_a_refresh_that_read_before_a_newer_decision_does_not_reopen_the_task(db, self_actor, monkeypatch):
+    """The Platform read holds no lock; a decision recorded meanwhile wins over the stale snapshot."""
+    from app import langgraph_client, service
+
+    task, draft = _waiting(db)
+
+    async def _read_while_someone_decides(*a, **k):
+        crud.record_approval(db, task.id, self_actor.id, "approved", "meanwhile", claim_waiting=True)
+        return {"values": {"drafts": [draft.content]}, "next": ["human_approval"]}  # the old question
+
+    monkeypatch.setattr(langgraph_client, "get_state", _read_while_someone_decides)
+
+    assert asyncio.run(service.refresh_from_platform(db, task)) is False
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
+
+
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):
     task, shown = _task_with_draft(db, "original")
 

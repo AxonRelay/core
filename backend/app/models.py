@@ -652,12 +652,12 @@ class SafeEvent(Base):
     occurred_at = Column(DateTime, nullable=False, index=True)
     received_at = Column(DateTime, nullable=False)
     producer_signature = Column(String(1024))
-    #: The Actor whose credential submitted the envelope, set server-side.
-    #: ``actor_ref`` above is what the *producer* asserts and cannot be
-    #: verified; this is what the server knows. SET NULL so deleting an Actor
-    #: never deletes evidence.
-    submitted_by_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), index=True)
-    submitted_by = relationship("Actor", foreign_keys=[submitted_by_actor_id])
+    #: The opaque reference of the Actor whose credential submitted the
+    #: envelope, set server-side. ``actor_ref`` above is what the *producer*
+    #: asserts and cannot be verified; this is what the server knows. Stored
+    #: as the reference itself, not a foreign key, so deleting the Actor later
+    #: cannot erase who submitted the evidence.
+    submitted_by_ref = Column(String(32), index=True)
 
 
 class Credential(Base):

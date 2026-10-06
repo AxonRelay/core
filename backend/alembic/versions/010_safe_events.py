@@ -65,8 +65,7 @@ def upgrade() -> None:
         sa.Column("occurred_at", sa.DateTime(), nullable=False),
         sa.Column("received_at", sa.DateTime(), nullable=False),
         sa.Column("producer_signature", sa.String(length=1024), nullable=True),
-        sa.Column("submitted_by_actor_id", sa.Integer(), nullable=True),
-        sa.ForeignKeyConstraint(["submitted_by_actor_id"], ["actors.id"], ondelete="SET NULL"),
+        sa.Column("submitted_by_ref", sa.String(length=32), nullable=True),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("event_id", name="uq_safe_events_event_id"),
     )
@@ -77,7 +76,7 @@ def upgrade() -> None:
     op.create_index("ix_safe_events_session_ref", "safe_events", ["session_ref"])
     op.create_index("ix_safe_events_action", "safe_events", ["action"])
     op.create_index("ix_safe_events_occurred_at", "safe_events", ["occurred_at"])
-    op.create_index("ix_safe_events_submitted_by_actor_id", "safe_events", ["submitted_by_actor_id"])
+    op.create_index("ix_safe_events_submitted_by_ref", "safe_events", ["submitted_by_ref"])
 
 
 def downgrade() -> None:
