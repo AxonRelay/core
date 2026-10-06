@@ -632,9 +632,11 @@ def test_an_undeclared_argument_name_is_not_echoed_in_safe_mode(mcp_db, safe_mod
     assert CANARY not in caplog.text
 
 
-def test_an_unknown_tool_name_is_not_echoed_in_safe_mode(mcp_db, safe_mode):
+def test_an_unknown_tool_name_is_not_echoed_in_safe_mode(mcp_db, safe_mode, caplog):
     from mcp.client._memory import InMemoryTransport
     from mcp.client.session import ClientSession
+
+    caplog.set_level(logging.DEBUG)
 
     async def _call():
         async with (
@@ -650,6 +652,7 @@ def test_an_unknown_tool_name_is_not_echoed_in_safe_mode(mcp_db, safe_mode):
     except Exception as exc:  # noqa: BLE001 - an MCP error is also a response
         text = str(exc)
     assert CANARY not in text
+    assert CANARY not in caplog.text  # nor in the SDK's own log line
 
 
 def test_safe_mode_rest_never_names_an_actor_even_nested(client, db, self_actor, safe_mode):

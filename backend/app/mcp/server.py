@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -259,6 +260,25 @@ async def _call_tool_without_input_values(name, arguments, context=None, *args, 
 
 
 mcp.call_tool = _call_tool_without_input_values
+
+
+class _UnknownToolNameFilter(logging.Filter):
+    """In safe mode, the SDK's own log line for a failed call names no unknown tool.
+
+    `_call_tool_without_input_values` keeps the name out of the response; the
+    SDK still logs `params.name` when it turns the error into a result, and
+    that name is the caller's string.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if safe_envelope.safe_mode() and isinstance(record.msg, str) and record.msg.startswith("Tool %r"):
+            args = record.args if isinstance(record.args, tuple) else ()
+            if args and mcp._tool_manager.get_tool(str(args[0])) is None:
+                record.args = ("(unknown tool)", *args[1:])
+        return True
+
+
+logging.getLogger("mcp.server.mcpserver.server").addFilter(_UnknownToolNameFilter())
 
 
 def _free_text_surface() -> None:

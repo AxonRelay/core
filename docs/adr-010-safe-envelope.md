@@ -120,7 +120,7 @@ route は「拒否」「読み取り専用（id / enum のみ）」「envelope�
 - MCP SDK は tool のコードより前に引数を検証し、その pydantic エラーは `input_value`
   を含む。safe mode ではここが拒否された値がサーバを出る唯一の経路になるため、
   `mcp.call_tool` を包んで**フィールド名だけ**の固定文言に置き換える（envelope の拒否と
-  同じ形。ワイヤ越しのテストで固定）。safe mode でなければ SDK の文言のまま返す
+  同じ形。ワイヤ越しのテストで固定）。存在しない tool 名も呼び出し元の文字列なので、応答は固定文言にし、SDK 自身のログ行からもフィルタで外す。safe mode でなければ SDK の文言のまま返す
 - uvicorn の access log はクエリ文字列を含む（`GET /coordination/git/guard?clone_path=...`）。
   #26 の範囲
 
