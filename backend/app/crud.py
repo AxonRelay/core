@@ -106,9 +106,21 @@ def delete_agent_definition(db: Session, agent_id: int):
     agent = get_agent_definition(db, agent_id)
     if not agent:
         return False
+    # Deleting the Actor cascades its task assignments away - approver roles
+    # included - so it takes the same task locks an assignment delete does.
+    _lock_tasks_assigned_to(db, agent.actor_id)
     db.delete(agent.actor)
     db.commit()
     return True
+
+
+def _lock_tasks_assigned_to(db: Session, actor_id: int) -> None:
+    """Lock every task this Actor is assigned to, in id order (no lock-order deadlocks)."""
+    task_ids = sorted(
+        {row[0] for row in db.query(models.TaskAssignment.task_id).filter(models.TaskAssignment.actor_id == actor_id)}
+    )
+    for task_id in task_ids:
+        _lock_task(db, task_id)
 
 
 # ========== TaskAssignment Operations ==========
@@ -182,12 +194,17 @@ def delete_task_assignment(db: Session, assignment_id: int):
     assignment = get_task_assignment(db, assignment_id)
     if not assignment:
         return False
+    # The task lock serializes this with `record_approval`, which re-checks
+    # the approver assignment under that lock: without it an assignment could
+    # be revoked after the check and the approval still commit.
+    _lock_task(db, assignment.task_id)
     db.delete(assignment)
     db.commit()
     return True
 
 
 def delete_task_assignment_by_actor(db: Session, task_id: int, actor_id: int):
+    _lock_task(db, task_id)  # as in delete_task_assignment
     assignment = (
         db.query(models.TaskAssignment)
         .filter(models.TaskAssignment.task_id == task_id, models.TaskAssignment.actor_id == actor_id)
@@ -644,12 +661,13 @@ def record_approval(
     return db_approval
 
 
-def reopen_decision(db: Session, task_id: int, approval_id: int) -> bool:
+def reopen_decision(db: Session, task_id: int, approval_id: int, expected_version: int) -> bool:
     """Put a task back to WAITING_APPROVAL after its decision failed to reach the graph.
 
     Only when that decision is still the task's latest entry and the task is
-    still where `record_approval(claim_waiting=True)` left it: if anything has
-    moved since (a projection, another decision), the task is not reopened.
+    still exactly where `record_approval(claim_waiting=True)` left it -
+    `state_version` unchanged: if anything has moved since (a projection,
+    another decision), the task is not reopened.
     Nothing is re-sent; this only lets a person re-drive the decision after
     checking the thread, which records a second entry - the truth.
     """
@@ -661,6 +679,7 @@ def reopen_decision(db: Session, task_id: int, approval_id: int) -> bool:
     reopen = (
         latest is not None
         and latest.id == approval_id
+        and (task.state_version or 0) == expected_version
         and task.status in (models.TaskStatusEnum.APPROVED, models.TaskStatusEnum.REJECTED)
     )
     if reopen:

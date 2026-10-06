@@ -1,8 +1,9 @@
 """Pydantic schemas for AxonRelay (personal PoC, post-migration 003)."""
 
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app import ledger
 
@@ -27,6 +28,18 @@ class ActorResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _through_disclosure(cls, value: Any) -> Any:
+        """An ORM Actor - top-level or nested in an agent / assignment - goes
+        through the disclosure policy here, so no response can read `name`
+        off the row and skip it."""
+        from app import disclosure, models  # schema is imported by both
+
+        if isinstance(value, models.Actor):
+            return {**disclosure.actor_view(value), "created_at": value.created_at}
+        return value
 
 
 # ========== AgentDefinition Schemas ==========
