@@ -218,9 +218,14 @@ MCP に `elicitation`（サーバが人間に構造化入力を accept/decline/c
 - **調整:** A2A を恒久的対象外から **「採用候補（個人 PoC では優先度低）」** に格上げ。
 - **設計余地の確保:** AI Actor 間連携（A2A 由来のアクション）も将来 `Approval` / `ExternalLink` 台帳に記録できる余地を残す。実装は急がない。
 
-### 11.4 EU AI Act full enforcement（2026-08-02）→ 台帳を value prop の中核に
+### 11.4 EU AI Act と台帳の位置づけ 〔2026-09 訂正〕
 
-高リスク AI の義務が 2026-08-02 に full enforcement。その3本柱（①改ざん耐性の行動ログ ②高影響行動の人間承認ゲート ③全行動の identity 帰属）は AxonRelay の残存核とほぼ一致する。
+> **訂正 (2026-09-07):** 本項の当初の記述「高リスク義務が 2026-08-02 に full enforcement」は誤りだった。2026-08-02 は AI Act の一般適用日かつ透明性規則（第 50 条）の開始日であり、高リスク義務は Digital Omnibus on AI（Regulation (EU) 2026/1744、2026-07-27 発効）により **2027-12-02**（Annex III）と **2028-08-02**（Annex I）へ延期された。「3 本柱」も法の構造ではなくこちら側の要約である。一次資料・確認日・保守手順は [regulatory-positioning.md](./regulatory-positioning.md) に置く。**結論（台帳を value prop の中核に据える／規制グレード対応は対象外／規制準拠製品ではない）は変わらない。** 以下は当時の記述を履歴として残す。 <!-- claim-check:allow -->
+
+<!-- claim-check:off -->
+> *(当初の記述 — 2026-06)* 高リスク AI の義務が 2026-08-02 に full enforcement。その3本柱（①改ざん耐性の行動ログ ②高影響行動の人間承認ゲート ③全行動の identity 帰属）は AxonRelay の残存核とほぼ一致する。
+<!-- claim-check:on -->
+
 - **調整:** §8 で「規制グレード対応は対象外」とした方針は維持する（電子署名 / タイムスタンプ局 / 21 CFR Part 11 等は引き続き対象外）。ただし **「監査台帳」という value prop は中核に据える** — 規制準拠製品ではなく、その思想のリファレンス実装として dogfood する。
 
 ### 11.5 LangGraph Platform → LangSmith Deployment 改称 / self-host 退避路

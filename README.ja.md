@@ -48,12 +48,20 @@ MCP のネイティブ機能（`elicitation`）になった。**承認のため�
 
 これらの層が与えてくれないのは「**説明責任の永続的な記録**」だ。elicitation は揮発的で
 セッション内限り、observability ツールは run を記録するが「誰が何を承認したか」は記録しない。
-一方で EU AI Act の高リスク義務は **2026-08-02 に full enforcement** を迎え、その中核要求は
-まさに——改ざん耐性のある行動ログ、高影響行動への人間承認ゲート、そしてすべての行動を
-責任ある identity（人**または**エージェント）に帰属させること——である。
 
-AxonRelay は人間をこの台帳の **第一級 Actor** として扱う（interrupt 境界の外側の例外としてではなく）。
-これがこのリポジトリが保持し、dogfood する残存価値だ。
+規制も同じ方向を向いているが、よく言われるより時期は遅く、範囲は狭い。EU AI Act が
+*高リスク*システムに課す要件には自動イベント記録（第 12 条）と人間による監督（第 14 条）が
+含まれ、承認台帳が記録するものと主題が重なる。ただしこの高リスク義務は 2026-08-02 時点で
+**発効していない**。同日は法の一般適用日であり透明性規則（第 50 条）の開始日であって、
+高リスク義務は Digital Omnibus on AI（Regulation (EU) 2026/1744、2026-07-27 発効）により
+**2027-12-02**（Annex III システム）と **2028-08-02**（Annex I システム）へ延期された。
+日付・一次資料・最終確認日は [docs/regulatory-positioning.md](docs/regulatory-positioning.md) にある。
+
+**AxonRelay はコンプライアンス製品ではなく、認証の仕組みでもない。** 何も認証せず、
+EU AI Act やその他の規制への対応を何ら提供しない。台帳は改ざん検知可能であって、
+法的な証明力を持つものではない。このリポジトリが保持し dogfood するのは、それらの要件と
+まっとうなエンジニアリングが共有する一つの考え——人間は永続的な台帳の **第一級 Actor**
+であり、interrupt 境界の外側の例外ではない——である。
 
 ---
 
@@ -267,6 +275,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 ## ドキュメント
 
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — ピボット仕様（Actor モデル / スコープ / dogfood シナリオ）
+- [docs/regulatory-positioning.md](docs/regulatory-positioning.md) — AxonRelay が*何でないか*（コンプライアンス・認証の主張はしない）、EU AI Act の適用日と一次資料と最終確認日、docs レビューチェックリスト（英日併記）
 - [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: 在席・territory claim・relay
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — 調整レイヤーにメッセージブローカーを入れない理由
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — `gitsafe` を PATH ラッパにせず明示 opt-in に留める理由

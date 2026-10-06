@@ -95,6 +95,25 @@ jobs:
           AXONRELAY_TEST_POSTGRES_URL: postgresql://axonrelay:axonrelay_dev@localhost:5432/axonrelay_test
         run: pytest tests/test_postgres_schema.py -q
 
+  lint-docs:
+    name: Lint Docs (claim check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Wording guard only: fails on phrases that previously reintroduced
+      # overstated regulatory claims. Accuracy is a review responsibility;
+      # see docs/regulatory-positioning.md.
+      - name: Check documentation claims
+        run: |
+          python3 scripts/check_doc_claims.py --selftest
+          python3 scripts/check_doc_claims.py
+
   build-frontend:
     name: Build Frontend (pnpm)
     runs-on: ubuntu-latest

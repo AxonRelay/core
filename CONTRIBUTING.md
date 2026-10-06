@@ -73,6 +73,15 @@ back on - deliberately, not in passing.
 The `.githooks/pre-push` hook still exists as a local first line of defence,
 and `git config core.hooksPath .githooks` is still worth running.
 
+#### Documentation claims
+
+`Lint Docs (claim check)` runs `scripts/check_doc_claims.py` on every PR. It
+fails on phrases that previously reintroduced overstated regulatory claims
+(the phrase list is in the script). It is not in the required-check list
+above, so it is advisory until the owner adds it there; treat a red run as a
+review comment. Wording rules, primary sources and the review checklist are in
+[docs/regulatory-positioning.md](docs/regulatory-positioning.md).
+
 #### Feature branches
 
 - Naming convention: `feature/<description>` or `fix/<description>`

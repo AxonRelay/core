@@ -52,14 +52,25 @@ a differentiator.
 
 What none of those layers give you is a **persistent record of accountability**:
 elicitation is ephemeral and per-session; observability tools log runs, not
-*who approved what*. Meanwhile the EU AI Act's high-risk obligations reach full
-enforcement on 2026-08-02, and their core asks are exactly: an immutable action
-log, a human approval gate for high-impact actions, and attribution of every
-action to a responsible identity (human **or** agent).
+*who approved what*.
 
-AxonRelay treats the human as a **first-class Actor** in that ledger, not an
-exception at the interrupt boundary. That is the residual value this repo
-preserves and dogfoods.
+Regulation points the same way, but later and more narrowly than is often
+stated. The EU AI Act's requirements for *high-risk* systems include automatic
+event logging (Article 12) and human oversight (Article 14), which overlap in
+theme with what an approval ledger records. Those high-risk obligations were
+**not** in force on 2026-08-02: that date is the Act's general application
+date and the start of its transparency rules (Article 50), while the
+Digital Omnibus on AI (Regulation (EU) 2026/1744, in force 2026-07-27)
+deferred the high-risk obligations to **2027-12-02** (Annex III systems) and
+**2028-08-02** (Annex I systems). Dates, primary sources and the day they were
+last checked are in [docs/regulatory-positioning.md](docs/regulatory-positioning.md).
+
+**AxonRelay is not a compliance product and not a certification mechanism.**
+It certifies nothing and makes nothing conform to the EU AI Act or any other
+regulation; the ledger is tamper-evident, not legally probative. What it
+preserves and dogfoods is one idea those requirements share with plain good
+engineering: the human is a **first-class Actor** in a durable ledger, not an
+exception at the interrupt boundary.
 
 ---
 
@@ -276,6 +287,7 @@ Roadmap and migration plan: [docs/step2-plan.md](docs/step2-plan.md). Pivot rati
 ## Docs
 
 - [docs/delta-mvp-spec.md](docs/delta-mvp-spec.md) — pivot spec (Actor model, scope, dogfood scenarios)
+- [docs/regulatory-positioning.md](docs/regulatory-positioning.md) — what AxonRelay is *not* (no compliance or certification claims), the EU AI Act application dates with primary sources and the date they were checked, and the docs review checklist
 - [docs/coordination-spec.md](docs/coordination-spec.md) — Phase 3: presence, territory claims, relays
 - [docs/adr-006-no-message-broker.md](docs/adr-006-no-message-broker.md) — why the coordination layer has no message broker
 - [docs/adr-007-gitsafe-enforcement-path.md](docs/adr-007-gitsafe-enforcement-path.md) — why `gitsafe` stays opt-in instead of shadowing `git` on PATH
