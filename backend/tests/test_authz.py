@@ -694,6 +694,7 @@ def test_every_coordination_tool_that_takes_a_session_id_checks_it():
         "read_inbox",
         "ack_relay",
         "claim_git_resource",
+        "check_git_resource",
         "check_conflicts",
     ):
         start = source.index(f"def {tool}(")
@@ -807,3 +808,36 @@ def test_a_credential_registers_as_its_own_actor_row_not_a_namesake(mcp_db, self
     sessions = mcp_db.query(models.Session).all()
     assert [s.actor_id for s in sessions] == [mine.id]
     assert mcp_db.query(models.Actor).filter(models.Actor.name == "worker").count() == 2  # nothing created
+
+
+def test_asking_the_git_guard_as_another_actors_session_is_refused(client, db, self_actor, enforced):
+    """The guard excludes the session's own claims, so borrowing a session would clear its claim."""
+    from app import coordination
+
+    agent = _make_ai(db)
+    theirs = _session_for(db, self_actor, clone="/theirs")
+    coordination.claim_resource(db, session_id=theirs.id, resource=models.ClaimResourceEnum.STASH)
+    token, _ = _credential(db, agent, {authz.Scope.COORDINATION_READ})
+
+    response = client.get(
+        "/coordination/git/guard", params={"session_id": theirs.id, "resource": "stash"}, headers=_auth(token)
+    )
+
+    assert response.status_code == 403
+
+
+def test_acking_a_relay_addressed_to_someone_else_is_refused(db, self_actor):
+    """Retention counts acked receipts as delivery; an outsider's ack would forge one."""
+    from app import coordination
+
+    agent = _make_ai(db)
+    sender = _session_for(db, self_actor, clone="/sender")
+    outsider = _session_for(db, agent, clone="/outsider")
+    reader = models.Actor(type=models.ActorTypeEnum.AI, name="reader")
+    db.add(reader)
+    db.commit()
+    relay = coordination.send_relay(db, from_session_id=sender.id, subject="s", to_actor_id=reader.id)
+
+    with pytest.raises(ValueError, match="not addressed"):
+        coordination.ack_relay(db, relay_id=relay.id, session_id=outsider.id)
+    assert db.query(models.RelayReceipt).count() == 0

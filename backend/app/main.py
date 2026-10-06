@@ -787,6 +787,9 @@ async def coordination_git_guard_endpoint(
         raise HTTPException(status_code=400, detail="Unknown resource") from e
 
     if session_id is not None:
+        # The answer excludes the session's own claims; asking as another
+        # Actor's session would clear the very claim meant to stop this caller.
+        authz.check_session_owner(db, session_id)
         try:
             return coordination.guard_git_operation(
                 db, session_id=session_id, resource=resolved, host=host, clone_path=clone_path, repo=repo
