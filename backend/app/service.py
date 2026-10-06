@@ -8,7 +8,6 @@ both call `project_run_state`.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -22,14 +21,15 @@ def project_run_state(
     values: dict[str, Any],
     waiting_for_human: bool,
     *,
-    status_guard: Callable[[], bool] | None = None,
+    locked: bool = False,
 ) -> None:
     """Project a LangGraph Platform run's state into the Postgres ledger.
 
-    `status_guard`, when given, runs just before the status is written (it
-    may take the task lock); if it returns False the status is left as it is.
-    The draft appends above commit on their own, so a check made before them
-    would not hold by the time the status is written.
+    `locked=True` means the caller already holds the task row lock and has
+    checked what it needed under it: then every draft and the task row are
+    written in that one transaction and committed once, so nothing - a
+    decision included - can interleave with a half-applied snapshot.
+    Otherwise each draft append takes the lock and commits on its own.
 
     The Platform thread is the source of truth; Postgres is a projection. This
     is **idempotent**: replaying the same `values` (e.g. a retried request) adds
@@ -52,7 +52,10 @@ def project_run_state(
                 continue
         elif existing and existing[-1].content == content:
             continue
-        existing.append(crud.add_draft(db, task_id=task.id, content=content))
+        if locked:
+            existing.append(crud.append_draft_locked(db, task.id, content))
+        else:
+            existing.append(crud.add_draft(db, task_id=task.id, content=content))
 
     reviewer_comments = values.get("reviewer_comments") or []
     feedback = reviewer_comments[-1] if reviewer_comments else None
@@ -64,8 +67,16 @@ def project_run_state(
         new_status = models.TaskStatusEnum.COMPLETED
     else:
         new_status = task.status  # unchanged
-    if status_guard is not None and not status_guard():
-        new_status = None  # leave the status to whatever moved it meanwhile
+
+    if locked:
+        task.status = new_status
+        if current_draft is not None:
+            task.current_draft = current_draft
+        if feedback is not None:
+            task.feedback = feedback
+        db.commit()
+        db.refresh(task)
+        return
 
     crud.update_task(
         db,
@@ -88,9 +99,11 @@ async def refresh_from_platform(
 
     The read happens outside any lock (it is a network call), so the snapshot
     is applied only if no decision was recorded meanwhile: the latest approval
-    is compared under the task lock against the one seen before reading. A
-    newer decision means the snapshot may predate it - projecting it could
-    reopen a task that decision just closed - so it is dropped.
+    is compared under the task lock against the one seen before reading, and
+    the projection is written in that same locked transaction. A newer
+    decision means the snapshot may predate it - projecting it could reopen a
+    task that decision just closed, or add drafts behind it - so it is
+    dropped whole.
     """
     before = (
         expected_latest_approval_id if expected_latest_approval_id is not None else _latest_approval_id(db, task.id)
@@ -101,15 +114,10 @@ async def refresh_from_platform(
     if _latest_approval_id(db, task.id) != before:
         db.rollback()
         return False
-
-    def _no_newer_decision() -> bool:
-        # Re-checked under the lock immediately before the status write,
-        # which update_task commits in the same transaction.
-        crud.lock_task(db, task.id)
-        return _latest_approval_id(db, task.id) == before
-
+    # Still under the lock: the whole snapshot - drafts and status - lands in
+    # this one transaction, or not at all.
     waiting = langgraph_client.is_waiting_for_human(state)
-    project_run_state(db, task, langgraph_client.extract_values(state), waiting, status_guard=_no_newer_decision)
+    project_run_state(db, task, langgraph_client.extract_values(state), waiting, locked=True)
     return True
 
 

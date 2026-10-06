@@ -411,6 +411,17 @@ def check_decision_is_bound(artifact_version: int | None, expected_commitment: s
         )
 
 
+def _human_or_administrator(db: Session) -> bool:
+    """Is this caller trusted with powers over other Actors? Loopback always is."""
+    principal = _current.get()
+    if principal is None or principal.source != "credential" or principal.actor_id is None:
+        return True
+    if principal.has(Scope.ADMINISTRATION):
+        return True
+    actor = db.query(models.Actor).filter(models.Actor.id == principal.actor_id).first()
+    return actor is not None and actor.type == models.ActorTypeEnum.HUMAN
+
+
 def check_may_grant_approver(db: Session) -> None:
     """May this caller give an Actor the `approver` role on a task?
 
@@ -421,16 +432,26 @@ def check_may_grant_approver(db: Session) -> None:
     when its Actor is a human (the operator, who approves anyway) or it holds
     `administration`. Loopback callers are the operator and unaffected.
     """
-    principal = _current.get()
-    if principal is None or principal.source != "credential" or principal.actor_id is None:
-        return
-    if principal.has(Scope.ADMINISTRATION):
-        return
-    actor = db.query(models.Actor).filter(models.Actor.id == principal.actor_id).first()
-    if actor is not None and actor.type == models.ActorTypeEnum.HUMAN:
+    if _human_or_administrator(db):
         return
     logger.info("authz refused granting the approver role")
     raise ApprovalNotPermitted("granting the 'approver' role needs a human Actor or the 'administration' scope")
+
+
+def check_may_force_claim(db: Session) -> None:
+    """May this caller claim over somebody else's claim (`force=true`)?
+
+    A forced claim releases the conflicting claims, which belong to other
+    sessions - other Actors, usually. Under `coordination:write` alone an
+    agent could clear another agent's `remote` claim and force-push behind
+    it. Overriding needs the same standing as granting approval: a human
+    Actor or `administration`. A claim that conflicts with nothing needs no
+    force and is unaffected.
+    """
+    if _human_or_administrator(db):
+        return
+    logger.info("authz refused a forced claim")
+    raise ApprovalNotPermitted("force=true releases other sessions' claims; it needs a human Actor or 'administration'")
 
 
 # ------------------------------------------------------- the surface → scope maps

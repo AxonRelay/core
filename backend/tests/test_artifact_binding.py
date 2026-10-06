@@ -276,12 +276,34 @@ def test_a_refresh_that_read_before_a_newer_decision_does_not_reopen_the_task(db
 
     async def _read_while_someone_decides(*a, **k):
         crud.record_approval(db, task.id, self_actor.id, "approved", "meanwhile", claim_waiting=True)
-        return {"values": {"drafts": [draft.content]}, "next": ["human_approval"]}  # the old question
+        # A snapshot from before that decision, with drafts the ledger has not seen.
+        return {"values": {"drafts": [draft.content, "stale v2", "stale v3"]}, "next": ["human_approval"]}
 
     monkeypatch.setattr(langgraph_client, "get_state", _read_while_someone_decides)
 
     assert asyncio.run(service.refresh_from_platform(db, task)) is False
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
+    assert [d.content for d in crud.get_drafts(db, task.id)] == [draft.content]  # dropped whole
+
+
+def test_a_refresh_lands_its_whole_snapshot_in_one_locked_transaction(db, self_actor, monkeypatch):
+    """No per-draft commit: a decision cannot interleave with a half-applied snapshot."""
+    from app import langgraph_client, service
+
+    task, draft = _waiting(db)
+
+    async def _snapshot(*a, **k):
+        return {"values": {"drafts": [draft.content, "v2", "v3"]}, "next": ["human_approval"]}
+
+    def _committing_append(*a, **k):
+        raise AssertionError("a draft was committed on its own, releasing the task lock mid-projection")
+
+    monkeypatch.setattr(langgraph_client, "get_state", _snapshot)
+    monkeypatch.setattr(crud, "add_draft", _committing_append)
+
+    assert asyncio.run(service.refresh_from_platform(db, task)) is True
+    assert [d.content for d in crud.get_drafts(db, task.id)] == [draft.content, "v2", "v3"]
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
 
 
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):

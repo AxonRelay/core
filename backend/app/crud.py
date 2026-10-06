@@ -465,6 +465,11 @@ def add_draft(
     return draft
 
 
+def append_draft_locked(db: Session, task_id: int, content: str) -> models.Draft:
+    """Append a draft inside a transaction that already holds the task lock. No commit."""
+    return _append_draft(db, task_id, content)
+
+
 def get_drafts(db: Session, task_id: int):
     return db.query(models.Draft).filter(models.Draft.task_id == task_id).order_by(models.Draft.version.asc()).all()
 

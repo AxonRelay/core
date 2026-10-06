@@ -66,6 +66,9 @@ assignment を信用する以上、**`approver` を付与すること自体が�
 よって credential による `approver` 付与は human Actor か `administration` scope に限る
 （`check_may_grant_approver`。全 surface が通る `crud.create_task_assignment` で確認し、
 task 作成時の付与は Platform の thread を作る前に拒否する）。
+同じ理由で、他のセッションの claim を解放しうる `force=true`（`claim_territory` /
+`claim_git_resource`）も human Actor か `administration` に限る（`check_may_force_claim`）。
+衝突のない claim には force が要らないので影響しない。
 
 ### 3. scope は 6 つ、surface は必ずどれかに割り当てる
 
