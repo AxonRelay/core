@@ -975,6 +975,7 @@ def register_session(
     with _session() as db:
         session = coordination.register_session(
             db,
+            actor=authz.credential_actor(db, resolved_type),
             actor_name=actor_name,
             actor_type=resolved_type,
             host=host,

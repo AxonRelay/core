@@ -785,3 +785,25 @@ def test_refusing_another_actors_claim_leaves_it_held(mcp_db, self_actor, enforc
     mcp_db.expire_all()
     still = mcp_db.query(models.Claim).filter(models.Claim.id == claim.id).one()
     assert still.status == models.ClaimStatusEnum.HELD
+
+
+def test_a_credential_registers_as_its_own_actor_row_not_a_namesake(mcp_db, self_actor, enforced):
+    """Actor names are not unique; the session must belong to the credential's Actor id."""
+    namesake = models.Actor(type=models.ActorTypeEnum.AI, name="worker")
+    mcp_db.add(namesake)
+    mcp_db.commit()
+    mine = models.Actor(type=models.ActorTypeEnum.AI, name="worker")
+    mcp_db.add(mine)
+    mcp_db.commit()
+    principal = authz.Principal(
+        actor_id=mine.id, actor_name="worker", scopes=authz.ALL_SCOPES, source="credential", credential_id=1
+    )
+
+    with authz.bind(principal):
+        server.register_session(actor_name="worker", host="h", repo="r", clone_path="/c")
+        with pytest.raises(authz.ActorMismatch):
+            server.register_session(actor_name="worker", host="h", repo="r", clone_path="/c2", actor_type="human")
+
+    sessions = mcp_db.query(models.Session).all()
+    assert [s.actor_id for s in sessions] == [mine.id]
+    assert mcp_db.query(models.Actor).filter(models.Actor.name == "worker").count() == 2  # nothing created
