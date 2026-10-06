@@ -173,6 +173,12 @@ class Task(Base):
 
     current_draft = Column(Text)
     feedback = Column(Text)
+    #: Bumped by every write that moves the task's decision state - a decision
+    #: recorded, a decision reopened, a Platform snapshot projected. A
+    #: snapshot read without a lock is applied only if this has not moved since
+    #: the read began, which orders concurrent projections without holding a
+    #: lock across a network call.
+    state_version = Column(Integer, nullable=False, default=0, server_default="0")
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

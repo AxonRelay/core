@@ -68,6 +68,7 @@ def project_run_state(
     else:
         new_status = task.status  # unchanged
 
+    task.state_version = (task.state_version or 0) + 1
     if locked:
         task.status = new_status
         if current_draft is not None:
@@ -87,64 +88,49 @@ def project_run_state(
     )
 
 
-async def refresh_from_platform(
-    db: Session, task: models.Task, *, expected_latest_approval_id: int | None = None
+def apply_snapshot(
+    db: Session, task: models.Task, values: dict[str, Any], waiting_for_human: bool, *, expected_version: int
 ) -> bool:
+    """Project a Platform snapshot only if the task has not moved since it was read.
+
+    The snapshot was obtained over the network without a lock (holding a
+    synchronous row lock across an await can stall the worker). So: take the
+    lock now, and apply the snapshot - drafts and task row, one transaction -
+    only if `state_version` is still what it was when the read began. Any
+    decision, reopen or other projection in between bumps it, and an older
+    snapshot then cannot land over a newer state. Returns whether it applied.
+    """
+    crud.lock_task(db, task.id)
+    if (task.state_version or 0) != expected_version:
+        db.rollback()
+        return False
+    project_run_state(db, task, values, waiting_for_human, locked=True)
+    return True
+
+
+def current_state_version(db: Session, task: models.Task) -> int:
+    db.refresh(task)
+    return task.state_version or 0
+
+
+async def refresh_from_platform(db: Session, task: models.Task, *, expected_version: int | None = None) -> bool:
     """Read the thread's current state from Platform and project it. Returns whether it was projected.
 
     This is how a task whose decision was recorded but never confirmed gets
     back to WAITING_APPROVAL: not by assuming anything about the failed call,
     but because Platform itself says the graph is waiting for a human. If the
     graph already answered and moved on, the projection shows that instead.
-
-    The task lock is held from before the read until the projection commits,
-    and the latest approval is compared against the one the caller expected:
-    a decision recorded since means the caller's view is stale - projecting
-    could reopen a task that decision closed, or add drafts behind it - so
-    nothing is applied.
+    `expected_version` defaults to the version before the read; see
+    `apply_snapshot` for why that is what makes the result safe to apply.
     """
-    before = (
-        expected_latest_approval_id if expected_latest_approval_id is not None else _latest_approval_id(db, task.id)
-    )
-    db.rollback()
-    # The lock is taken *before* the Platform read and held across it, so
-    # refreshes of one task, and decisions on it, are serialized with the read
-    # itself. Checking only afterwards would let two refreshes that read in one
-    # order commit in the other: an older "waiting" snapshot landing over a
-    # newer "completed" one would reopen a finished task. A refresh is a rare
-    # recovery step, so a decision waiting out one Platform read is cheap.
-    crud.lock_task(db, task.id)
-    if _latest_approval_id(db, task.id) != before:
-        db.rollback()
-        return False
-    try:
-        state = await langgraph_client.get_state(task.thread_id)
-    except BaseException:
-        db.rollback()
-        raise
-    if _latest_approval_id(db, task.id) != before:
-        # Cannot happen while the lock holds on Postgres; SQLite has no row
-        # locks, so check again rather than rely on it.
-        db.rollback()
-        return False
-    # Still under the lock: the whole snapshot - drafts and status - lands in
-    # this one transaction, or not at all.
+    version = expected_version if expected_version is not None else current_state_version(db, task)
+    db.rollback()  # no transaction - and no lock - across the network call
+    state = await langgraph_client.get_state(task.thread_id)
     waiting = langgraph_client.is_waiting_for_human(state)
-    project_run_state(db, task, langgraph_client.extract_values(state), waiting, locked=True)
-    return True
+    return apply_snapshot(db, task, langgraph_client.extract_values(state), waiting, expected_version=version)
 
 
-def _latest_approval_id(db: Session, task_id: int) -> int | None:
-    latest = (
-        db.query(models.Approval.id)
-        .filter(models.Approval.task_id == task_id)
-        .order_by(models.Approval.id.desc())
-        .first()
-    )
-    return latest[0] if latest else None
-
-
-async def settle_failed_delivery(db: Session, task: models.Task, approval_id: int, exc: BaseException) -> None:
+async def settle_failed_delivery(db: Session, task: models.Task, approval: models.Approval, exc: BaseException) -> None:
     """After a decision's one delivery attempt failed, put the task where Platform says it is.
 
     * Platform not configured: nothing was sent, so the decision is reopened.
@@ -158,11 +144,11 @@ async def settle_failed_delivery(db: Session, task: models.Task, approval_id: in
       the graph may already have moved past.
     """
     if isinstance(exc, langgraph_client.PlatformNotConfiguredError):
-        crud.reopen_decision(db, task.id, approval_id)
+        crud.reopen_decision(db, task.id, approval.id)
         return
     if not isinstance(exc, Exception):
         return
     try:
-        await refresh_from_platform(db, task, expected_latest_approval_id=approval_id)
+        await refresh_from_platform(db, task, expected_version=approval.task_state_version)
     except Exception:  # noqa: BLE001 - unreadable state leaves the task closed, by design
         db.rollback()

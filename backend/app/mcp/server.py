@@ -451,7 +451,7 @@ async def refresh_task(task_id: int) -> dict:
         return task_to_dict(task)
 
 
-async def _deliver(db, task: models.Task, resume_payload: dict[str, Any], approval_id: int) -> dict:
+async def _deliver(db, task: models.Task, resume_payload: dict[str, Any], approval: models.Approval) -> dict:
     """Make the one delivery attempt this decision gets, and name the doubt if it fails.
 
     Nothing re-sends it. `resume_thread` is a plain LangGraph resume with no
@@ -478,9 +478,9 @@ async def _deliver(db, task: models.Task, resume_payload: dict[str, Any], approv
             raise
         # Put the task where Platform says it is; reopened only if it is
         # waiting again (or nothing was sent at all).
-        await service.settle_failed_delivery(db, task, approval_id, e)
+        await service.settle_failed_delivery(db, task, approval, e)
         raise ToolError(
-            f"Decision {approval_id} is recorded in the ledger, but the graph did not confirm it "
+            f"Decision {approval.id} is recorded in the ledger, but the graph did not confirm it "
             f"({type(e).__name__}). Nothing re-sends it: a second delivery would answer whichever "
             "question the graph has reached by now. The task accepts a new decision only once Platform "
             "reports the graph waiting again; run refresh_task to re-read it, then re-drive with "
@@ -582,8 +582,15 @@ async def _apply_decision(
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
-        result = await _deliver(db, task, resume_payload, approval.id)
-        _sync_state(db, task, result)
+        result = await _deliver(db, task, resume_payload, approval)
+        # Only onto the state this decision left: a later decision or projection wins.
+        service.apply_snapshot(
+            db,
+            task,
+            langgraph_client.extract_values(result),
+            langgraph_client.is_waiting_for_human(result),
+            expected_version=approval.task_state_version,
+        )
         db.refresh(task)
         payload = task_to_dict(task)
         payload["approval"] = approval_to_dict(approval)

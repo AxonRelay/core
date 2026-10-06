@@ -178,6 +178,15 @@ def test_the_signature_is_sized_to_an_ed25519_signature(db, full_text_mode):
     assert caught.value.fields == ["producer_signature"]
 
 
+def test_an_unknown_key_is_not_echoed_because_the_key_is_caller_data(db, full_text_mode, caplog):
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(safe_envelope.EnvelopeRejected) as exc:
+        safe_envelope.ingest(db, {**_envelope(), CANARY: 1})
+    assert exc.value.fields == [safe_envelope.UNKNOWN_FIELD]
+    assert CANARY not in str(exc.value)
+    assert CANARY not in caplog.text
+
+
 @pytest.mark.parametrize(
     "bad",
     [

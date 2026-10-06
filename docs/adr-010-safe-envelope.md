@@ -85,6 +85,10 @@ route は「拒否」「読み取り専用（id / enum のみ）」「envelope�
 - ログ: `axonrelay.safe_envelope` logger はフィールド名と enum 値だけを出す
 - **FastAPI 既定の 422 ハンドラを差し替え**、全エンドポイントで `input` / `ctx` を
   返さない（`loc` と `type` のみ）。これは safe mode に関係なく常時有効
+- 未知のキーは、JSON オブジェクトのキーそのものが呼び出し元のデータなので、名前を
+  そのまま返さない。サーバが固定で持つ「よく来るが置き場のない名前」
+  （`title` / `body` / `url` …、`KNOWN_EXCLUDED_FIELDS`）に一致するときだけ名前を返し、
+  それ以外は `(unknown field)` とする。返るのは常にサーバの定数である
 
 ### 4. public identifier は policy 下でのみ
 

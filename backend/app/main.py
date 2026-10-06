@@ -488,10 +488,10 @@ def _record_decision(db: Session, **kwargs) -> models.Approval:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-async def _settle(db: Session, task: models.Task, approval_id: int, exc: BaseException) -> None:
+async def _settle(db: Session, task: models.Task, approval: models.Approval, exc: BaseException) -> None:
     """`service.settle_failed_delivery`, skipped for a cancellation (nothing may be awaited then)."""
     if isinstance(exc, Exception):
-        await service.settle_failed_delivery(db, task, approval_id, exc)
+        await service.settle_failed_delivery(db, task, approval, exc)
 
 
 @app.post("/tasks/{task_id}/refresh", response_model=TaskWithAssignmentsResponse)
@@ -559,14 +559,15 @@ async def approve_task_endpoint(
     except BaseException as e:
         # Recorded but unconfirmed. Nothing re-sends it; the task goes where
         # Platform says it is (service.settle_failed_delivery).
-        await _settle(db, task, approval.id, e)
+        await _settle(db, task, approval, e)
         if isinstance(e, langgraph_client.PlatformNotConfiguredError):
             raise HTTPException(status_code=503, detail=str(e)) from e
         raise
 
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)
-    _sync_state_to_db(db, task, values, waiting)
+    # Only onto the state this decision left: a later decision or projection wins.
+    service.apply_snapshot(db, task, values, waiting, expected_version=approval.task_state_version)
     return approval
 
 
@@ -611,14 +612,15 @@ async def reject_task_endpoint(
             },
         )
     except BaseException as e:
-        await _settle(db, task, approval.id, e)  # as in approve_task_endpoint
+        await _settle(db, task, approval, e)  # as in approve_task_endpoint
         if isinstance(e, langgraph_client.PlatformNotConfiguredError):
             raise HTTPException(status_code=503, detail=str(e)) from e
         raise
 
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)
-    _sync_state_to_db(db, task, values, waiting)
+    # Only onto the state this decision left: a later decision or projection wins.
+    service.apply_snapshot(db, task, values, waiting, expected_version=approval.task_state_version)
     return approval
 
 
