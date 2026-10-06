@@ -34,9 +34,10 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session as DBSession
 
-from app import models
+from app import coordination, models
 
 logger = logging.getLogger("axonrelay.retention")
 
@@ -48,7 +49,8 @@ ENDED_SESSION_DAYS = 30
 #: little while so "who held this when I was refused?" is still answerable.
 FINISHED_CLAIM_DAYS = 14
 
-#: A relay every recipient has acknowledged is a delivered message.
+#: A directed relay that every live session it is addressed to has acknowledged
+#: is a delivered message.
 ACKED_RELAY_DAYS = 30
 
 #: An unacknowledged relay is still someone's inbox item, so it lives much
@@ -146,24 +148,35 @@ def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) 
     # --- relays that have been delivered, or have waited long enough --------
     acked_cutoff = now - timedelta(days=ACKED_RELAY_DAYS)
     stale_cutoff = now - timedelta(days=UNACKED_RELAY_DAYS)
+    # A receipt exists only for a session that has *read* the relay, so
+    # "every receipt is acked" says nothing about recipients who never opened
+    # it. "Delivered" therefore means: every live session the relay is
+    # addressed to holds an acked receipt. Ended sessions will not read again
+    # and are not waited for. A broadcast only ever leaves on the long window
+    # (UNACKED_RELAY_DAYS) - its audience includes sessions not yet started.
+    audience: dict[int, set[int]] = {}
+    live_sessions = db.query(models.Session).filter(models.Session.status != models.SessionStatusEnum.ENDED).all()
+    for session in live_sessions:
+        addressed = (
+            db.query(models.Relay.id)
+            .filter(coordination._addressed_to(session))
+            .filter(or_(models.Relay.from_session_id.is_(None), models.Relay.from_session_id != session.id))
+            .filter(models.Relay.created_at < acked_cutoff)
+        )
+        for (relay_id,) in addressed:
+            audience.setdefault(relay_id, set()).add(session.id)
+
     doomed_relays = []
     for relay in db.query(models.Relay).filter(models.Relay.created_at < acked_cutoff).all():
         if relay.created_at < stale_cutoff:
             doomed_relays.append(relay)
             continue
-        # A receipt exists only for a session that has *read* the relay, so
-        # "every receipt is acked" says nothing about recipients who never
-        # opened it. A broadcast therefore only ever leaves on the long
-        # window; a directed relay may leave once its addressees have acked.
         broadcast = relay.to_actor_id is None and relay.to_workspace_id is None and relay.to_repo is None
-        receipts = list(relay.receipts or [])
-        delivered = bool(receipts) and all(r.acked_at is not None for r in receipts)
-        surviving = [r for r in receipts if r.session_id not in doomed_session_ids]
-        if delivered and (not broadcast or not surviving):
-            # Directed and acknowledged; or acknowledged by recipients whose
-            # sessions are going, which would leave the relay with no receipts
-            # at all - and a relay with no receipts reads as unacknowledged, so
-            # keeping it would show a delivered message as open again.
+        if broadcast:
+            continue
+        acked_by = {r.session_id for r in (relay.receipts or []) if r.acked_at is not None}
+        every_receipt_acked = all(r.acked_at is not None for r in (relay.receipts or []))
+        if acked_by and every_receipt_acked and audience.get(relay.id, set()) <= acked_by:
             doomed_relays.append(relay)
 
     doomed_relay_ids = {r.id for r in doomed_relays}

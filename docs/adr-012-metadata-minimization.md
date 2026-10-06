@@ -91,8 +91,13 @@ migration は既存の自由文からコードを**推測しない**。文から
 |---|---|
 | 終了した session | 30 日 |
 | 解放済み / 期限切れの claim | 14 日 |
-| 全員が ack した relay | 30 日 |
-| 未 ack の relay | 180 日 |
+| 宛先の生きている session 全員が ack した宛先付き relay | 30 日 |
+| それ以外の relay（未 ack、broadcast） | 180 日 |
+
+receipt は relay を**読んだ** session にしか無いので、「receipt が全部 ack 済み」は
+まだ開いていない宛先について何も言わない。だから「配達済み」は、宛先に含まれる
+**終了していない session すべて**が ack した receipt を持つこと、と定義する。
+broadcast の宛先にはまだ始まっていない session も含まれるので、常に 180 日の窓で消える。
 
 sweep が触れてよいテーブルは `sessions` / `claims` / `relays` / `relay_receipts`
 の 4 つだけ。`approvals` / `drafts` / `tasks` / `task_assignments` /
