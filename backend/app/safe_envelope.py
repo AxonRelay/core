@@ -117,7 +117,11 @@ Sha256Hex = Annotated[str, StringConstraints(pattern=ledger.SHA256_HEX_PATTERN)]
 PolicyVersion = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._-]{1,32}$")]
 # A detached signature over the envelope, produced by the source. Opaque to
 # the core (it is stored and returned, never verified here); bounded base64url.
-Signature = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_=-]{16,1024}$")]
+# An Ed25519 signature: 64 bytes, base64url (86 characters, optional "=="
+# padding). The field is stored and returned but not verified, so it is sized
+# to a real signature and no larger: an unverified free-length field would be
+# the widest channel in the envelope.
+Signature = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{86}(==)?$")]
 
 
 class SafeEnvelope(BaseModel):
@@ -222,6 +226,19 @@ class EnvelopeRejected(ValueError):
         super().__init__(f"Safe Envelope rejected ({reason}): {detail}")
 
 
+class EnvelopeConflict(EnvelopeRejected):
+    """An ``event_id`` that is already stored arrived with different contents.
+
+    Idempotency covers a *re-send*: the same envelope again. A different
+    envelope under a stored id is either a producer bug or someone claiming an
+    id first to suppress the real event, and answering it with the stored row
+    and ``created=False`` would hide both. Names the differing fields only.
+    """
+
+    def __init__(self, fields: list[str]) -> None:
+        super().__init__(fields, "event_id already stored with different contents")
+
+
 def _field_names(error: ValidationError) -> list[str]:
     """Top-level field names only: the envelope is flat, and pydantic appends
     union-member or validator tags to ``loc`` that are not field names."""
@@ -266,6 +283,7 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
     envelope = validate_envelope(payload)
     existing = _find_existing(db, envelope.event_id)
     if existing is not None:
+        _require_same(existing, envelope)
         return existing, False
 
     event = models.SafeEvent(
@@ -298,10 +316,53 @@ def ingest(db: Session, payload: Any) -> tuple[models.SafeEvent, bool]:
         existing = _find_existing(db, envelope.event_id)
         if existing is None:  # pragma: no cover - the constraint that fired is on event_id
             raise
+        _require_same(existing, envelope)
         return existing, False
     db.refresh(event)
     logger.info("safe_envelope stored action=%s outcome=%s", event.action.value, event.outcome.value)
     return event, True
+
+
+def _stored_values(envelope: SafeEnvelope) -> dict[str, Any]:
+    """The envelope as ``ingest`` persists it, keyed by envelope field name."""
+    return {
+        "schema_version": envelope.schema_version,
+        "policy_version": envelope.policy_version,
+        "identifier_policy": envelope.identifier_policy,
+        "actor_id": envelope.actor_id,
+        "repository_id": envelope.repository_id,
+        "workspace_id": envelope.workspace_id,
+        "session_id": envelope.session_id,
+        "action": envelope.action,
+        "outcome": envelope.outcome,
+        "artifact_id": envelope.artifact_id,
+        "artifact_version": envelope.artifact_version,
+        "artifact_commitment": envelope.artifact_commitment,
+        "artifact_commitment_algorithm": envelope.artifact_commitment_algorithm,
+        "occurred_at": envelope.occurred_at.astimezone(UTC).replace(tzinfo=None),
+        "producer_signature": envelope.producer_signature,
+    }
+
+
+_STORED_COLUMN = {
+    "actor_id": "actor_ref",
+    "repository_id": "repository_ref",
+    "workspace_id": "workspace_ref",
+    "session_id": "session_ref",
+    "artifact_id": "artifact_ref",
+}
+
+
+def _require_same(existing: models.SafeEvent, envelope: SafeEnvelope) -> None:
+    """Refuse a different envelope under a stored ``event_id``."""
+    differing = sorted(
+        name
+        for name, value in _stored_values(envelope).items()
+        if getattr(existing, _STORED_COLUMN.get(name, name)) != value
+    )
+    if differing:
+        logger.info("safe_envelope conflict fields=%s", differing)
+        raise EnvelopeConflict(differing)
 
 
 def _find_existing(db: Session, event_id: str) -> models.SafeEvent | None:

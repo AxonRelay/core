@@ -674,7 +674,8 @@ async def ingest_envelope_endpoint(request: Request, db: Session = Depends(get_d
     The body is read as raw JSON and validated by the shared service, not by a
     request model: a schema failure must name fields only, and this path must
     behave identically to the MCP tool. 422 lists the offending field names;
-    409 is never used because re-sending an event_id is idempotent (200).
+    Re-sending the same envelope is idempotent (200); a *different* envelope
+    under a stored event_id is a 409 naming the differing fields.
     """
     try:
         payload = await request.json()
@@ -682,6 +683,8 @@ async def ingest_envelope_endpoint(request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=422, detail={"reason": "not JSON", "fields": ["(envelope)"]}) from None
     try:
         event, created = safe_envelope.ingest(db, payload)
+    except safe_envelope.EnvelopeConflict as e:
+        raise HTTPException(status_code=409, detail={"reason": e.reason, "fields": e.fields}) from None
     except safe_envelope.EnvelopeRejected as e:
         raise HTTPException(status_code=422, detail={"reason": e.reason, "fields": e.fields}) from None
     body = safe_envelope.event_to_dict(event)

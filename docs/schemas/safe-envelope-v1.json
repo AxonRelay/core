@@ -131,7 +131,7 @@
     "producer_signature": {
       "anyOf": [
         {
-          "pattern": "^[A-Za-z0-9_=-]{16,1024}$",
+          "pattern": "^[A-Za-z0-9_-]{86}(==)?$",
           "type": "string"
         },
         {
