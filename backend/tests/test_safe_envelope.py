@@ -119,11 +119,37 @@ def test_a_well_formed_envelope_is_accepted_and_stored_field_for_field(db, full_
 
 def test_resending_an_event_id_is_idempotent(db, full_text_mode):
     first, created = safe_envelope.ingest(db, _envelope())
-    second, again = safe_envelope.ingest(db, _envelope(outcome="error"))
+    second, again = safe_envelope.ingest(db, _envelope())
     assert created and not again
     assert second.id == first.id
-    assert second.outcome == models.SafeOutcomeEnum.SUCCESS  # the first envelope stands
     assert db.query(models.SafeEvent).count() == 1
+
+
+def test_a_different_envelope_under_a_stored_event_id_is_a_conflict(db, full_text_mode):
+    """Answering it with the stored row would let whoever sends an id first suppress the real event."""
+    safe_envelope.ingest(db, _envelope())
+    with pytest.raises(safe_envelope.EnvelopeConflict) as caught:
+        safe_envelope.ingest(db, _envelope(outcome="error", artifact_commitment="b" * 64))
+    assert caught.value.fields == ["artifact_commitment", "outcome"]  # names only
+    assert "b" * 64 not in str(caught.value)
+    stored = db.query(models.SafeEvent).one()
+    assert stored.outcome == models.SafeOutcomeEnum.SUCCESS
+
+
+def test_a_conflicting_envelope_is_a_409_over_rest(client, full_text_mode):
+    assert client.post("/envelopes", json=_envelope()).status_code == 201
+    assert client.post("/envelopes", json=_envelope()).status_code == 200
+    response = client.post("/envelopes", json=_envelope(outcome="error"))
+    assert response.status_code == 409
+    assert response.json()["detail"]["fields"] == ["outcome"]
+
+
+def test_the_signature_is_sized_to_an_ed25519_signature(db, full_text_mode):
+    """Stored unverified, so it may not be wider than a real signature."""
+    safe_envelope.ingest(db, _envelope(producer_signature="s" * 86))
+    with pytest.raises(safe_envelope.EnvelopeRejected) as caught:
+        safe_envelope.validate_envelope(_envelope(event_id="evt_" + "z" * 20, producer_signature="s" * 1024))
+    assert caught.value.fields == ["producer_signature"]
 
 
 @pytest.mark.parametrize(
@@ -250,9 +276,15 @@ def test_a_lost_race_on_event_id_still_returns_the_winner(db, monkeypatch, full_
         return None if calls["n"] == 1 else real(session, event_id)
 
     monkeypatch.setattr(safe_envelope, "_find_existing", _miss_once)
-    loser, created = safe_envelope.ingest(db, _envelope(outcome="error"))
+    loser, created = safe_envelope.ingest(db, _envelope())
     assert created is False
     assert loser.id == winner.id
+    assert db.query(models.SafeEvent).count() == 1
+
+    # The same race with a *different* envelope is still a conflict, not a silent win.
+    calls["n"] = 0
+    with pytest.raises(safe_envelope.EnvelopeConflict):
+        safe_envelope.ingest(db, _envelope(outcome="error"))
     assert db.query(models.SafeEvent).count() == 1
 
 

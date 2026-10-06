@@ -56,14 +56,17 @@ Envelope は Pydantic model（`extra="forbid"`）で、JSON Schema を
 | `artifact_commitment_algorithm?` | `app.ledger.COMMITMENT_ALGORITHM` と同一の値のみ（ADR-009 と同じラベル） |
 | `artifact_version?` | 整数 ≥ 1 |
 | `occurred_at` | timezone-aware datetime |
-| `producer_signature?` | base64url、16〜1024 文字。保存・返却のみで検証はしない |
+| `producer_signature?` | Ed25519 署名の形（base64url 86 文字、末尾 `==` 可）。保存・返却のみで検証はしない。検証しない欄を実際の署名より広くしない |
 
 `title` / `description` / `prompt` / `draft` / `feedback` / `body` / `subject` /
 `url` / `clone_path` / `host` … を入れる**場所が無い**。未知フィールドは拒否。
 
 保存先 `safe_events` テーブルには **Text 列が存在しない**（テストで構造的に保証）。
-`event_id` は unique で、再送は冪等（既存行を返し `created=false`）。同時再送で
-unique 制約に負けた側も既存行を返す（insert-first）。
+`event_id` は unique で、**同じ envelope の**再送は冪等（既存行を返し `created=false`）。
+同時再送で unique 制約に負けた側も既存行を返す（insert-first）。保存済みの `event_id` に
+**内容の違う** envelope が来たら衝突として拒否する（REST は 409、MCP は ToolError。
+違うフィールド名だけを返す）。黙って既存行を返すと、先に id を送った側が本物の
+イベントを握りつぶせてしまう。
 
 safe mode の網羅はテストが構造的に強制する: MCP の全 tool と REST の全書き込み
 route は「拒否」「読み取り専用（id / enum のみ）」「envelope」のいずれかに分類されて
@@ -91,7 +94,8 @@ route は「拒否」「読み取り専用（id / enum のみ）」「envelope�
 
 | 性質 | |
 |---|---|
-| safe mode で core が成果物本文を受け取らない | **する**——受け取る場所が無い |
+| safe mode で core が成果物本文を受け取らない | **する**——正直な producer が誤って送る場所が無い |
+| 悪意ある producer が識別子に本文を符号化して送ること | **しない**——下記「残る露出」 |
 | 拒否された値が DB・ログ・エラー・レスポンス・外部呼び出しに現れない | **する**（canary テスト） |
 | envelope の commitment が本物の成果物のものである | **しない**——producer を信頼する。署名検証は将来 |
 | 同一プロセス・同一 DB の管理者からのデータ隠蔽 | しない（非目標） |
@@ -99,6 +103,14 @@ route は「拒否」「読み取り専用（id / enum のみ）」「envelope�
 | 汎用 DLP、LLM による自動分類 | しない（非目標） |
 
 ## 残る露出
+
+- **producer 自身による意図的な符号化は防がない。** opaque id は 1 欄 128 文字まで、
+  署名欄は 86 文字あり、producer はそこに任意のバイト列を符号化できる。
+  content-blind が保証するのは「スキーマに本文の置き場が無く、正直な producer が
+  誤って本文を送れない」ことであって、隠れチャネルの不在ではない。そもそも本文を
+  持っているのは producer であり、意図して漏らす producer は AxonRelay を経由する
+  必要もない。署名欄を実在の署名長に絞っているのは、検証しない欄を最大の経路に
+  しないためである
 
 - MCP SDK の入力スキーマ違反（例: `envelope` に文字列を渡す）は SDK が
   `input_value` 付きで返す。トップレベルの型違反であり、フィールド内容ではないが、
