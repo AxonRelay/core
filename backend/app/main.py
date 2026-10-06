@@ -326,6 +326,10 @@ async def create_task_endpoint(
     _guard: None = Depends(_free_text_surface),
 ):
     creator_actor_id = authz.acting_actor_id(db)
+    if any(str(a.role) == models.AssignmentRoleEnum.APPROVER.value for a in task_data.assignments or []):
+        # Refuse before anything is created - the Platform thread included -
+        # not halfway through the assignment loop below.
+        authz.check_may_grant_approver(db)
 
     try:
         thread_id = await langgraph_client.create_thread(

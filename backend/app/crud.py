@@ -5,7 +5,7 @@ from datetime import datetime
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import ledger, models
+from app import authz, ledger, models
 
 # ========== Actor Operations ==========
 
@@ -134,7 +134,13 @@ def get_actor_assignments(db: Session, actor_id: int, skip: int = 0, limit: int 
 def create_task_assignment(db: Session, task_id: int, actor_id: int, role: models.AssignmentRoleEnum):
     """Assign an actor to a task with a role. Idempotent on (task_id, actor_id,
     role): a repeat call returns the existing row instead of violating the
-    unique constraint."""
+    unique constraint.
+
+    Granting `approver` is checked here, on the one path every surface takes,
+    so a new surface cannot forget it (`authz.check_may_grant_approver`).
+    """
+    if role == models.AssignmentRoleEnum.APPROVER:
+        authz.check_may_grant_approver(db)
     existing = (
         db.query(models.TaskAssignment)
         .filter(

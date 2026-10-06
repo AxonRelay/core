@@ -336,6 +336,68 @@ def test_an_agent_cannot_approve_a_task_it_is_not_an_approver_on(client, db, sel
     assert crud.get_approvals(db, task.id) == []
 
 
+def test_an_agent_cannot_make_itself_an_approver(client, db, self_actor, enforced, no_platform):
+    """Granting the role is the approval power; `ledger:write` alone must not reach it."""
+    agent = _make_ai(db)
+    token, _ = _credential(db, agent, {authz.Scope.LEDGER_WRITE})
+    task = _waiting_task(db, "t-selfgrant")
+
+    granted = client.post(
+        f"/tasks/{task.id}/assignments", json={"actor_id": agent.id, "role": "approver"}, headers=_auth(token)
+    )
+    approved = client.post(f"/tasks/{task.id}/approve", json={"comment": "ship it"}, headers=_auth(token))
+
+    assert granted.status_code == 403
+    assert approved.status_code == 403
+    assert crud.get_approvals(db, task.id) == []
+    executor = client.post(
+        f"/tasks/{task.id}/assignments", json={"actor_id": agent.id, "role": "executor"}, headers=_auth(token)
+    )
+    assert executor.status_code == 200  # other roles are unaffected
+
+
+def test_a_human_or_an_administrator_may_grant_the_approver_role(client, db, self_actor, enforced):
+    agent = _make_ai(db)
+    task = _waiting_task(db, "t-grant")
+    human, _ = _credential(db, self_actor, {authz.Scope.LEDGER_WRITE}, label="human")
+    admin, _ = _credential(db, agent, {authz.Scope.LEDGER_WRITE, authz.Scope.ADMINISTRATION}, label="admin")
+
+    by_human = client.post(
+        f"/tasks/{task.id}/assignments", json={"actor_id": agent.id, "role": "approver"}, headers=_auth(human)
+    )
+    by_admin = client.post(
+        f"/tasks/{task.id}/assignments", json={"actor_id": self_actor.id, "role": "approver"}, headers=_auth(admin)
+    )
+
+    assert (by_human.status_code, by_admin.status_code) == (200, 200)
+
+
+def test_creating_a_task_with_an_approver_is_refused_before_anything_is_created(
+    client, db, self_actor, enforced, monkeypatch
+):
+    from app import langgraph_client
+
+    created = []
+
+    async def _thread(*a, **k):
+        created.append(1)
+        return "thread-x"
+
+    monkeypatch.setattr(langgraph_client, "create_thread", _thread)
+    agent = _make_ai(db)
+    token, _ = _credential(db, agent, {authz.Scope.LEDGER_WRITE})
+
+    response = client.post(
+        "/tasks",
+        json={"title": "mine", "assignments": [{"actor_id": agent.id, "role": "approver"}]},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 403
+    assert created == []
+    assert db.query(models.Task).filter(models.Task.title == "mine").count() == 0
+
+
 def test_a_human_credential_may_approve_without_an_assignment(client, db, self_actor, enforced, no_platform):
     """The operator approves by definition; that is what a human Actor is here."""
     token, _ = _credential(db, self_actor, {authz.Scope.LEDGER_WRITE})
