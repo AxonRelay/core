@@ -34,7 +34,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session as DBSession
 
 from app import coordination, models
@@ -113,6 +113,13 @@ def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) 
     delivered message look unread again for the rest of its long window.
     """
     now = now or datetime.utcnow()
+    if not dry_run and db.get_bind().dialect.name == "postgresql":
+        # Decide from one consistent picture. Without this, a session that
+        # registers (or a receipt acked) after the live sessions are read is
+        # missing from a relay's audience, and the relay can be deleted as
+        # "delivered" before that session ever reads it. SHARE blocks writers
+        # to these tables until the sweep commits; readers are unaffected.
+        db.execute(text("LOCK TABLE sessions, relay_receipts IN SHARE MODE"))
 
     # --- sessions that have been finished long enough to forget -------------
     doomed_sessions = (

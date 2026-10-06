@@ -56,7 +56,7 @@ Envelope は Pydantic model（`extra="forbid"`）で、JSON Schema を
 | `artifact_commitment_algorithm?` | `app.ledger.COMMITMENT_ALGORITHM` と同一の値のみ（ADR-009 と同じラベル） |
 | `artifact_version?` | 整数 ≥ 1 |
 | `occurred_at` | timezone-aware datetime |
-| （サーバが付与）`submitted_by` | 提出した credential の Actor（loopback ならオペレータ）。`actor_id` は producer の**主張**で検証できないので、サーバが知っている提出者を別列に記録し、opaque ref で返す |
+| （サーバが付与）`submitted_by` | 提出した credential の Actor（loopback ならオペレータ）。`actor_id` は producer の**主張**で検証できないので、サーバが知っている提出者を別列に記録し、opaque ref で返す。FK ではなく ref そのものを保存するので、後で Actor を削除しても提出者は消えない |
 | `producer_signature?` | Ed25519 署名の形（base64url 86 文字、末尾 `==` 可）。保存・返却のみで検証はしない。検証しない欄を実際の署名より広くしない |
 
 `title` / `description` / `prompt` / `draft` / `feedback` / `body` / `subject` /

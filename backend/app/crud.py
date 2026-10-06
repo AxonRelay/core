@@ -389,6 +389,11 @@ def find_decision(db: Session, task_id: int, decision_key: str):
     )
 
 
+def lock_task(db: Session, task_id: int) -> models.Task:
+    """The per-task row lock, for service code that must check-then-write under it."""
+    return _lock_task(db, task_id)
+
+
 def _lock_task(db: Session, task_id: int) -> models.Task:
     """Take the per-task row lock that serializes ledger writers.
 

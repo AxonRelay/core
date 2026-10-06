@@ -782,7 +782,7 @@ class TestMinimizationMigration:
         pg_session.rollback()
 
 
-def test_downgrading_013_refuses_once_a_decision_key_exists():
+def test_downgrading_013_refuses_once_a_v3_entry_exists():
     """The column is inside the v3 hash, so dropping it is not reversible.
 
     A re-upgrade recreates it empty, and every keyed entry then recomputes to a
@@ -807,13 +807,38 @@ def test_downgrading_013_refuses_once_a_decision_key_exists():
             session.commit()
             task = crud.create_task(session, thread_id="t-downgrade", title="downgrade")
             crud.add_draft(session, task_id=task.id, content="draft")
-            crud.record_approval(session, task.id, actor.id, "approved", decision_key="k1")
+            # Unkeyed, as every direct REST / MCP decision is: still a v3 entry.
+            crud.record_approval(session, task.id, actor.id, "approved")
         finally:
             session.close()
 
         output = _run_alembic_expecting(url, ["downgrade", "012"], succeed=False)
-        assert "decision_key" in output
+        assert "v3" in output and "decision_key" in output
         with engine.connect() as conn:
             assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "013"
     finally:
         engine.dispose()
+
+
+def test_a_sweep_decides_from_a_locked_picture_of_sessions_and_receipts(migrated_engine):
+    """A session registering mid-sweep must not be missing from a relay's audience."""
+    from sqlalchemy import event
+
+    from app import retention
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    session = sessionmaker(bind=migrated_engine)()
+    event.listen(migrated_engine, "before_cursor_execute", _capture)
+    try:
+        retention.sweep(session)
+    finally:
+        event.remove(migrated_engine, "before_cursor_execute", _capture)
+        session.close()
+
+    lock = next(i for i, s in enumerate(statements) if s.startswith("LOCK TABLE sessions, relay_receipts"))
+    first_session_read = next(i for i, s in enumerate(statements) if "FROM sessions" in s)
+    assert lock < first_session_read

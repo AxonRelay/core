@@ -131,10 +131,16 @@ def test_the_submitting_actor_is_recorded_beside_the_producers_claim(db, self_ac
         event, _ = safe_envelope.ingest(db, _envelope(actor_id="someone_else_0123456"))
 
     assert event.actor_ref == "someone_else_0123456"
-    assert event.submitted_by_actor_id == agent.id
     stored = safe_envelope.event_to_dict(event)
     assert stored["submitted_by_ref"] == agent.opaque_id and stored["submitted_by_ref"]
     assert "producer-bot" not in json.dumps(stored)
+
+    # Deleting the Actor later does not erase who submitted the evidence.
+    ref = agent.opaque_id
+    db.delete(agent)
+    db.commit()
+    db.expire_all()
+    assert safe_envelope.event_to_dict(db.get(models.SafeEvent, event.id))["submitted_by_ref"] == ref
 
 
 def test_resending_an_event_id_is_idempotent(db, full_text_mode):

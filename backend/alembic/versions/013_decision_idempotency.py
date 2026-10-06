@@ -70,8 +70,9 @@ def downgrade() -> None:
     carried a key then recomputes to a different hash and reports as tampered
     forever. Losing the ability to verify a legitimate ledger is worse than
     refusing to downgrade, so this stops rather than corrupts. Immediately
-    after an upgrade, with nothing keyed yet, it is genuinely reversible and
-    proceeds.
+    after an upgrade, with no v3 entry yet, it is genuinely reversible and
+    proceeds. A v3 entry without a key counts too: its hash includes the
+    key's absence.
     """
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
@@ -79,12 +80,17 @@ def downgrade() -> None:
         # a keyed approval between them loses hashed data to a DROP COLUMN that
         # was already cleared to proceed.
         bind.execute(sa.text("LOCK TABLE approvals IN ACCESS EXCLUSIVE MODE"))
-    keyed = bind.execute(sa.text("SELECT COUNT(*) FROM approvals WHERE decision_key IS NOT NULL")).scalar()
-    if keyed:
+    # Every v3 entry hashes decision_key - as null when it has none - so an
+    # unkeyed v3 entry is just as unverifiable under 012's verifier as a keyed
+    # one. Count both.
+    v3 = bind.execute(
+        sa.text("SELECT COUNT(*) FROM approvals WHERE decision_key IS NOT NULL OR hash_version >= 3")
+    ).scalar()
+    if v3:
         raise RuntimeError(
-            f"refusing to downgrade: {keyed} approval(s) carry a decision_key, which is inside their v3 "
-            "entry hash (app/ledger.py). Dropping the column would make those entries unverifiable for "
-            "good. Remove or re-record them deliberately if this downgrade is really what you want."
+            f"refusing to downgrade: {v3} approval(s) are v3 entries, whose hash covers decision_key "
+            "(app/ledger.py). Dropping the column would make those entries unverifiable for good. "
+            "Remove or re-record them deliberately if this downgrade is really what you want."
         )
     op.drop_constraint("ck_approval_decision_key_needs_v3", "approvals", type_="check")
     op.drop_constraint("uq_approval_decision_key", "approvals", type_="unique")

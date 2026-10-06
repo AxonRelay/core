@@ -8,6 +8,7 @@ both call `project_run_state`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -20,8 +21,15 @@ def project_run_state(
     task: models.Task,
     values: dict[str, Any],
     waiting_for_human: bool,
+    *,
+    status_guard: Callable[[], bool] | None = None,
 ) -> None:
     """Project a LangGraph Platform run's state into the Postgres ledger.
+
+    `status_guard`, when given, runs just before the status is written (it
+    may take the task lock); if it returns False the status is left as it is.
+    The draft appends above commit on their own, so a check made before them
+    would not hold by the time the status is written.
 
     The Platform thread is the source of truth; Postgres is a projection. This
     is **idempotent**: replaying the same `values` (e.g. a retried request) adds
@@ -56,6 +64,8 @@ def project_run_state(
         new_status = models.TaskStatusEnum.COMPLETED
     else:
         new_status = task.status  # unchanged
+    if status_guard is not None and not status_guard():
+        new_status = None  # leave the status to whatever moved it meanwhile
 
     crud.update_task(
         db,
@@ -66,18 +76,51 @@ def project_run_state(
     )
 
 
-async def refresh_from_platform(db: Session, task: models.Task) -> bool:
-    """Read the thread's current state from Platform and project it. Returns "waiting".
+async def refresh_from_platform(
+    db: Session, task: models.Task, *, expected_latest_approval_id: int | None = None
+) -> bool:
+    """Read the thread's current state from Platform and project it. Returns whether it was projected.
 
     This is how a task whose decision was recorded but never confirmed gets
     back to WAITING_APPROVAL: not by assuming anything about the failed call,
     but because Platform itself says the graph is waiting for a human. If the
     graph already answered and moved on, the projection shows that instead.
+
+    The read happens outside any lock (it is a network call), so the snapshot
+    is applied only if no decision was recorded meanwhile: the latest approval
+    is compared under the task lock against the one seen before reading. A
+    newer decision means the snapshot may predate it - projecting it could
+    reopen a task that decision just closed - so it is dropped.
     """
+    before = (
+        expected_latest_approval_id if expected_latest_approval_id is not None else _latest_approval_id(db, task.id)
+    )
+    db.rollback()  # end the read transaction; the network call holds no lock
     state = await langgraph_client.get_state(task.thread_id)
+    crud.lock_task(db, task.id)
+    if _latest_approval_id(db, task.id) != before:
+        db.rollback()
+        return False
+
+    def _no_newer_decision() -> bool:
+        # Re-checked under the lock immediately before the status write,
+        # which update_task commits in the same transaction.
+        crud.lock_task(db, task.id)
+        return _latest_approval_id(db, task.id) == before
+
     waiting = langgraph_client.is_waiting_for_human(state)
-    project_run_state(db, task, langgraph_client.extract_values(state), waiting)
-    return waiting
+    project_run_state(db, task, langgraph_client.extract_values(state), waiting, status_guard=_no_newer_decision)
+    return True
+
+
+def _latest_approval_id(db: Session, task_id: int) -> int | None:
+    latest = (
+        db.query(models.Approval.id)
+        .filter(models.Approval.task_id == task_id)
+        .order_by(models.Approval.id.desc())
+        .first()
+    )
+    return latest[0] if latest else None
 
 
 async def settle_failed_delivery(db: Session, task: models.Task, approval_id: int, exc: BaseException) -> None:
@@ -98,8 +141,7 @@ async def settle_failed_delivery(db: Session, task: models.Task, approval_id: in
         return
     if not isinstance(exc, Exception):
         return
-    db.rollback()
     try:
-        await refresh_from_platform(db, task)
+        await refresh_from_platform(db, task, expected_latest_approval_id=approval_id)
     except Exception:  # noqa: BLE001 - unreadable state leaves the task closed, by design
         db.rollback()
