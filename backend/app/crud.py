@@ -522,10 +522,18 @@ def record_approval(
         raise StaleArtifactError(
             f"Task {task_id}: the decision targeted draft v{artifact_version} but the latest is v{shown.version}"
         )
-    # A row the 009 backfill did not reach (SQLite test schema, or content
-    # added outside the app) has no commitment yet; compute it in memory so
-    # the checks below run on it, and persist it only once they pass.
-    shown_commitment = shown.commitment or ledger.compute_artifact_commitment(shown.content)
+    # The commitment is always recomputed from the bytes the reviewer is shown.
+    # A stored one is a claim about those bytes, not a substitute for them: if
+    # the content was changed underneath it, binding the stored value would
+    # record approval of text nobody reviewed. A row the 009 backfill did not
+    # reach (SQLite test schema, or content added outside the app) has no
+    # commitment yet; it is persisted below once the checks pass.
+    shown_commitment = ledger.compute_artifact_commitment(shown.content)
+    if shown.commitment is not None and shown.commitment != shown_commitment:
+        raise CommitmentMismatchError(
+            f"Task {task_id}: draft v{shown.version} no longer matches its recorded commitment; "
+            "its content was changed after it was committed"
+        )
     if expected_commitment is not None and shown_commitment != expected_commitment:
         raise StaleArtifactError(
             f"Task {task_id}: draft v{shown.version} no longer has the commitment the decision targeted"

@@ -149,6 +149,19 @@ def test_a_decision_on_a_superseded_commitment_is_refused(db, self_actor):
     assert crud.get_approvals(db, task.id) == []
 
 
+def test_content_changed_under_its_commitment_cannot_be_approved(db, self_actor):
+    """The stored commitment is checked against the bytes, never trusted in their place."""
+    task, shown = _task_with_draft(db, "what was committed")
+    db.execute(text("UPDATE drafts SET content = 'changed underneath' WHERE id = :id"), {"id": shown.id})
+    db.commit()
+    db.expire_all()
+
+    with pytest.raises(crud.CommitmentMismatchError):
+        crud.record_approval(db, task.id, self_actor.id, "approved", expected_commitment=shown.commitment)
+    db.rollback()
+    assert crud.get_approvals(db, task.id) == []
+
+
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):
     task, shown = _task_with_draft(db, "original")
 
