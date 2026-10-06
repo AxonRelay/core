@@ -1116,8 +1116,6 @@ def check_conflicts(repo: str, paths: list[str], session_id: int | None = None, 
     _free_text_surface()
     with _session() as _db:
         authz.check_session_owner(_db, session_id)
-        if force:
-            authz.check_may_force_claim(_db)
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         conflicts = coordination.find_conflicts(
@@ -1156,6 +1154,8 @@ def claim_territory(
     _free_text_surface()
     with _session() as _db:
         authz.check_session_owner(_db, session_id)
+        if force:
+            authz.check_may_force_claim(_db)
     resolved_mode = models.ClaimModeEnum(mode)
     with _session() as db:
         result = coordination.claim_territory(

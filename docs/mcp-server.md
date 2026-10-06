@@ -178,7 +178,7 @@ Actor 名も `actor_ref` に置き換わり、これは MCP と REST の両方�
 | `end_session(session_id)` | 離脱。保持中の claim をすべて解放 |
 | `get_board(repo?)` | **1コールで全体像** — 稼働セッション / 有効な claim / 未 ack の relay |
 | `check_conflicts(repo, paths, session_id?, mode?)` | claim せずに衝突だけ問い合わせる |
-| `claim_territory(session_id, paths, reason?, mode?, ttl_minutes?, force?)` | 編集するパスの助言的リースを取る。**衝突時は拒否**し、保持者（誰が / どのマシン / どの clone）を返す |
+| `claim_territory(session_id, paths, reason?, mode?, ttl_minutes?, force?)` | 編集するパスの助言的リースを取る。**衝突時は拒否**し、保持者（誰が / どのマシン / どの clone）を返す。`force=true` は衝突する claim を解放するので、credential では human Actor か `administration` に限る |
 | `release_territory(claim_id? \| session_id?)` | claim を返す |
 | `send_relay(from_session_id, subject, body?, kind?, to_actor_id? \| to_workspace_id? \| to_repo?)` | 永続メッセージを投函。宛先未指定は全体ブロードキャスト |
 | `read_inbox(session_id, include_acked?, limit?)` | 自分宛を読む（既読になる。ack するまで残る） |

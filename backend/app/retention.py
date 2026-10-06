@@ -161,17 +161,24 @@ def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) 
     # addressed to holds an acked receipt. Ended sessions will not read again
     # and are not waited for. A broadcast only ever leaves on the long window
     # (UNACKED_RELAY_DAYS) - its audience includes sessions not yet started.
+    # `addressed`: every session a relay was for, ended ones included - only
+    # their acks count (an ack from outside the audience, which ack_relay
+    # once accepted, is not a delivery). `audience`: the live subset, all of
+    # which must have acked.
+    addressed: dict[int, set[int]] = {}
     audience: dict[int, set[int]] = {}
-    live_sessions = db.query(models.Session).filter(models.Session.status != models.SessionStatusEnum.ENDED).all()
-    for session in live_sessions:
-        addressed = (
+    for session in db.query(models.Session).all():
+        rows = (
             db.query(models.Relay.id)
             .filter(coordination._addressed_to(session))
             .filter(or_(models.Relay.from_session_id.is_(None), models.Relay.from_session_id != session.id))
             .filter(models.Relay.created_at < acked_cutoff)
         )
-        for (relay_id,) in addressed:
-            audience.setdefault(relay_id, set()).add(session.id)
+        live = session.status != models.SessionStatusEnum.ENDED
+        for (relay_id,) in rows:
+            addressed.setdefault(relay_id, set()).add(session.id)
+            if live:
+                audience.setdefault(relay_id, set()).add(session.id)
 
     doomed_relays = []
     for relay in db.query(models.Relay).filter(models.Relay.created_at < acked_cutoff).all():
@@ -184,7 +191,11 @@ def sweep(db: DBSession, *, now: datetime | None = None, dry_run: bool = False) 
         # Delivered: somebody it was for acked it, and every live session it
         # is addressed to has. A receipt left unacked by a session that has
         # since ended does not hold it back - that session will not read again.
-        acked_by = {r.session_id for r in (relay.receipts or []) if r.acked_at is not None}
+        acked_by = {
+            r.session_id
+            for r in (relay.receipts or [])
+            if r.acked_at is not None and r.session_id in addressed.get(relay.id, set())
+        }
         if acked_by and audience.get(relay.id, set()) <= acked_by:
             doomed_relays.append(relay)
 
