@@ -1114,13 +1114,14 @@ def release_territory(claim_id: int | None = None, session_id: int | None = None
     with _session() as db:
         authz.check_session_owner(db, session_id)
         if claim_id is not None:
-            claim = coordination.release_claim(db, claim_id)
-            if claim is not None:
-                # A claim id names a session too; releasing another Actor's
-                # territory is the same forgery as ending its session.
-                authz.check_session_owner(db, claim.session_id)
+            claim = db.query(models.Claim).filter(models.Claim.id == claim_id).first()
             if not claim:
                 raise ValueError(f"Claim {claim_id} not found")
+            # A claim id names a session too; releasing another Actor's
+            # territory is the same forgery as ending its session. Checked
+            # before the release, which commits: a refusal must change nothing.
+            authz.check_session_owner(db, claim.session_id)
+            claim = coordination.release_claim(db, claim_id)
             return {"released": 1, "claim": claim_to_dict(claim)}
         return {"released": coordination.release_session_claims(db, session_id)}
 
