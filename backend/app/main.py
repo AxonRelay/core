@@ -478,10 +478,10 @@ def _record_decision(db: Session, **kwargs) -> models.Approval:
     """
     authz.check_may_approve(db, kwargs["task_id"])
     try:
-        return crud.record_approval(db, **kwargs)
+        return crud.record_approval(db, claim_waiting=True, **kwargs)
     except crud.TaskNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    except (crud.StaleArtifactError, crud.ArtifactRequiredError) as e:
+    except (crud.StaleArtifactError, crud.ArtifactRequiredError, crud.DecisionNotOpenError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except crud.LedgerError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -529,8 +529,13 @@ async def approve_task_endpoint(
                 "modified_draft": approve_data.modified_draft,
             },
         )
-    except langgraph_client.PlatformNotConfiguredError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        # Recorded but unconfirmed: reopen so a person can re-drive it after
+        # checking the thread. Nothing re-sends it automatically.
+        crud.reopen_decision(db, task_id, approval.id)
+        if isinstance(e, langgraph_client.PlatformNotConfiguredError):
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        raise
 
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)
@@ -578,8 +583,11 @@ async def reject_task_endpoint(
                 "human_comment": combined_comment,
             },
         )
-    except langgraph_client.PlatformNotConfiguredError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        crud.reopen_decision(db, task_id, approval.id)  # as in approve_task_endpoint
+        if isinstance(e, langgraph_client.PlatformNotConfiguredError):
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        raise
 
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)

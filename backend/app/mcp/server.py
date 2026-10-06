@@ -466,9 +466,10 @@ async def _apply_decision(
         # The recorded reviewer is the authenticated caller, never a parameter.
         reviewer_actor_id = authz.acting_actor_id(db)
 
-        if task.status != models.TaskStatusEnum.WAITING_APPROVAL:
-            raise ValueError(f"Task {task_id} is not waiting for approval (status={task.status})")
-
+        # Whether the task is waiting is decided inside record_approval, under
+        # the task lock and *after* the decision_key lookup: a retry of a
+        # decision that already moved the task on must get its replay, not a
+        # "not waiting" error.
         try:
             approval = crud.record_approval(
                 db,
@@ -480,6 +481,7 @@ async def _apply_decision(
                 expected_commitment=expected_commitment,
                 modified_draft=modified_draft if action == "approved" else None,
                 decision_key=_scope_to_reviewer(decision_key, reviewer_actor_id),
+                claim_waiting=True,
             )
         except crud.DuplicateDecisionError as e:
             # Either a replay of a round already recorded, or a genuinely new
@@ -518,7 +520,13 @@ async def _apply_decision(
         resume_payload = {"decision": action, "human_comment": comment}
         if action == "approved":
             resume_payload["modified_draft"] = modified_draft
-        result = await _deliver(task, resume_payload, approval.id)
+        try:
+            result = await _deliver(task, resume_payload, approval.id)
+        except BaseException:
+            # Recorded but unconfirmed: reopen so the re-drive `_deliver`
+            # describes is possible. Nothing re-sends it.
+            crud.reopen_decision(db, task_id, approval.id)
+            raise
         _sync_state(db, task, result)
         db.refresh(task)
         payload = task_to_dict(task)
