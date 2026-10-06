@@ -162,6 +162,69 @@ def test_content_changed_under_its_commitment_cannot_be_approved(db, self_actor)
     assert crud.get_approvals(db, task.id) == []
 
 
+def _waiting(db, content="draft"):
+    task, draft = _task_with_draft(db, content, title="waiting")
+    task.status = models.TaskStatusEnum.WAITING_APPROVAL
+    db.commit()
+    return task, draft
+
+
+def test_a_second_decision_on_one_waiting_question_is_refused(db, self_actor):
+    """Both callers saw WAITING_APPROVAL before the lock; only the first may record."""
+    task, _ = _waiting(db)
+    crud.record_approval(db, task.id, self_actor.id, "approved", "first", claim_waiting=True)
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
+
+    with pytest.raises(crud.DecisionNotOpenError):
+        crud.record_approval(db, task.id, self_actor.id, "rejected", "second", claim_waiting=True)
+    db.rollback()
+    assert [a.comment for a in crud.get_approvals(db, task.id)] == ["first"]
+
+
+def test_a_replay_is_answered_even_after_its_decision_moved_the_task_on(db, self_actor):
+    task, _ = _waiting(db)
+    crud.record_approval(db, task.id, self_actor.id, "approved", "ok", decision_key="k1", claim_waiting=True)
+    with pytest.raises(crud.DuplicateDecisionError):
+        crud.record_approval(db, task.id, self_actor.id, "approved", "ok", decision_key="k1", claim_waiting=True)
+
+
+def test_a_failed_delivery_reopens_only_its_own_decision(db, self_actor):
+    task, _ = _waiting(db)
+    first = crud.record_approval(db, task.id, self_actor.id, "rejected", "no", claim_waiting=True)
+
+    assert crud.reopen_decision(db, task.id, first.id) is True
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+    second = crud.record_approval(db, task.id, self_actor.id, "approved", "re-driven", claim_waiting=True)
+    assert crud.reopen_decision(db, task.id, first.id) is False  # no longer the latest entry
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
+    assert second.id != first.id
+
+
+def test_an_mcp_decision_that_the_graph_did_not_confirm_can_be_re_driven(mcp_db, self_actor, monkeypatch):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from app import langgraph_client
+
+    task, _ = _waiting(mcp_db)
+    task.thread_id = "t-undelivered"
+    mcp_db.commit()
+
+    async def _down(*a, **k):
+        raise ConnectionError("platform unreachable")
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _down)
+    with pytest.raises(ToolError):
+        asyncio.run(server.approve_task(task.id, comment="ship"))
+    assert crud.get_task(mcp_db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+
+    async def _up(*a, **k):
+        return {}
+
+    monkeypatch.setattr(langgraph_client, "resume_thread", _up)
+    asyncio.run(server.approve_task(task.id, comment="ship, again"))
+    assert len(crud.get_approvals(mcp_db, task.id)) == 2
+
+
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):
     task, shown = _task_with_draft(db, "original")
 

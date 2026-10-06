@@ -345,6 +345,10 @@ class StaleArtifactError(LedgerError):
     """The decision targeted a draft version / commitment that is no longer the latest."""
 
 
+class DecisionNotOpenError(LedgerError):
+    """The task is not waiting for a decision (any more) - checked under the task lock."""
+
+
 class CommitmentMismatchError(LedgerError):
     """A supplied commitment does not match the artifact content."""
 
@@ -392,7 +396,9 @@ def _lock_task(db: Session, task_id: int) -> models.Task:
     writers at the database level anyway. On Postgres it is a real `SELECT ...
     FOR UPDATE`, held until the caller commits.
     """
-    task = db.query(models.Task).filter(models.Task.id == task_id).with_for_update().first()
+    # populate_existing: the caller may already hold this Task in the session,
+    # and a check made under the lock must see the row as it is now.
+    task = db.query(models.Task).filter(models.Task.id == task_id).with_for_update().populate_existing().first()
     if task is None:
         raise TaskNotFoundError(f"Task {task_id} not found")
     return task
@@ -472,6 +478,7 @@ def record_approval(
     expected_commitment: str | None = None,
     modified_draft: str | None = None,
     decision_key: str | None = None,
+    claim_waiting: bool = False,
 ):
     """Record an approval / rejection event bound to the artifact it decided on.
 
@@ -496,6 +503,13 @@ def record_approval(
       the task row lock, so of two racing rounds exactly one is told it wrote;
       migration 013's unique index is the backstop if they reach the table on
       separate connections anyway.
+    * `claim_waiting` is what every decision *surface* passes. Under the same
+      lock it requires the task to be WAITING_APPROVAL (`DecisionNotOpenError`
+      otherwise) and moves it to APPROVED / REJECTED in the same commit as the
+      entry. A status check before the lock is not enough: two decisions
+      could both see WAITING_APPROVAL, both be recorded, and both be sent to
+      the graph - the second answering whatever question it has reached by
+      then. If delivery then fails, `reopen_decision` puts the task back.
 
     created_at is set explicitly here (not via the column default) so the value
     that is hashed is exactly the value persisted.
@@ -511,7 +525,7 @@ def record_approval(
     """
     # Lock the task row *before* reading drafts or the chain head, so a
     # concurrent writer on the same task waits here rather than racing us.
-    _lock_task(db, task_id)
+    task = _lock_task(db, task_id)
 
     # Idempotency first: a replay must not append a draft version either, so
     # this runs before `modified_draft` is considered and before the staleness
@@ -520,6 +534,9 @@ def record_approval(
         already = find_decision(db, task_id, decision_key)
         if already is not None:
             raise DuplicateDecisionError(already)
+
+    if claim_waiting and task.status != models.TaskStatusEnum.WAITING_APPROVAL:
+        raise DecisionNotOpenError(f"Task {task_id} is not waiting for approval (status={task.status})")
 
     shown = _latest_draft(db, task_id)
     if shown is None:
@@ -595,9 +612,36 @@ def record_approval(
         decision_key=decision_key,
     )
     db.add(db_approval)
+    if claim_waiting:
+        task.status = models.TaskStatusEnum.APPROVED if action == "approved" else models.TaskStatusEnum.REJECTED
     db.commit()
     db.refresh(db_approval)
     return db_approval
+
+
+def reopen_decision(db: Session, task_id: int, approval_id: int) -> bool:
+    """Put a task back to WAITING_APPROVAL after its decision failed to reach the graph.
+
+    Only when that decision is still the task's latest entry and the task is
+    still where `record_approval(claim_waiting=True)` left it: if anything has
+    moved since (a projection, another decision), the task is not reopened.
+    Nothing is re-sent; this only lets a person re-drive the decision after
+    checking the thread, which records a second entry - the truth.
+    """
+    db.rollback()
+    task = _lock_task(db, task_id)
+    latest = (
+        db.query(models.Approval).filter(models.Approval.task_id == task_id).order_by(models.Approval.id.desc()).first()
+    )
+    reopen = (
+        latest is not None
+        and latest.id == approval_id
+        and task.status in (models.TaskStatusEnum.APPROVED, models.TaskStatusEnum.REJECTED)
+    )
+    if reopen:
+        task.status = models.TaskStatusEnum.WAITING_APPROVAL
+    db.commit()
+    return reopen
 
 
 def get_approvals(db: Session, task_id: int):

@@ -450,6 +450,54 @@ class TestConcurrentApprovals:
         finally:
             check.close()
 
+    def test_racing_decisions_on_one_waiting_task_record_exactly_one(self, migrated_engine):
+        """What every surface does: `claim_waiting=True`. One decision per waiting question.
+
+        The status check runs under the task row lock, so of eight reviewers
+        deciding at once exactly one is recorded and the rest are told the task
+        is no longer waiting - none of them reaches the graph a second time.
+        """
+        factory = sessionmaker(bind=migrated_engine, autoflush=False)
+
+        setup = factory()
+        actor = models.Actor(type=models.ActorTypeEnum.HUMAN, name="decider")
+        task = models.Task(thread_id="parity-decide", title="decide", status=models.TaskStatusEnum.WAITING_APPROVAL)
+        setup.add_all([actor, task])
+        setup.commit()
+        crud.add_draft(setup, task_id=task.id, content="the draft under review")
+        task_id, actor_id = task.id, actor.id
+        setup.close()
+
+        barrier = threading.Barrier(self.WRITERS)
+        outcomes: list[str] = []
+
+        def decide(index: int) -> None:
+            session = factory()
+            try:
+                barrier.wait(timeout=30)
+                action = "approved" if index % 2 else "rejected"
+                crud.record_approval(session, task_id, actor_id, action, f"reviewer-{index}", claim_waiting=True)
+                outcomes.append("recorded")
+            except crud.DecisionNotOpenError:
+                outcomes.append("refused")
+            except Exception as exc:  # noqa: BLE001 - reported as a test failure
+                outcomes.append(f"{type(exc).__name__}: {exc}")
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=decide, args=(i,)) for i in range(self.WRITERS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert sorted(outcomes) == ["recorded"] + ["refused"] * (self.WRITERS - 1)
+        check = factory()
+        try:
+            assert len(crud.get_approvals(check, task_id)) == 1
+        finally:
+            check.close()
+
     def test_racing_editors_each_get_their_own_version_and_one_chain(self, migrated_engine):
         """Approvals that carry a modified draft race on the *draft* table too.
 
