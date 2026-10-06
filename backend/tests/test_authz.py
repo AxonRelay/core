@@ -315,7 +315,9 @@ def test_an_approval_is_attributed_to_the_credential_not_a_parameter(client, db,
     task = _waiting_task(db)
     crud.create_task_assignment(db, task.id, agent.id, models.AssignmentRoleEnum.APPROVER)
 
-    response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ok"}, headers=_auth(token))
+    response = client.post(
+        f"/tasks/{task.id}/approve", json={"comment": "ok", "artifact_version": 1}, headers=_auth(token)
+    )
 
     assert response.status_code == 200
     assert response.json()["reviewer_actor_id"] == agent.id
@@ -403,10 +405,24 @@ def test_a_human_credential_may_approve_without_an_assignment(client, db, self_a
     token, _ = _credential(db, self_actor, {authz.Scope.LEDGER_WRITE})
     task = _waiting_task(db, "t-human")
 
-    response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ok"}, headers=_auth(token))
+    response = client.post(
+        f"/tasks/{task.id}/approve", json={"comment": "ok", "artifact_version": 1}, headers=_auth(token)
+    )
 
     assert response.status_code == 200
     assert response.json()["reviewer_actor_id"] == self_actor.id
+
+
+def test_a_credentialed_decision_must_name_its_draft(client, db, self_actor, enforced, no_platform):
+    """Unbound, a retry after a lost response would decide on a draft nobody has seen."""
+    token, _ = _credential(db, self_actor, {authz.Scope.LEDGER_WRITE})
+    task = _waiting_task(db, "t-unbound")
+
+    response = client.post(f"/tasks/{task.id}/approve", json={"comment": "ok"}, headers=_auth(token))
+
+    assert response.status_code == 403
+    assert "artifact_version" in response.json()["detail"]
+    assert crud.get_approvals(db, task.id) == []
 
 
 def test_without_enforcement_approving_is_unchanged(client, db, self_actor, unenforced, no_platform):

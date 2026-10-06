@@ -12,7 +12,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app import crud, models
+from app import crud, langgraph_client, models
 
 
 def project_run_state(
@@ -64,3 +64,42 @@ def project_run_state(
         current_draft=current_draft,
         feedback=feedback,
     )
+
+
+async def refresh_from_platform(db: Session, task: models.Task) -> bool:
+    """Read the thread's current state from Platform and project it. Returns "waiting".
+
+    This is how a task whose decision was recorded but never confirmed gets
+    back to WAITING_APPROVAL: not by assuming anything about the failed call,
+    but because Platform itself says the graph is waiting for a human. If the
+    graph already answered and moved on, the projection shows that instead.
+    """
+    state = await langgraph_client.get_state(task.thread_id)
+    waiting = langgraph_client.is_waiting_for_human(state)
+    project_run_state(db, task, langgraph_client.extract_values(state), waiting)
+    return waiting
+
+
+async def settle_failed_delivery(db: Session, task: models.Task, approval_id: int, exc: BaseException) -> None:
+    """After a decision's one delivery attempt failed, put the task where Platform says it is.
+
+    * Platform not configured: nothing was sent, so the decision is reopened.
+    * Anything else may have been accepted (a timeout after acceptance looks
+      like any other error), so nothing is assumed: the thread's state is read
+      and projected. Only if Platform reports the graph waiting does the task
+      return to WAITING_APPROVAL.
+    * If the state cannot be read, or the request was cancelled, the task stays
+      APPROVED / REJECTED - closed to new decisions - until `refresh_task`
+      reads it. Reopening blind would let a second decision answer a question
+      the graph may already have moved past.
+    """
+    if isinstance(exc, langgraph_client.PlatformNotConfiguredError):
+        crud.reopen_decision(db, task.id, approval_id)
+        return
+    if not isinstance(exc, Exception):
+        return
+    db.rollback()
+    try:
+        await refresh_from_platform(db, task)
+    except Exception:  # noqa: BLE001 - unreadable state leaves the task closed, by design
+        db.rollback()

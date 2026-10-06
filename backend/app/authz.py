@@ -111,6 +111,10 @@ class ActorMismatch(AuthzError):
     """
 
 
+class UnboundDecision(AuthzError):
+    """A credentialed decision did not name the draft it decides on."""
+
+
 class ApprovalNotPermitted(AuthzError):
     """A credential that may write to the ledger but may not approve *this* task."""
 
@@ -387,6 +391,26 @@ def check_may_approve(db: Session, task_id: int) -> None:
     raise ApprovalNotPermitted("this Actor is not an approver on this task; assign it the 'approver' role first")
 
 
+def check_decision_is_bound(artifact_version: int | None, expected_commitment: str | None) -> None:
+    """Refuse a credentialed decision that does not say which draft it is about.
+
+    An unbound decision means "whatever is current". Over a network that is a
+    hazard: if the first call went through, the graph moved to a new draft,
+    and the response was lost, a client's retry would record and send the same
+    decision on a draft nobody has seen. Bound to a version or commitment, the
+    retry is refused as stale instead. The operator's own loopback calls keep
+    the convenience.
+    """
+    principal = _current.get()
+    if principal is None or principal.source != "credential":
+        return
+    if artifact_version is None and expected_commitment is None:
+        logger.info("authz refused an unbound decision")
+        raise UnboundDecision(
+            "a credentialed decision must name the draft it decides on: pass artifact_version or expected_commitment"
+        )
+
+
 def check_may_grant_approver(db: Session) -> None:
     """May this caller give an Actor the `approver` role on a task?
 
@@ -426,6 +450,7 @@ TOOL_SCOPES: dict[str, Scope] = {
     "create_task": Scope.LEDGER_WRITE,
     "run_task": Scope.LEDGER_WRITE,
     "approve_task": Scope.LEDGER_WRITE,
+    "refresh_task": Scope.LEDGER_WRITE,
     "reject_task": Scope.LEDGER_WRITE,
     "review_pending_task": Scope.LEDGER_WRITE,
     "create_agent": Scope.LEDGER_WRITE,
@@ -499,6 +524,7 @@ ROUTE_SCOPES: dict[tuple[str, str], Scope | None] = {
     ("DELETE", "/tasks/{task_id}"): Scope.ADMINISTRATION,
     ("POST", "/tasks/{task_id}/run"): Scope.LEDGER_WRITE,
     ("POST", "/tasks/{task_id}/approve"): Scope.LEDGER_WRITE,
+    ("POST", "/tasks/{task_id}/refresh"): Scope.LEDGER_WRITE,
     ("POST", "/tasks/{task_id}/reject"): Scope.LEDGER_WRITE,
     ("GET", "/tasks/{task_id}/drafts"): Scope.LEDGER_READ,
     ("GET", "/tasks/{task_id}/approvals"): Scope.LEDGER_READ,

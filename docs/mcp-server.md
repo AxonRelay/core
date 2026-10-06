@@ -74,7 +74,8 @@ claude mcp add -s user -t http axonrelay http://<host>.<tailnet>.ts.net:8765/mcp
 | `get_drafts(task_id)` | ドラフト履歴（各版の `commitment` = 本文 SHA-256 と `producer_actor_id` を含む） |
 | `create_task(title, description?, assignments?)` | 新規タスク + Platform thread 確保 |
 | `run_task(task_id)` | Platform 上で graph 実行 → 承認待ちまで |
-| `approve_task(task_id, comment?, modified_draft?, artifact_version?, expected_commitment?)` | 承認（任意で edit）。`artifact_version` / `expected_commitment` を渡すと**読んだ版に束縛**され、task が先に進んでいれば何も記録せず `status="stale_decision"` を返す。`modified_draft` は新しい draft 版として保存され、承認はその版に束縛される。戻り値に `approval`（束縛と hash を含む）を同梱 |
+| `refresh_task(task_id)` | thread の現在の状態を Platform から読み直して投影する。記録したが graph が確認しなかった判断の後、task は Platform が「人を待っている」と言うまで新しい判断を受け付けない——その確認に使う。何も再送しない |
+| `approve_task(task_id, comment?, modified_draft?, artifact_version?, expected_commitment?)` | 承認（任意で edit）。`artifact_version` / `expected_commitment` を渡すと**読んだ版に束縛**され、task が先に進んでいれば何も記録せず `status="stale_decision"` を返す。`modified_draft` は新しい draft 版として保存され、承認はその版に束縛される。戻り値に `approval`（束縛と hash を含む）を同梱。**credential で呼ぶときは束縛引数が必須**（応答を失った再送が次の版への判断にならないように）。1 つの承認待ちに記録される判断は 1 つ |
 | `reject_task(task_id, comment?, reason?, artifact_version?, expected_commitment?)` | 差戻し（revision loop）。束縛引数の意味は `approve_task` と同じ |
 | `review_pending_task(task_id)` | **対話的承認** — MCP `elicitation` でドラフトを提示し承認/差戻しを尋ね、台帳記録 + resume まで一括。問いの運び方は交渉した改訂に従う（下の[互換性マトリクス](#mcp-互換性マトリクス)）。表示した draft の版と commitment に判断を束縛するので、待っている間に draft が差し替わると**もう一度尋ねられる**（新しい draft について）。task が承認待ちを離れていれば `stale_decision`。form elicitation 非対応のクライアントには何も尋ねず、`status="elicitation_unsupported"` と束縛引数つきで `approve_task`/`reject_task` を案内する |
 | `verify_task_ledger(task_id)` | 承認 hash chain の改ざん検証（`{valid, broken_at, count, legacy, artifact_bound, unbound}`。`legacy` は hash chain 導入前の行数、`artifact_bound` は判断対象の draft 版と commitment を名指しする行数、`unbound` はそれ以外。[ADR-009](./adr-009-artifact-commitment.md)） |

@@ -56,6 +56,7 @@ Envelope は Pydantic model（`extra="forbid"`）で、JSON Schema を
 | `artifact_commitment_algorithm?` | `app.ledger.COMMITMENT_ALGORITHM` と同一の値のみ（ADR-009 と同じラベル） |
 | `artifact_version?` | 整数 ≥ 1 |
 | `occurred_at` | timezone-aware datetime |
+| （サーバが付与）`submitted_by` | 提出した credential の Actor（loopback ならオペレータ）。`actor_id` は producer の**主張**で検証できないので、サーバが知っている提出者を別列に記録し、opaque ref で返す |
 | `producer_signature?` | Ed25519 署名の形（base64url 86 文字、末尾 `==` 可）。保存・返却のみで検証はしない。検証しない欄を実際の署名より広くしない |
 
 `title` / `description` / `prompt` / `draft` / `feedback` / `body` / `subject` /
@@ -112,9 +113,10 @@ route は「拒否」「読み取り専用（id / enum のみ）」「envelope�
   必要もない。署名欄を実在の署名長に絞っているのは、検証しない欄を最大の経路に
   しないためである
 
-- MCP SDK の入力スキーマ違反（例: `envelope` に文字列を渡す）は SDK が
-  `input_value` 付きで返す。トップレベルの型違反であり、フィールド内容ではないが、
-  文書化しておく
+- MCP SDK は tool のコードより前に引数を検証し、その pydantic エラーは `input_value`
+  を含む。safe mode ではここが拒否された値がサーバを出る唯一の経路になるため、
+  `mcp.call_tool` を包んで**フィールド名だけ**の固定文言に置き換える（envelope の拒否と
+  同じ形。ワイヤ越しのテストで固定）。safe mode でなければ SDK の文言のまま返す
 - uvicorn の access log はクエリ文字列を含む（`GET /coordination/git/guard?clone_path=...`）。
   #26 の範囲
 

@@ -477,6 +477,7 @@ def _record_decision(db: Session, **kwargs) -> models.Approval:
     text names versions only, never content.
     """
     authz.check_may_approve(db, kwargs["task_id"])
+    authz.check_decision_is_bound(kwargs.get("artifact_version"), kwargs.get("expected_commitment"))
     try:
         return crud.record_approval(db, claim_waiting=True, **kwargs)
     except crud.TaskNotFoundError as e:
@@ -485,6 +486,32 @@ def _record_decision(db: Session, **kwargs) -> models.Approval:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except crud.LedgerError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+async def _settle(db: Session, task: models.Task, approval_id: int, exc: BaseException) -> None:
+    """`service.settle_failed_delivery`, skipped for a cancellation (nothing may be awaited then)."""
+    if isinstance(exc, Exception):
+        await service.settle_failed_delivery(db, task, approval_id, exc)
+
+
+@app.post("/tasks/{task_id}/refresh", response_model=TaskWithAssignmentsResponse)
+@limiter.limit("30/minute")
+async def refresh_task_endpoint(
+    request: Request,
+    task_id: int,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
+):
+    """Re-read the thread from Platform and project it - the recovery path for an unconfirmed decision."""
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        await service.refresh_from_platform(db, task)
+    except langgraph_client.PlatformNotConfiguredError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    db.refresh(task)
+    return task
 
 
 @app.post("/tasks/{task_id}/approve", response_model=ApprovalResponse)
@@ -529,10 +556,10 @@ async def approve_task_endpoint(
                 "modified_draft": approve_data.modified_draft,
             },
         )
-    except Exception as e:
-        # Recorded but unconfirmed: reopen so a person can re-drive it after
-        # checking the thread. Nothing re-sends it automatically.
-        crud.reopen_decision(db, task_id, approval.id)
+    except BaseException as e:
+        # Recorded but unconfirmed. Nothing re-sends it; the task goes where
+        # Platform says it is (service.settle_failed_delivery).
+        await _settle(db, task, approval.id, e)
         if isinstance(e, langgraph_client.PlatformNotConfiguredError):
             raise HTTPException(status_code=503, detail=str(e)) from e
         raise
@@ -583,8 +610,8 @@ async def reject_task_endpoint(
                 "human_comment": combined_comment,
             },
         )
-    except Exception as e:
-        crud.reopen_decision(db, task_id, approval.id)  # as in approve_task_endpoint
+    except BaseException as e:
+        await _settle(db, task, approval.id, e)  # as in approve_task_endpoint
         if isinstance(e, langgraph_client.PlatformNotConfiguredError):
             raise HTTPException(status_code=503, detail=str(e)) from e
         raise

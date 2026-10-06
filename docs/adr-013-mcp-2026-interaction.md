@@ -80,9 +80,15 @@ unique index は、ロックをすり抜けた二重書き込みの最後の砦�
 下の段落のとおり誰も見ていない問いに答える。そこで surface は `record_approval` に
 `claim_waiting=True` を渡し、**task 行ロックの下で**（キーの照合の後に）状態を確かめ、
 エントリと同じコミットで task を `APPROVED` / `REJECTED` に移す。2 人目は
-`DecisionNotOpenError` で止まり、resume しない。配送が失敗したら `reopen_decision` が
-task を `WAITING_APPROVAL` に戻す——その判断がまだ最新のエントリである場合に限る。
-これで下に書く「人が送り直す」経路が残る。`tasks.status` はハッシュの外の可変列だが、
+`DecisionNotOpenError` で止まり、resume しない。配送が失敗したときの扱いは、
+失敗が送信前かどうかで分ける。Platform 未設定（何も送っていない）なら `reopen_decision` が
+すぐ `WAITING_APPROVAL` に戻す——その判断がまだ最新のエントリである場合に限る。それ以外の
+失敗は受理後のタイムアウトと見分けがつかないので**何も仮定しない**: thread の状態を読んで
+投影し、Platform が「人を待っている」と言うときだけ `WAITING_APPROVAL` になる。読めない
+とき・キャンセルされたときは `APPROVED` / `REJECTED` のまま新しい判断を受け付けず、
+`refresh_task`（REST は `POST /tasks/{id}/refresh`）が読み直すまで待つ。盲目的に開け直すと、
+graph がすでに先へ進んでいた場合に 2 件目の判断がその先の問いに答えてしまう。
+これで下に書く「人が送り直す」経路が、graph の実際の状態に基づいて残る。`tasks.status` はハッシュの外の可変列だが、
 書き換えて得られるのは「もう 1 件判断を**記録できる**」ことだけで、記録済みの判断を
 変えたり消したりはできない。
 

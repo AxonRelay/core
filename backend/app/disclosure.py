@@ -305,6 +305,11 @@ def _ref(row) -> str | None:
     return row.opaque_id
 
 
+def actor_ref(actor: models.Actor | None) -> str | None:
+    """An Actor's opaque reference, for surfaces that name an Actor in either mode."""
+    return _ref(actor)
+
+
 def _repo(value: str | None) -> str | None:
     """A repository slug is a public identifier; disclose it under that policy only."""
     if not safe_mode() or public_identifiers_allowed():
