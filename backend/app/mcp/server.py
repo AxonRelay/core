@@ -200,19 +200,29 @@ class AuthorizationMiddleware:
         return None
 
 
-def _without_input_values(error: ToolError) -> ToolError:
+def _without_input_values(error: ToolError, tool_name: str) -> ToolError:
     """In safe mode, an argument-validation error names fields, never the values.
 
     The SDK validates tool arguments before any tool code runs - so before
     `_free_text_surface` can refuse - and its pydantic message carries
     `input_value`. Outside safe mode that is a useful message to the caller
     who sent it; in safe mode it is the one place a rejected value would still
-    leave the server, so it is replaced the way envelope rejections are.
+    leave the server, so it is replaced the way envelope rejections are. A
+    name is reported only if the tool declares it: an undeclared argument's
+    name is a key the caller chose, which is caller data like a value.
     """
     cause = error.__cause__
     if not safe_envelope.safe_mode() or not isinstance(cause, PydanticValidationError):
         return error
-    fields = sorted({str(item["loc"][0]) for item in cause.errors(include_input=False) if item.get("loc")})
+    tool = mcp._tool_manager.get_tool(tool_name)
+    declared = set((tool.parameters or {}).get("properties", {})) if tool is not None else set()
+    fields = sorted(
+        {
+            str(item["loc"][0]) if str(item["loc"][0]) in declared else "(unknown argument)"
+            for item in cause.errors(include_input=False)
+            if item.get("loc")
+        }
+    )
     return ToolError(f"Error executing tool: invalid arguments: {', '.join(fields) or '(arguments)'}")
 
 
@@ -238,7 +248,7 @@ async def _call_tool_without_input_values(name, arguments, context=None, *args, 
     try:
         return await _sdk_call_tool(name, arguments, context, *args, **kwargs)
     except ToolError as e:
-        scrubbed = _without_input_values(e)
+        scrubbed = _without_input_values(e, name)
         if scrubbed is e:
             raise
         raise scrubbed from None
@@ -400,16 +410,6 @@ async def create_task(
         return task_to_dict(task)
 
 
-def _sync_state(db, task: models.Task, result: dict[str, Any]) -> None:
-    """Project a Platform run result back into the Postgres ledger.
-
-    Delegates to the shared service so the MCP and HTTP paths cannot drift.
-    """
-    values = langgraph_client.extract_values(result)
-    waiting = langgraph_client.is_waiting_for_human(result)
-    service.project_run_state(db, task, values, waiting)
-
-
 @mcp.tool()
 async def run_task(task_id: int) -> dict:
     """Kick off graph execution on Platform. Blocks until interrupt or completion."""
@@ -427,8 +427,17 @@ async def run_task(task_id: int) -> dict:
             "reviewer_comments": [],
             "iteration": 0,
         }
+        version = service.current_state_version(db, task)
+        db.rollback()  # nothing held across the Platform call
         result = await langgraph_client.run_until_interrupt(task.thread_id, initial_state)
-        _sync_state(db, task, result)
+        # Only onto the state seen before the run: a decision in between wins.
+        service.apply_snapshot(
+            db,
+            task,
+            langgraph_client.extract_values(result),
+            langgraph_client.is_waiting_for_human(result),
+            expected_version=version,
+        )
         db.refresh(task)
         return task_to_dict(task)
 
@@ -544,6 +553,8 @@ async def _apply_decision(
                 modified_draft=modified_draft if action == "approved" else None,
                 decision_key=_scope_to_reviewer(decision_key, reviewer_actor_id),
                 claim_waiting=True,
+                # Re-checked under the task lock: an assignment removed meanwhile counts.
+                authorize=lambda: authz.check_may_approve(db, task_id),
             )
         except crud.DuplicateDecisionError as e:
             # Either a replay of a round already recorded, or a genuinely new

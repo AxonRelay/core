@@ -362,6 +362,58 @@ def test_a_late_delivery_result_does_not_reopen_a_task_a_newer_decision_closed(d
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
 
 
+def test_a_decision_keeps_the_version_it_left_even_if_the_row_moves_right_after(db, self_actor, monkeypatch):
+    """Read after the commit, the version could already be a later projection's."""
+    task, _ = _waiting(db)
+    before = task.state_version or 0
+    real_commit = db.commit
+
+    def _commit_then_someone_projects():
+        real_commit()
+        db.execute(text("UPDATE tasks SET state_version = state_version + 5 WHERE id = :id"), {"id": task.id})
+        real_commit()
+
+    monkeypatch.setattr(db, "commit", _commit_then_someone_projects)
+    approval = crud.record_approval(db, task.id, self_actor.id, "approved", "ok", claim_waiting=True)
+
+    assert approval.task_state_version == before + 1
+
+
+def test_a_run_result_does_not_reopen_a_task_decided_while_it_ran(client, db, self_actor, monkeypatch):
+    from app import langgraph_client
+
+    task, draft = _waiting(db)
+
+    async def _run(*a, **k):
+        # Someone decides while the run is in flight; the run then returns "waiting".
+        crud.record_approval(db, task.id, self_actor.id, "approved", "meanwhile", claim_waiting=True)
+        return {"values": {"drafts": [draft.content]}, "next": ["human_approval"]}
+
+    monkeypatch.setattr(langgraph_client, "run_until_interrupt", _run)
+    client.post(f"/tasks/{task.id}/run")
+
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
+
+
+def test_authorization_is_rechecked_under_the_task_lock(db, self_actor):
+    """An approver assignment removed between the surface's check and the write must count."""
+    task, _ = _waiting(db)
+    calls = []
+
+    def _no_longer_allowed():
+        calls.append("authorize")
+        raise crud.LedgerError("not an approver any more")
+
+    with pytest.raises(crud.LedgerError):
+        crud.record_approval(
+            db, task.id, self_actor.id, "approved", "ok", claim_waiting=True, authorize=_no_longer_allowed
+        )
+    db.rollback()
+    assert calls == ["authorize"]
+    assert crud.get_approvals(db, task.id) == []
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+
+
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):
     task, shown = _task_with_draft(db, "original")
 
