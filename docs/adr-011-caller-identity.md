@@ -61,6 +61,12 @@ credential による承認は、**その task で `approver` assignment を持�
 **human Actor** に限る（`check_may_approve`）。データモデルは誰が承認者かをすでに
 表現していたが、それを強制するものが無かった。loopback は従来どおり。
 
+assignment を信用する以上、**`approver` を付与すること自体が承認の権限**になる。
+`ledger:write` だけの agent が自分に `approver` を付けられると、上の制限は形だけになる。
+よって credential による `approver` 付与は human Actor か `administration` scope に限る
+（`check_may_grant_approver`。全 surface が通る `crud.create_task_assignment` で確認し、
+task 作成時の付与は Platform の thread を作る前に拒否する）。
+
 ### 3. scope は 6 つ、surface は必ずどれかに割り当てる
 
 | scope | 何を許すか |
@@ -135,7 +141,7 @@ CORS の `allow_headers` に `Authorization` を含める。含めないとブ�
 | 同一プロセス・同一 DB の管理者に対する防御 | しない（非目標） |
 | OAuth 2.1 / 汎用 identity provider / マルチテナント | しない（非目標。ADR-008 の理由がそのまま生きる） |
 | 他人の session を駆動できないこと | **する**（`check_session_owner`） |
-| agent が自分の draft を承認して reviewer として記録されないこと | **する**（`check_may_approve`。`approver` assignment か human Actor が必要） |
+| agent が自分の draft を承認して reviewer として記録されないこと | **する**（`check_may_approve`。`approver` assignment か human Actor が必要。`approver` の付与は human か `administration` のみ） |
 | ブラウザからのダッシュボード利用 | CORS は通るようにしたが、credential の保管と提示はダッシュボード側の未実装分。強制下での本番利用はリバースプロキシ（Cloudflare Access 等）を前提にする |
 
 ## 代替案と却下理由

@@ -367,6 +367,28 @@ def check_may_approve(db: Session, task_id: int) -> None:
     raise ApprovalNotPermitted("this Actor is not an approver on this task; assign it the 'approver' role first")
 
 
+def check_may_grant_approver(db: Session) -> None:
+    """May this caller give an Actor the `approver` role on a task?
+
+    `check_may_approve` trusts the assignment, so handing it out is the
+    approval power itself. Under `ledger:write` alone, an agent credential
+    could assign *itself* approver and then approve its own draft — the gate
+    would hold in form and not in substance. A credential may grant the role
+    when its Actor is a human (the operator, who approves anyway) or it holds
+    `administration`. Loopback callers are the operator and unaffected.
+    """
+    principal = _current.get()
+    if principal is None or principal.source != "credential" or principal.actor_id is None:
+        return
+    if principal.has(Scope.ADMINISTRATION):
+        return
+    actor = db.query(models.Actor).filter(models.Actor.id == principal.actor_id).first()
+    if actor is not None and actor.type == models.ActorTypeEnum.HUMAN:
+        return
+    logger.info("authz refused granting the approver role")
+    raise ApprovalNotPermitted("granting the 'approver' role needs a human Actor or the 'administration' scope")
+
+
 # ------------------------------------------------------- the surface → scope maps
 
 #: Every MCP tool, mapped to the one scope it needs. A tool missing from this

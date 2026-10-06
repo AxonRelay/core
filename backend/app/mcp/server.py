@@ -334,6 +334,9 @@ async def create_task(
     _free_text_surface()
     with _session() as db:
         creator_actor_id = authz.acting_actor_id(db)
+        if any(str(a.get("role", "executor")) == models.AssignmentRoleEnum.APPROVER.value for a in assignments or []):
+            # Refuse before anything is created, the Platform thread included.
+            authz.check_may_grant_approver(db)
 
         thread_id = await langgraph_client.create_thread(
             metadata={"title": title, "creator_actor_id": creator_actor_id}
