@@ -192,10 +192,10 @@ def test_a_failed_delivery_reopens_only_its_own_decision(db, self_actor):
     task, _ = _waiting(db)
     first = crud.record_approval(db, task.id, self_actor.id, "rejected", "no", claim_waiting=True)
 
-    assert crud.reopen_decision(db, task.id, first.id) is True
+    assert crud.reopen_decision(db, task.id, first.id, first.task_state_version) is True
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
     second = crud.record_approval(db, task.id, self_actor.id, "approved", "re-driven", claim_waiting=True)
-    assert crud.reopen_decision(db, task.id, first.id) is False  # no longer the latest entry
+    assert crud.reopen_decision(db, task.id, first.id, first.task_state_version) is False  # no longer the latest entry
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
     assert second.id != first.id
 
@@ -352,7 +352,9 @@ def test_a_late_delivery_result_does_not_reopen_a_task_a_newer_decision_closed(d
 
     task, draft = _waiting(db)
     first = crud.record_approval(db, task.id, self_actor.id, "rejected", "no", claim_waiting=True)
-    assert crud.reopen_decision(db, task.id, first.id)  # e.g. a refresh saw the graph waiting again
+    assert crud.reopen_decision(
+        db, task.id, first.id, first.task_state_version
+    )  # e.g. a refresh saw the graph waiting again
     crud.record_approval(db, task.id, self_actor.id, "approved", "yes", claim_waiting=True)
 
     # The first decision's delivery result, delayed, says "waiting".
@@ -412,6 +414,21 @@ def test_authorization_is_rechecked_under_the_task_lock(db, self_actor):
     assert calls == ["authorize"]
     assert crud.get_approvals(db, task.id) == []
     assert crud.get_task(db, task.id).status == models.TaskStatusEnum.WAITING_APPROVAL
+
+
+def test_a_decision_is_not_reopened_once_anything_has_moved_the_task(db, self_actor):
+    """A projection that leaves the status alone still moves the version; reopen must see it."""
+    from app import service
+
+    task, draft = _waiting(db)
+    decided = crud.record_approval(db, task.id, self_actor.id, "approved", "ok", claim_waiting=True)
+    # The graph is mid-run: neither waiting nor finished. Status stays APPROVED, version moves.
+    assert service.apply_snapshot(
+        db, task, {"drafts": [draft.content]}, False, expected_version=decided.task_state_version
+    )
+
+    assert crud.reopen_decision(db, task.id, decided.id, decided.task_state_version) is False
+    assert crud.get_task(db, task.id).status == models.TaskStatusEnum.APPROVED
 
 
 def test_a_modified_draft_becomes_a_new_version_before_the_approval_binds_to_it(db, self_actor):

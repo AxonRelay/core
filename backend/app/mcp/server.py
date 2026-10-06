@@ -245,6 +245,10 @@ async def _call_tool_without_input_values(name, arguments, context=None, *args, 
     an `is_error` result inside `call_next`, so by the time the middleware sees
     it the value is already in the text.
     """
+    if safe_envelope.safe_mode() and mcp._tool_manager.get_tool(name) is None:
+        # The SDK would answer "Unknown tool: <name>", and the name is the
+        # caller's string.
+        raise ToolError("Unknown tool")
     try:
         return await _sdk_call_tool(name, arguments, context, *args, **kwargs)
     except ToolError as e:

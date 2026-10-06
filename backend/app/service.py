@@ -128,7 +128,7 @@ async def settle_failed_delivery(db: Session, task: models.Task, approval: model
       the graph may already have moved past.
     """
     if isinstance(exc, langgraph_client.PlatformNotConfiguredError):
-        crud.reopen_decision(db, task.id, approval.id)
+        crud.reopen_decision(db, task.id, approval.id, approval.task_state_version)
         return
     if not isinstance(exc, Exception):
         return

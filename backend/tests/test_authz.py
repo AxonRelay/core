@@ -939,3 +939,20 @@ def test_an_approver_unassigned_mid_request_cannot_record(client, db, self_actor
     monkeypatch.setattr(crud, "_lock_task", real_lock)
     db.rollback()
     assert crud.get_approvals(db, task.id) == []
+
+
+def test_removing_an_assignment_takes_the_task_lock(db, self_actor, monkeypatch):
+    """So it serializes with record_approval's under-lock approver check."""
+    agent = _make_ai(db)
+    task = _waiting_task(db, "t-revoke")
+    crud.create_task_assignment(db, task.id, agent.id, models.AssignmentRoleEnum.APPROVER)
+    locked: list[int] = []
+    real_lock = crud._lock_task
+
+    def _lock(session, task_id):
+        locked.append(task_id)
+        return real_lock(session, task_id)
+
+    monkeypatch.setattr(crud, "_lock_task", _lock)
+    assert crud.delete_task_assignment_by_actor(db, task.id, agent.id)
+    assert locked == [task.id]

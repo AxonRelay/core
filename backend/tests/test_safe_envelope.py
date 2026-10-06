@@ -630,3 +630,41 @@ def test_an_undeclared_argument_name_is_not_echoed_in_safe_mode(mcp_db, safe_mod
     assert result.is_error
     assert CANARY not in text
     assert CANARY not in caplog.text
+
+
+def test_an_unknown_tool_name_is_not_echoed_in_safe_mode(mcp_db, safe_mode):
+    from mcp.client._memory import InMemoryTransport
+    from mcp.client.session import ClientSession
+
+    async def _call():
+        async with (
+            InMemoryTransport(server.mcp, raise_exceptions=False) as streams,
+            ClientSession(*streams[:2]) as session,
+        ):
+            await session.initialize()
+            return await session.call_tool(CANARY, {})
+
+    try:
+        result = asyncio.run(_call())
+        text = " ".join(getattr(c, "text", "") for c in result.content)
+    except Exception as exc:  # noqa: BLE001 - an MCP error is also a response
+        text = str(exc)
+    assert CANARY not in text
+
+
+def test_safe_mode_rest_never_names_an_actor_even_nested(client, db, self_actor, safe_mode):
+    """Agents and assignments embed an Actor; it goes through the same policy as /actors."""
+    agent = models.Actor(type=models.ActorTypeEnum.AI, name=CANARY)
+    db.add(agent)
+    db.commit()
+    db.add(models.AgentDefinition(actor_id=agent.id, agent_type=models.AgentTypeEnum.WRITER, is_active=True))
+    task = models.Task(thread_id="t-nested", title="t")
+    db.add(task)
+    db.commit()
+    db.add(models.TaskAssignment(task_id=task.id, actor_id=agent.id, role=models.AssignmentRoleEnum.EXECUTOR))
+    db.commit()
+
+    for path in ("/agents", f"/tasks/{task.id}/assignments", f"/tasks/{task.id}"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert CANARY not in response.text, path
