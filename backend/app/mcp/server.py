@@ -1331,6 +1331,9 @@ def check_git_resource(session_id: int, resource: str) -> dict:
     """
     resolved = models.ClaimResourceEnum(resource)
     with _session() as db:
+        # The answer excludes the session's own claims, so asking as another
+        # Actor's session would clear exactly the claim meant to stop us.
+        authz.check_session_owner(db, session_id)
         return coordination.guard_git_operation(db, session_id=session_id, resource=resolved)
 
 

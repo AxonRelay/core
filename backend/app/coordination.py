@@ -908,7 +908,22 @@ def ack_relay(
 
     Acking removes it from this session's inbox but leaves it in everyone
     else's, and the receipt is what makes "who has seen this" answerable later.
+    Only a session the relay is addressed to may ack it: retention counts acked
+    receipts as delivery, so an ack from outside the audience would be a
+    forged delivery.
     """
+    session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if session is None:
+        raise ValueError(f"Session {session_id} not found")
+    addressed = (
+        db.query(models.Relay.id)
+        .filter(models.Relay.id == relay_id)
+        .filter(_addressed_to(session))
+        .filter(or_(models.Relay.from_session_id.is_(None), models.Relay.from_session_id != session_id))
+        .first()
+    )
+    if addressed is None:
+        raise ValueError(f"Relay {relay_id} is not addressed to session {session_id}")
     receipt = (
         db.query(models.RelayReceipt)
         .filter(models.RelayReceipt.relay_id == relay_id, models.RelayReceipt.session_id == session_id)
