@@ -916,3 +916,26 @@ def test_check_conflicts_answers_for_its_own_session(mcp_db, self_actor, enforce
     with authz.bind(reader):
         result = server.check_conflicts(repo="r", paths=["backend/app"], session_id=mine.id)
     assert isinstance(result, dict)
+
+
+def test_an_approver_unassigned_mid_request_cannot_record(client, db, self_actor, enforced, no_platform, monkeypatch):
+    """The surface's check passes; the assignment is deleted before the write; the write refuses."""
+    agent = _make_ai(db)
+    token, _ = _credential(db, agent, {authz.Scope.LEDGER_WRITE})
+    task = _waiting_task(db, "t-unassigned")
+    crud.create_task_assignment(db, task.id, agent.id, models.AssignmentRoleEnum.APPROVER)
+    real_lock = crud._lock_task
+
+    def _lock_after_an_admin_removed_it(session, task_id):
+        session.query(models.TaskAssignment).filter(models.TaskAssignment.actor_id == agent.id).delete()
+        return real_lock(session, task_id)
+
+    monkeypatch.setattr(crud, "_lock_task", _lock_after_an_admin_removed_it)
+    response = client.post(
+        f"/tasks/{task.id}/approve", json={"comment": "ok", "artifact_version": 1}, headers=_auth(token)
+    )
+
+    assert response.status_code == 403
+    monkeypatch.setattr(crud, "_lock_task", real_lock)
+    db.rollback()
+    assert crud.get_approvals(db, task.id) == []

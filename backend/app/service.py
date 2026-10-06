@@ -3,7 +3,7 @@
 Both interfaces are thin presentation layers over the same ledger logic; keeping
 the projection in one place prevents the two from drifting (a risk called out in
 the pivot notes). The HTTP path (`app.main`) and the MCP path (`app.mcp.server`)
-both call `project_run_state`.
+both project through `apply_snapshot`.
 """
 
 from __future__ import annotations
@@ -20,16 +20,13 @@ def project_run_state(
     task: models.Task,
     values: dict[str, Any],
     waiting_for_human: bool,
-    *,
-    locked: bool = False,
 ) -> None:
     """Project a LangGraph Platform run's state into the Postgres ledger.
 
-    `locked=True` means the caller already holds the task row lock and has
-    checked what it needed under it: then every draft and the task row are
-    written in that one transaction and committed once, so nothing - a
-    decision included - can interleave with a half-applied snapshot.
-    Otherwise each draft append takes the lock and commits on its own.
+    Every draft and the task row are written in one transaction and committed
+    once. Callers go through `apply_snapshot`, which holds the task lock and
+    has checked `state_version` first, so nothing - a decision included - can
+    interleave with a half-applied snapshot or land between check and write.
 
     The Platform thread is the source of truth; Postgres is a projection. This
     is **idempotent**: replaying the same `values` (e.g. a retried request) adds
@@ -52,10 +49,7 @@ def project_run_state(
                 continue
         elif existing and existing[-1].content == content:
             continue
-        if locked:
-            existing.append(crud.append_draft_locked(db, task.id, content))
-        else:
-            existing.append(crud.add_draft(db, task_id=task.id, content=content))
+        existing.append(crud.append_draft_locked(db, task.id, content))
 
     reviewer_comments = values.get("reviewer_comments") or []
     feedback = reviewer_comments[-1] if reviewer_comments else None
@@ -69,23 +63,13 @@ def project_run_state(
         new_status = task.status  # unchanged
 
     task.state_version = (task.state_version or 0) + 1
-    if locked:
-        task.status = new_status
-        if current_draft is not None:
-            task.current_draft = current_draft
-        if feedback is not None:
-            task.feedback = feedback
-        db.commit()
-        db.refresh(task)
-        return
-
-    crud.update_task(
-        db,
-        task_id=task.id,
-        status=new_status,
-        current_draft=current_draft,
-        feedback=feedback,
-    )
+    task.status = new_status
+    if current_draft is not None:
+        task.current_draft = current_draft
+    if feedback is not None:
+        task.feedback = feedback
+    db.commit()
+    db.refresh(task)
 
 
 def apply_snapshot(
@@ -104,7 +88,7 @@ def apply_snapshot(
     if (task.state_version or 0) != expected_version:
         db.rollback()
         return False
-    project_run_state(db, task, values, waiting_for_human, locked=True)
+    project_run_state(db, task, values, waiting_for_human)
     return True
 
 

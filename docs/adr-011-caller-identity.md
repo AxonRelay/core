@@ -58,7 +58,7 @@ loopback（オペレータ自身のプロセス）はマシン上の全 session 
 承認を覆うため、そのままでは agent の credential が自分で作った draft を承認し、
 reviewer として記録され得る——台帳が可視化するはずの当のものが崩れる。よって
 credential による承認は、**その task で `approver` assignment を持つ Actor**、または
-**human Actor** に限る（`check_may_approve`）。データモデルは誰が承認者かをすでに
+**human Actor** に限る（`check_may_approve`）。この確認は surface の入口に加えて、判断を書くトランザクションの中、task 行ロックの下でもう一度行う——確認と書き込みの間に割り当てが外されても通らないように。データモデルは誰が承認者かをすでに
 表現していたが、それを強制するものが無かった。loopback は従来どおり。
 
 assignment を信用する以上、**`approver` を付与すること自体が承認の権限**になる。

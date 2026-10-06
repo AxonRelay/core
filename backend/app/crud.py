@@ -1,5 +1,6 @@
 """CRUD operations for database models (personal PoC, post-migration 003)."""
 
+from collections.abc import Callable
 from datetime import datetime
 
 from sqlalchemy.exc import IntegrityError
@@ -489,6 +490,7 @@ def record_approval(
     modified_draft: str | None = None,
     decision_key: str | None = None,
     claim_waiting: bool = False,
+    authorize: Callable[[], None] | None = None,
 ):
     """Record an approval / rejection event bound to the artifact it decided on.
 
@@ -513,6 +515,10 @@ def record_approval(
       the task row lock, so of two racing rounds exactly one is told it wrote;
       migration 013's unique index is the backstop if they reach the table on
       separate connections anyway.
+    * `authorize`, when given, runs under the task lock before anything is
+      written: an authorization that depends on rows another request can
+      change (the approver assignment) must hold in the transaction that
+      records the decision, not merely before it.
     * `claim_waiting` is what every decision *surface* passes. Under the same
       lock it requires the task to be WAITING_APPROVAL (`DecisionNotOpenError`
       otherwise) and moves it to APPROVED / REJECTED in the same commit as the
@@ -536,6 +542,8 @@ def record_approval(
     # Lock the task row *before* reading drafts or the chain head, so a
     # concurrent writer on the same task waits here rather than racing us.
     task = _lock_task(db, task_id)
+    if authorize is not None:
+        authorize()
 
     # Idempotency first: a replay must not append a draft version either, so
     # this runs before `modified_draft` is considered and before the staleness
@@ -625,11 +633,14 @@ def record_approval(
     if claim_waiting:
         task.status = models.TaskStatusEnum.APPROVED if action == "approved" else models.TaskStatusEnum.REJECTED
         task.state_version = (task.state_version or 0) + 1
+    # The version this decision leaves the task at, taken as a value *before*
+    # the commit: reading it afterwards would reload the row and could pick up
+    # a later projection's version. The delivery that follows may project its
+    # result only onto this one.
+    left_at_version = task.state_version or 0
     db.commit()
     db.refresh(db_approval)
-    # The version this decision left the task at, read inside the commit that
-    # set it: the delivery that follows may project its result only onto it.
-    db_approval.task_state_version = task.state_version
+    db_approval.task_state_version = left_at_version
     return db_approval
 
 

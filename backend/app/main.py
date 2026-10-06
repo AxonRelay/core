@@ -411,14 +411,6 @@ async def delete_task_endpoint(request: Request, task_id: int, db: Session = Dep
 # ========== Platform-driven Run / State Sync ==========
 
 
-def _sync_state_to_db(db: Session, task: models.Task, values: dict, waiting_for_human: bool) -> None:
-    """Project Platform thread state into the Postgres ledger.
-
-    Thin wrapper over the shared service so the HTTP and MCP paths cannot drift.
-    """
-    service.project_run_state(db, task, values, waiting_for_human)
-
-
 @app.post("/tasks/{task_id}/run", response_model=TaskWithAssignmentsResponse)
 @limiter.limit("10/minute")
 async def run_task_endpoint(
@@ -439,6 +431,8 @@ async def run_task_endpoint(
         "iteration": 0,
     }
 
+    version = service.current_state_version(db, task)
+    db.rollback()  # nothing held across the Platform call
     try:
         result = await langgraph_client.run_until_interrupt(task.thread_id, initial_state)
     except langgraph_client.PlatformNotConfiguredError as e:
@@ -446,7 +440,8 @@ async def run_task_endpoint(
 
     values = langgraph_client.extract_values(result)
     waiting = langgraph_client.is_waiting_for_human(result)
-    _sync_state_to_db(db, task, values, waiting)
+    # Only onto the state seen before the run: a decision in between wins.
+    service.apply_snapshot(db, task, values, waiting, expected_version=version)
     db.refresh(task)
     return task
 
@@ -479,7 +474,13 @@ def _record_decision(db: Session, **kwargs) -> models.Approval:
     authz.check_may_approve(db, kwargs["task_id"])
     authz.check_decision_is_bound(kwargs.get("artifact_version"), kwargs.get("expected_commitment"))
     try:
-        return crud.record_approval(db, claim_waiting=True, **kwargs)
+        return crud.record_approval(
+            db,
+            claim_waiting=True,
+            # Re-checked under the task lock: an assignment removed meanwhile counts.
+            authorize=lambda: authz.check_may_approve(db, kwargs["task_id"]),
+            **kwargs,
+        )
     except crud.TaskNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except (crud.StaleArtifactError, crud.ArtifactRequiredError, crud.DecisionNotOpenError) as e:

@@ -607,3 +607,26 @@ def test_a_malformed_argument_is_not_echoed_back_in_safe_mode(mcp_db, safe_mode,
     assert CANARY not in text
     assert "title" in text  # the field name is still reported
     assert CANARY not in caplog.text
+
+
+def test_an_undeclared_argument_name_is_not_echoed_in_safe_mode(mcp_db, safe_mode, caplog):
+    """An argument's name is the caller's key; only declared names are reported."""
+    from mcp.client._memory import InMemoryTransport
+    from mcp.client.session import ClientSession
+
+    caplog.set_level(logging.DEBUG)
+
+    async def _call():
+        async with (
+            InMemoryTransport(server.mcp, raise_exceptions=False) as streams,
+            ClientSession(*streams[:2]) as session,
+        ):
+            await session.initialize()
+            return await session.call_tool("create_task", {"title": {"x": 1}, CANARY: 1})
+
+    result = asyncio.run(_call())
+
+    text = " ".join(getattr(c, "text", "") for c in result.content)
+    assert result.is_error
+    assert CANARY not in text
+    assert CANARY not in caplog.text
