@@ -80,7 +80,11 @@ REST の request model は `extra="forbid"` で、`quote` / `title` / `annotatio
 - **Streamable HTTP**: サーバは共有インスタンスでありうる。そのディスクは呼び出し元の
   store ではないので、**読まない**。全 clip を `unresolved` として digest と出所だけ返す
 
-`unresolved` は「一致しなかった」と「このマシンに無い」を区別するために返す。
+`unresolved`（ref・digest・出所）は「一致しなかった」と「このマシンに無い」を区別するために返す。
+予算はまず `items` に使い、`unresolved` は残りに入る分だけ載せて `unresolved_count` で全件数を
+示す。解決できたが予算に収まらなかった一致は `omitted_count` に数える——clip が痕跡なく消える
+ことはない。同じ本文を複数のページから取った場合、ローカルの記録はページごとの capture
+（title・完全な URL・注釈）を持ち、pack は clip の台帳 URL に対応する capture だけを見せる。
 pack は `char_budget`（2,000〜20,000 文字）を超えない。先頭の 1 件が収まらなければ
 注釈・title を落とし、本文を接頭辞に切って `verbatim_complete: false` を付ける。
 ref・digest・URL は落とさない——それが無いと引用も照合もできない。

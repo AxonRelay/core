@@ -95,6 +95,18 @@ def _validate_annotations(annotations: dict | None) -> None:
         raise LocalEvidenceError(f"annotations must be at most {MAX_ANNOTATIONS_BYTES} UTF-8 bytes")
 
 
+def _validate_record(content, title, url, annotations) -> None:
+    if not isinstance(content, str) or not content.strip():
+        raise LocalEvidenceError("content must not be empty")
+    if len(content) > MAX_CONTENT_CHARS:
+        raise LocalEvidenceError(f"content must be at most {MAX_CONTENT_CHARS} characters")
+    if title is not None and (not isinstance(title, str) or len(title) > MAX_TITLE_CHARS):
+        raise LocalEvidenceError(f"title must be a string of at most {MAX_TITLE_CHARS} characters")
+    if url is not None and not isinstance(url, str):
+        raise LocalEvidenceError("url must be a string")
+    _validate_annotations(annotations)
+
+
 def put(
     content: str,
     *,
@@ -113,14 +125,7 @@ def put(
     URL, annotations - per source URL, and a new source adds a capture rather
     than replacing the first page's metadata.
     """
-    if not isinstance(content, str) or not content.strip():
-        raise LocalEvidenceError("content must not be empty")
-    if len(content) > MAX_CONTENT_CHARS:
-        raise LocalEvidenceError(f"content must be at most {MAX_CONTENT_CHARS} characters")
-    if title is not None and len(title) > MAX_TITLE_CHARS:
-        raise LocalEvidenceError(f"title must be at most {MAX_TITLE_CHARS} characters")
-    _validate_annotations(annotations)
-
+    _validate_record(content, title, url, annotations)
     digest = ledger.compute_artifact_commitment(content)
     directory = store_dir(store)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -190,6 +195,10 @@ def import_jsonl(path: str | os.PathLike, *, store: str | os.PathLike | None = N
                 raise LocalEvidenceError(f"line {number} is not JSON") from None
             if not isinstance(entry, dict) or not isinstance(entry.get("content"), str):
                 raise LocalEvidenceError(f"line {number} is not an object with a content string")
+            try:
+                _validate_record(entry["content"], entry.get("title"), entry.get("url"), entry.get("annotations"))
+            except LocalEvidenceError as e:
+                raise LocalEvidenceError(f"line {number}: {e}") from None
             stated = entry.get("content_sha256")
             if stated is not None and stated != ledger.compute_artifact_commitment(entry["content"]):
                 raise LocalEvidenceError(f"line {number}: content_sha256 does not match its content")
@@ -385,6 +394,9 @@ def build_context_pack(
             "items": items,
             "unresolved": listed,
             "unresolved_count": len(unresolved),
+            # Resolved matches within `limit` that the budget left out, so a
+            # clip never disappears without a trace.
+            "omitted_count": min(len(scored), limit) - len(items),
             "char_budget": char_budget,
             "elapsed_ms": elapsed_ms,
         }

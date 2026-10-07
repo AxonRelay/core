@@ -182,7 +182,11 @@ async function saveClip() {
       const detail = typeof body.detail === "string" ? body.detail : `${response.status} ${response.statusText}`;
       throw new Error(detail);
     }
-    const clips = (await localClips()).filter((clip) => clip.content_sha256 !== capture.content_sha256);
+    // One record per (text, page): the same words captured from another page
+    // are a separate ledger clip with their own title and annotations.
+    const clips = (await localClips()).filter(
+      (clip) => !(clip.content_sha256 === capture.content_sha256 && clip.url === capture.url),
+    );
     clips.push({
       content_sha256: capture.content_sha256,
       content: capture.content,

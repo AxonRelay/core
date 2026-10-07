@@ -374,3 +374,38 @@ def test_the_mcp_pack_sees_clips_beyond_any_page(mcp_db, store, self_actor):
 
     assert [i["evidence_ref"] for i in pack["items"]] == [oldest.evidence_ref]
     assert pack["unresolved_count"] == evidence.MAX_LIST + 5
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"content": "x", "title": "t" * (evidence_local.MAX_TITLE_CHARS + 1)},
+        {"content": "x", "annotations": {"verified": True}},
+        {"content": "   "},
+    ],
+)
+def test_an_import_is_all_or_nothing_for_every_kind_of_bad_line(store, tmp_path, bad):
+    """Round-2 finding: title and annotation checks ran only after earlier lines were written."""
+    export = tmp_path / "mixed.jsonl"
+    export.write_text(json.dumps({"content": "fine"}) + "\n" + json.dumps(bad) + "\n")
+
+    with pytest.raises(evidence_local.LocalEvidenceError):
+        evidence_local.import_jsonl(export)
+    assert evidence_local.get(ledger.compute_artifact_commitment("fine")) is None
+
+
+def test_a_match_the_budget_cannot_hold_is_counted_not_lost(store):
+    """Round-2 finding: a near-2,000-character URL made a resolved clip vanish."""
+    long_url = "https://example.com/" + "p" * 1_980
+    evidence_local.put("Long-URL clip.", url=long_url)
+    pack = evidence_local.build_context_pack(
+        1, [_entry(1, "Long-URL clip.") | {"source_url": long_url}], char_budget=2_000
+    )
+    assert pack["items"] == []
+    assert pack["omitted_count"] == 1
+    assert _size(pack) <= 2_000
+
+
+def test_nothing_is_omitted_when_everything_fits(store):
+    evidence_local.put("fits", url=URL)
+    assert evidence_local.build_context_pack(1, [_entry(1, "fits")])["omitted_count"] == 0
