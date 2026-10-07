@@ -636,6 +636,9 @@ def test_the_two_surfaces_agree_on_what_a_scope_means():
         (("GET", "/coordination/board"), "get_board"),
         (("POST", "/envelopes"), "ingest_safe_envelope"),
         (("GET", "/envelopes"), "list_safe_events"),
+        (("POST", "/tasks/{task_id}/evidence-clips"), "capture_evidence_clip"),
+        (("GET", "/tasks/{task_id}/evidence-clips"), "list_evidence_clips"),
+        (("POST", "/evidence-clips/{clip_id}/feedback"), "evaluate_evidence_clip"),
     ]
     for route, tool in pairs:
         assert authz.ROUTE_SCOPES[route] == authz.TOOL_SCOPES[tool], f"{route} vs {tool}"

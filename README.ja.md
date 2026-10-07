@@ -156,6 +156,11 @@ content-blind モードでは opaque ref・構造化コード・件数だけに�
 `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`。
 
+**Evidence Clip 5 tools**: `capture_evidence_clip`, `list_evidence_clips`,
+`get_context_pack`, `evaluate_evidence_clip`, `validate_evidence_references`。
+台帳は抜粋の SHA-256 と出所だけを記録し、本文はローカルに残って Context Pack も
+ローカルで解決する（[ADR-014](docs/adr-014-evidence-clips.md)）。
+
 **調整系 12 tools**: `register_session`, `heartbeat_session`, `end_session`,
 `get_board`, `check_conflicts`, `claim_territory`, `release_territory`,
 `claim_git_resource`, `check_git_resource`, `send_relay`, `read_inbox`, `ack_relay`。
@@ -291,7 +296,7 @@ cd axonrelay-graph && pip install -e . && langgraph dev
 
 ピボットは完了。Phase 3（調整レイヤー）まで入っている:
 
-- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（28 tools / 3 resources）、LangGraph Platform クライアント、migration 012 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
+- ✅ **Backend**: Actor ベースの台帳、MCP サーバ（34 tools / 3 resources）、LangGraph Platform クライアント、migration 014 まで。承認台帳は改ざん耐性あり（per-task SHA-256 hash chain、`verify_task_ledger` で検証）、かつ並行書き込みに対して安全 — [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) が記録していた単一書き込み者前提は解消済み。
 - ✅ **調整レイヤー (Phase 3)**: Workspace / Session / Claim / Relay。MCP から駆動し `/coordination/*` で読む。複数マシン・複数リポジトリ・兄弟 clone にまたがるエージェントが、互いを認識し、同じパスの同時編集を避け、永続メッセージを残せる — [docs/coordination-spec.md](docs/coordination-spec.md)。
 - ✅ **Graph**: `axonrelay-graph/`（writer → reviewer → human_approval → finalize）が Platform 用に準備済み。
 - ✅ **Frontend**: 薄い**読み取り専用**ダッシュボード（Vite + React + TS・[`frontend/`](frontend/)）。タスク一覧（status filter）/ ドラフト履歴 / 承認 timeline / task ごとの台帳検証バッジ。書き込みは MCP/IDE 経路のまま。（CopilotKit/AG-UI は読み取り専用には不要なため見送り。）

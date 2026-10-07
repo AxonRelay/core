@@ -175,6 +175,12 @@ Design, semantics, and the per-turn protocol agents follow:
 protocol revision uses — see `docs/mcp-server.md`), `verify_task_ledger`, `get_drafts`,
 `list_agents`, `create_agent`, `update_agent`, `get_self_actor`.
 
+**Evidence Clips — 5 tools**: `capture_evidence_clip`, `list_evidence_clips`,
+`get_context_pack`, `evaluate_evidence_clip`, `validate_evidence_references`.
+The ledger records a clip's SHA-256 and source only; the excerpt stays local
+and Context Packs resolve it there
+([ADR-014](docs/adr-014-evidence-clips.md)).
+
 **Coordination — 12 tools**: `register_session`, `heartbeat_session`,
 `end_session`, `get_board`, `check_conflicts`, `claim_territory`,
 `release_territory`, `claim_git_resource`, `check_git_resource`, `send_relay`,
@@ -314,7 +320,7 @@ See [SETUP_POSTGRES.md](SETUP_POSTGRES.md) for database setup and migrations.
 
 The pivot is complete; Phase 3 (coordination) is in:
 
-- ✅ **Backend**: Actor-based ledger, MCP server (28 tools / 3 resources), LangGraph Platform client, migrations through 012. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
+- ✅ **Backend**: Actor-based ledger, MCP server (34 tools / 3 resources), LangGraph Platform client, migrations through 014. Approval ledger is tamper-evident (per-task SHA-256 hash chain, verifiable via `verify_task_ledger`) and safe under concurrent writers — the single-writer limitation recorded in [delta-mvp-spec §11.6](docs/delta-mvp-spec.md) is lifted.
 - ✅ **Coordination (Phase 3)**: Workspace / Session / Claim / Relay, driven from MCP, read via `/coordination/*`. Lets several agents across machines, repos and sibling clones see each other, avoid editing the same paths, and leave each other durable messages — [docs/coordination-spec.md](docs/coordination-spec.md).
 - ✅ **Graph**: `axonrelay-graph/` (writer → reviewer → human_approval → finalize) ready for Platform.
 - ✅ **Frontend**: a thin **read-only** dashboard (Vite + React + TS, [`frontend/`](frontend/)) — task list with status filter, draft history, the approval timeline, and a per-task ledger-verification badge. Write actions stay in the MCP/IDE path. (CopilotKit/AG-UI deferred — a read-only audit viewer doesn't need agent↔UI streaming.)

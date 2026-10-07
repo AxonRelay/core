@@ -75,6 +75,10 @@ PRESERVED = (
     "agent_definitions",
     "safe_events",
     "credentials",
+    # A draft cites a clip as [E-n]; the approval binds that draft. Removing
+    # the clip would leave an approved citation pointing at nothing.
+    "evidence_clips",
+    "evidence_feedback",
     # A workspace is the stable identity sessions and claims hang off. Removing
     # one would renumber a checkout that is still in use.
     "workspaces",

@@ -109,6 +109,10 @@ def sanitize_url(url: str | None) -> str | None:
         raise UnsafeURL("a URL fragment may not be stored; strip it first")
     if not parts.netloc:
         raise UnsafeURL("a URL must name a host")
+    try:
+        parts.port  # noqa: B018 - raises on a non-numeric or out-of-range port
+    except ValueError:
+        raise UnsafeURL("a URL port must be a number from 0 to 65535") from None
     return url.strip()
 
 

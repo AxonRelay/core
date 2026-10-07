@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; font: 13px/1.45 system-ui, sans-serif; }
+body { margin: 0; width: 420px; }
+main { padding: 16px; }
+h1 { font-size: 18px; margin: 0 0 8px; }
+h2 { font-size: 14px; }
+label { display: block; margin: 10px 0; }
+input, select, textarea, button { box-sizing: border-box; font: inherit; width: 100%; }
+input, select, textarea { margin-top: 4px; padding: 7px; }
+button { cursor: pointer; margin: 6px 0; padding: 8px; }
+blockquote { border-left: 3px solid #777; margin: 8px 0; max-height: 140px; overflow: auto; padding-left: 10px; white-space: pre-wrap; }
+.status { background: color-mix(in srgb, CanvasText 8%, Canvas); border-radius: 4px; padding: 8px; }
+.error { color: #c33; }
+#source { overflow-wrap: anywhere; }
+.confirm { display: flex; gap: 8px; align-items: flex-start; }
+.confirm input { margin-top: 3px; width: auto; }
+#sourceUrl { font-size: 11px; overflow-wrap: anywhere; }
+.digest { font-size: 11px; overflow-wrap: anywhere; }

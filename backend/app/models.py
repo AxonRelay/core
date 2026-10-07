@@ -1,6 +1,7 @@
 """Database models for AxonRelay (personal PoC pivot, post-migration 003)."""
 
 import enum
+import re
 import secrets
 from datetime import datetime
 
@@ -76,6 +77,21 @@ class TaskStatusEnum(enum.StrEnum):
     NEEDS_REVISION = "needs_revision"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+
+
+class EvidenceSourceTypeEnum(enum.StrEnum):
+    """Operator-declared sensitivity of a captured source."""
+
+    PUBLIC = "public"
+    PERSONAL = "personal"
+
+
+class EvidenceFeedbackVerdictEnum(enum.StrEnum):
+    """Small, evaluation-oriented feedback vocabulary for an Evidence Clip."""
+
+    RELEVANT = "relevant"
+    IRRELEVANT = "irrelevant"
+    MISLEADING = "misleading"
 
 
 # =============================================================================
@@ -188,6 +204,7 @@ class Task(Base):
     drafts = relationship("Draft", back_populates="task", cascade="all, delete-orphan")
     approvals = relationship("Approval", back_populates="task", cascade="all, delete-orphan")
     external_links = relationship("ExternalLink", back_populates="task", cascade="all, delete-orphan")
+    evidence_clips = relationship("EvidenceClip", back_populates="task", cascade="all, delete-orphan")
 
 
 class Draft(Base):
@@ -306,6 +323,77 @@ class ExternalLink(Base):
         from app import disclosure  # local: disclosure imports models
 
         return disclosure.sanitize_url(value)
+
+
+class EvidenceClip(Base):
+    """A commitment to an operator-selected source excerpt, attached to one task (ADR-014).
+
+    The row is the shared half of a clip: *that* an excerpt was captured, from
+    where, when and by whom, and the SHA-256 of its exact text. The text itself,
+    the page title and any model annotations stay with whoever captured it
+    (app/evidence_local.py) and are resolved against this digest locally. There
+    is no column a quote could be put in; a test keeps it that way.
+    """
+
+    __tablename__ = "evidence_clips"
+    __table_args__ = (
+        UniqueConstraint("task_id", "source_url", "content_sha256", name="uq_evidence_task_source_content"),
+        Index("ix_evidence_task_captured", "task_id", "captured_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    captured_by_actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), index=True)
+
+    source_url = Column(String(2000), nullable=False)
+    source_type = Column(Enum(EvidenceSourceTypeEnum), nullable=False)
+    content_sha256 = Column(String(64), nullable=False, index=True)
+    content_algorithm = Column(String(32), nullable=False)
+    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    task = relationship("Task", back_populates="evidence_clips")
+    captured_by = relationship("Actor")
+    feedback_events = relationship(
+        "EvidenceFeedback", back_populates="evidence_clip", cascade="all, delete-orphan", order_by="EvidenceFeedback.id"
+    )
+
+    @property
+    def evidence_ref(self) -> str:
+        return f"E-{self.id}"
+
+    @validates("source_url")
+    def _sanitize_source_url(self, _key: str, value: str | None) -> str | None:
+        """Same rule as `ExternalLink.url`: no credentials, query, fragment or odd scheme.
+
+        A presigned URL carries its credential in the query, so a clip from
+        one would otherwise store a live secret. The capturing client strips
+        query and fragment before it sends; the full URL stays on its side.
+        """
+        from app import disclosure  # local: disclosure imports models
+
+        return disclosure.sanitize_url(value)
+
+    @validates("content_sha256")
+    def _check_content_sha256(self, _key: str, value: str | None) -> str | None:
+        """Lowercase hex SHA-256 only (migration 014 checks the same on Postgres)."""
+        if value is None or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("content_sha256 must be 64 lowercase hex characters")
+        return value
+
+
+class EvidenceFeedback(Base):
+    """Append-only relevance verdict on an EvidenceClip. A verdict, never free text."""
+
+    __tablename__ = "evidence_feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+    evidence_clip_id = Column(Integer, ForeignKey("evidence_clips.id", ondelete="CASCADE"), nullable=False, index=True)
+    actor_id = Column(Integer, ForeignKey("actors.id", ondelete="SET NULL"), index=True)
+    verdict = Column(Enum(EvidenceFeedbackVerdictEnum), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    evidence_clip = relationship("EvidenceClip", back_populates="feedback_events")
+    actor = relationship("Actor")
 
 
 # =============================================================================

@@ -467,6 +467,9 @@ TOOL_SCOPES: dict[str, Scope] = {
     "verify_task_ledger": Scope.LEDGER_READ,
     "list_agents": Scope.LEDGER_READ,
     "get_self_actor": Scope.LEDGER_READ,
+    "list_evidence_clips": Scope.LEDGER_READ,
+    "get_context_pack": Scope.LEDGER_READ,
+    "validate_evidence_references": Scope.LEDGER_READ,
     # Ledger, write
     "create_task": Scope.LEDGER_WRITE,
     "run_task": Scope.LEDGER_WRITE,
@@ -476,6 +479,8 @@ TOOL_SCOPES: dict[str, Scope] = {
     "review_pending_task": Scope.LEDGER_WRITE,
     "create_agent": Scope.LEDGER_WRITE,
     "update_agent": Scope.LEDGER_WRITE,
+    "capture_evidence_clip": Scope.LEDGER_WRITE,
+    "evaluate_evidence_clip": Scope.LEDGER_WRITE,
     # Coordination, read
     "get_board": Scope.COORDINATION_READ,
     "read_inbox": Scope.COORDINATION_READ,
@@ -553,6 +558,9 @@ ROUTE_SCOPES: dict[tuple[str, str], Scope | None] = {
     ("GET", "/tasks/{task_id}/assignments"): Scope.LEDGER_READ,
     ("POST", "/tasks/{task_id}/assignments"): Scope.LEDGER_WRITE,
     ("DELETE", "/tasks/{task_id}/assignments/{actor_id}"): Scope.ADMINISTRATION,
+    ("POST", "/tasks/{task_id}/evidence-clips"): Scope.LEDGER_WRITE,
+    ("GET", "/tasks/{task_id}/evidence-clips"): Scope.LEDGER_READ,
+    ("POST", "/evidence-clips/{clip_id}/feedback"): Scope.LEDGER_WRITE,
     ("GET", "/coordination/board"): Scope.COORDINATION_READ,
     ("GET", "/coordination/sessions"): Scope.COORDINATION_READ,
     ("GET", "/coordination/claims"): Scope.COORDINATION_READ,
