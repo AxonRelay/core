@@ -1,7 +1,7 @@
 # Floors are the minor lines CI resolves today; caps stop the next major from
 # arriving unannounced. Dependabot moves the floors; a cap is moved by hand,
 # after reading the changelog.
-fastapi>=0.141,<1
+fastapi>=0.141.1,<1
 uvicorn[standard]>=0.52,<1
 pydantic>=2.13.5,<3
 python-dotenv>=1.2,<2
