@@ -32,6 +32,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from app import ledger
 
@@ -106,6 +107,11 @@ def put(
 
     The text is hashed exactly as given: a client that trims whitespace must
     trim before it hashes, or the two halves will not meet.
+
+    The same words can be captured from several pages (boilerplate, a quoted
+    press release). The record therefore keeps one *capture* - title, full
+    URL, annotations - per source URL, and a new source adds a capture rather
+    than replacing the first page's metadata.
     """
     if not isinstance(content, str) or not content.strip():
         raise LocalEvidenceError("content must not be empty")
@@ -118,13 +124,17 @@ def put(
     digest = ledger.compute_artifact_commitment(content)
     directory = store_dir(store)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        existing = get(digest, store=directory)
+    except LocalEvidenceError:
+        existing = None  # unreadable or tampered: the fresh text replaces it
+    captures = [c for c in (existing or {}).get("captures", []) if isinstance(c, dict) and c.get("url") != url]
+    captures.append({"title": title, "url": url, "annotations": annotations})
     record = {
         "content_sha256": digest,
         "content_algorithm": ledger.COMMITMENT_ALGORITHM,
         "content": content,
-        "title": title,
-        "url": url,
-        "annotations": annotations,
+        "captures": captures,
     }
     # Write-then-rename, so a reader never sees half a record.
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
@@ -166,10 +176,10 @@ def import_jsonl(path: str | os.PathLike, *, store: str | os.PathLike | None = N
     """Load the Chrome adapter's export. Each line: content, title, url, annotations, content_sha256.
 
     When a line states ``content_sha256`` it must equal the digest of its
-    content; a line that disagrees is refused rather than stored under a
-    digest the ledger may not hold.
+    content. The whole file is checked before anything is written, so a bad
+    line leaves the store exactly as it was.
     """
-    digests = []
+    entries = []
     with open(path, encoding="utf-8") as handle:
         for number, line in enumerate(handle, start=1):
             if not line.strip():
@@ -178,21 +188,22 @@ def import_jsonl(path: str | os.PathLike, *, store: str | os.PathLike | None = N
                 entry = json.loads(line)
             except ValueError:
                 raise LocalEvidenceError(f"line {number} is not JSON") from None
-            if not isinstance(entry, dict):
-                raise LocalEvidenceError(f"line {number} is not an object")
-            digest = put(
-                entry.get("content", ""),
-                title=entry.get("title"),
-                url=entry.get("url"),
-                annotations=entry.get("annotations"),
-                store=store,
-            )
+            if not isinstance(entry, dict) or not isinstance(entry.get("content"), str):
+                raise LocalEvidenceError(f"line {number} is not an object with a content string")
             stated = entry.get("content_sha256")
-            if stated is not None and stated != digest:
-                (store_dir(store) / f"{digest}.json").unlink(missing_ok=True)
+            if stated is not None and stated != ledger.compute_artifact_commitment(entry["content"]):
                 raise LocalEvidenceError(f"line {number}: content_sha256 does not match its content")
-            digests.append(digest)
-    return digests
+            entries.append(entry)
+    return [
+        put(
+            entry["content"],
+            title=entry.get("title"),
+            url=entry.get("url"),
+            annotations=entry.get("annotations"),
+            store=store,
+        )
+        for entry in entries
+    ]
 
 
 # ------------------------------------------------------------------ Context Pack
@@ -207,6 +218,34 @@ def _trigrams(value: str) -> set[str]:
     if len(normalized) < 3:
         return {normalized} if normalized else set()
     return {normalized[index : index + 3] for index in range(len(normalized) - 2)}
+
+
+def _ledger_form(url: str | None) -> str | None:
+    """A URL as the ledger stores it: no userinfo, query or fragment; scheme and host lowercased."""
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme.lower(), host, parts.path or "/", "", ""))
+
+
+def _view(record: dict, source_url: str) -> dict:
+    """The excerpt with the capture that belongs to *this* clip's source.
+
+    Another page's title and annotations are not shown under this clip's
+    provenance; with no matching capture the clip shows its text alone.
+    """
+    wanted = _ledger_form(source_url)
+    capture = next(
+        (c for c in record.get("captures", []) if isinstance(c, dict) and _ledger_form(c.get("url")) == wanted),
+        {},
+    )
+    return {"content": record["content"], "title": capture.get("title"), "annotations": capture.get("annotations")}
 
 
 def _search_planes(record: dict) -> dict[str, str]:
@@ -296,8 +335,10 @@ def build_context_pack(
 
     ``local=False`` is the remote-transport case: nothing is read from disk,
     every clip is listed as unresolved, and no query can be ranked.
-    ``unresolved`` names the refs whose text this machine does not hold, so an
-    agent can tell "no match" from "not here".
+    ``unresolved`` lists the clips whose text this machine does not hold - ref,
+    digest and source - so an agent can tell "no match" from "not here". Items
+    are fitted to the budget first; ``unresolved`` takes what room is left,
+    and ``unresolved_count`` always gives the full number.
     """
     started = time.perf_counter()
     if len(query) > MAX_QUERY_CHARS:
@@ -306,7 +347,7 @@ def build_context_pack(
     char_budget = max(MIN_PACK_CHARS, min(char_budget, MAX_PACK_CHARS))
 
     resolved: list[tuple[dict, dict]] = []
-    unresolved: list[str] = []
+    unresolved: list[dict] = []
     for entry in manifest:
         record = None
         if local:
@@ -315,9 +356,15 @@ def build_context_pack(
             except LocalEvidenceError:
                 record = None
         if record is None:
-            unresolved.append(entry["evidence_ref"])
+            unresolved.append(
+                {
+                    "evidence_ref": entry["evidence_ref"],
+                    "content_sha256": entry["content_sha256"],
+                    "source_url": entry["source_url"],
+                }
+            )
         else:
-            resolved.append((entry, record))
+            resolved.append((entry, _view(record, entry["source_url"])))
 
     query_normalized = _normalized(query)
     if query_normalized:
@@ -329,14 +376,15 @@ def build_context_pack(
         # The manifest is newest first already.
         scored = [(entry, record, 1.0, "recency") for entry, record in resolved]
 
-    def pack(items: list[dict], elapsed_ms: float) -> dict:
+    def pack(items: list[dict], listed: list[dict], elapsed_ms: float) -> dict:
         return {
             "task_id": task_id,
             "query": query,
             "untrusted_content": True,
             "epistemic_contract": EPISTEMIC_CONTRACT,
             "items": items,
-            "unresolved": unresolved,
+            "unresolved": listed,
+            "unresolved_count": len(unresolved),
             "char_budget": char_budget,
             "elapsed_ms": elapsed_ms,
         }
@@ -345,23 +393,23 @@ def build_context_pack(
     items: list[dict] = []
     for entry, record, score, plane in scored[:limit]:
         payload = _item(entry, record, score, plane)
-        if _json_characters(pack([*items, payload], 999999.999)) <= char_budget:
+        if _json_characters(pack([*items, payload], [], 999999.999)) <= char_budget:
             items.append(payload)
             continue
         if not items:
-            available = char_budget - _json_characters(pack([], 999999.999))
+            available = char_budget - _json_characters(pack([], [], 999999.999))
             payload = _fit_first_item(payload, max(0, available - 1))
-            if _json_characters(pack([payload], 999999.999)) <= char_budget:
+            if _json_characters(pack([payload], [], 999999.999)) <= char_budget:
                 items.append(payload)
         break
 
-    result = pack(items, round((time.perf_counter() - started) * 1_000, 3))
-    if _json_characters(result) > char_budget:
-        # A manifest so long that its unresolved refs alone overflow the
-        # budget: report the count rather than exceed what the caller asked for.
-        result["unresolved"] = []
-        result["unresolved_count"] = len(unresolved)
-    return result
+    listed: list[dict] = []
+    for missing in unresolved:
+        if _json_characters(pack(items, [*listed, missing], 999999.999)) > char_budget:
+            break
+        listed.append(missing)
+
+    return pack(items, listed, round((time.perf_counter() - started) * 1_000, 3))
 
 
 # ------------------------------------------------------------------------- CLI

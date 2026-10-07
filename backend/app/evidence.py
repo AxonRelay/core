@@ -125,6 +125,23 @@ def list_clips(db: Session, task_id: int, *, skip: int = 0, limit: int = 100) ->
     )
 
 
+def manifest(db: Session, task_id: int) -> list[dict]:
+    """Every clip of a task, newest first, as `clip_to_dict` rows - what a Context Pack resolves.
+
+    Unpaged on purpose: a pack that saw only the newest page could neither
+    return an older cited clip nor report it as unresolved.
+    """
+    if not db.get(models.Task, task_id):
+        raise EvidenceNotFound(f"Task {task_id} not found")
+    clips = (
+        db.query(models.EvidenceClip)
+        .filter(models.EvidenceClip.task_id == task_id)
+        .order_by(models.EvidenceClip.captured_at.desc(), models.EvidenceClip.id.desc())
+        .all()
+    )
+    return [clip_to_dict(clip) for clip in clips]
+
+
 def record_feedback(db: Session, clip_id: int, actor_id: int | None, verdict: str) -> models.EvidenceFeedback:
     """Append one verdict. Earlier verdicts are never changed."""
     clip = db.get(models.EvidenceClip, clip_id)

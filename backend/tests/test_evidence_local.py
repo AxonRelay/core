@@ -42,8 +42,43 @@ def test_put_returns_the_ledger_commitment_and_get_round_trips(store):
     assert digest == ledger.compute_artifact_commitment("An excerpt.")
     record = evidence_local.get(digest)
     assert record["content"] == "An excerpt."
-    assert record["url"] == URL + "?q=1#p"  # the full URL stays local
-    assert record["annotations"] == {"summary": "s"}
+    # The full URL stays local.
+    assert record["captures"] == [{"title": "T", "url": URL + "?q=1#p", "annotations": {"summary": "s"}}]
+
+
+def test_the_same_words_from_two_pages_keep_both_captures(store):
+    """Round-1 finding: a second source must not overwrite the first page's metadata."""
+    other = "https://other.example.org/copy"
+    digest = evidence_local.put("Boilerplate.", title="First", url=URL, annotations={"summary": "first"})
+    evidence_local.put("Boilerplate.", title="Second", url=other, annotations={"summary": "second"})
+    evidence_local.put("Boilerplate.", title="First, renamed", url=URL, annotations={"summary": "first"})
+
+    titles = {c["url"]: c["title"] for c in evidence_local.get(digest)["captures"]}
+    assert titles == {URL: "First, renamed", other: "Second"}
+
+    pack = evidence_local.build_context_pack(
+        1, [_entry(2, "Boilerplate.") | {"source_url": other}, _entry(1, "Boilerplate.")]
+    )
+    assert [(i["evidence_ref"], i["source_title"]) for i in pack["items"]] == [
+        ("E-2", "Second"),
+        ("E-1", "First, renamed"),
+    ]
+
+
+def test_a_capture_from_another_source_is_not_shown_under_this_clip(store):
+    evidence_local.put(
+        "Shared words.", title="Elsewhere", url="https://elsewhere.example/", annotations={"summary": "x"}
+    )
+    item = evidence_local.build_context_pack(1, [_entry(1, "Shared words.")])["items"][0]
+    assert item["source_title"] == "" and item["annotations"] is None
+
+
+def test_the_ledger_form_of_a_url_matches_its_capture(store):
+    evidence_local.put("Text.", title="T", url="https://User:pw" + "@" + "Example.COM/articles/foxes?utm=1#frag")
+    item = evidence_local.build_context_pack(
+        1, [_entry(1, "Text.") | {"source_url": "https://example.com/articles/foxes"}]
+    )["items"][0]
+    assert item["source_title"] == "T"
 
 
 def test_records_are_private_to_the_owner(store):
@@ -102,6 +137,25 @@ def test_import_checks_the_stated_digest(store, tmp_path):
     assert evidence_local.get(ledger.compute_artifact_commitment("three")) is None
 
 
+def test_a_bad_import_line_leaves_the_store_untouched(store, tmp_path):
+    """Round-1 finding: a wrong stated digest used to overwrite, then delete, a valid record."""
+    digest = evidence_local.put("kept", title="Original", url=URL)
+    before = (store / f"{digest}.json").read_text()
+    export = tmp_path / "mixed.jsonl"
+    export.write_text(
+        json.dumps({"content": "new and fine"})
+        + "\n"
+        + json.dumps({"content": "kept", "title": "Overwrite", "content_sha256": "0" * 64})
+        + "\n"
+    )
+
+    with pytest.raises(evidence_local.LocalEvidenceError):
+        evidence_local.import_jsonl(export)
+
+    assert (store / f"{digest}.json").read_text() == before
+    assert evidence_local.get(ledger.compute_artifact_commitment("new and fine")) is None
+
+
 def test_cli_put_prints_the_digest(store, capsys, monkeypatch):
     import io
 
@@ -142,7 +196,7 @@ def test_a_query_ranks_exact_matches_first_and_drops_weak_ones(store):
 
 
 def test_annotations_are_searched_on_their_own_plane(store):
-    evidence_local.put("Plain text.", annotations={"source_claims": ["Rates rose in March"]})
+    evidence_local.put("Plain text.", url=URL, annotations={"source_claims": ["Rates rose in March"]})
     pack = evidence_local.build_context_pack(1, [_entry(1, "Plain text.")], query="rates rose")
     assert pack["items"][0]["matched_plane"] == "source_claim"
 
@@ -151,7 +205,10 @@ def test_text_not_on_this_machine_is_reported_unresolved(store):
     evidence_local.put("here")
     pack = evidence_local.build_context_pack(1, [_entry(2, "elsewhere"), _entry(1, "here")])
     assert [item["evidence_ref"] for item in pack["items"]] == ["E-1"]
-    assert pack["unresolved"] == ["E-2"]
+    assert pack["unresolved"] == [
+        {"evidence_ref": "E-2", "content_sha256": ledger.compute_artifact_commitment("elsewhere"), "source_url": URL}
+    ]
+    assert pack["unresolved_count"] == 1
 
 
 def test_a_tampered_record_is_unresolved_not_shown(store):
@@ -162,14 +219,14 @@ def test_a_tampered_record_is_unresolved_not_shown(store):
     path.write_text(json.dumps(record))
 
     pack = evidence_local.build_context_pack(1, [_entry(1, "original")])
-    assert pack["items"] == [] and pack["unresolved"] == ["E-1"]
+    assert pack["items"] == [] and [u["evidence_ref"] for u in pack["unresolved"]] == ["E-1"]
     assert "forged" not in json.dumps(pack)
 
 
 def test_a_remote_pack_reads_nothing(store):
     evidence_local.put("local text")
     pack = evidence_local.build_context_pack(1, [_entry(1, "local text")], local=False)
-    assert pack["items"] == [] and pack["unresolved"] == ["E-1"]
+    assert pack["items"] == [] and [u["evidence_ref"] for u in pack["unresolved"]] == ["E-1"]
 
 
 @pytest.mark.parametrize("budget", [500, 2_000, 2_500, 5_000, 8_000, 20_000])
@@ -271,3 +328,49 @@ def test_an_undecidable_transport_does_not_read_the_disk():
             raise ValueError("no request in flight")
 
     assert server._transport_is_local(_Ctx()) is False
+
+
+def test_a_long_unresolved_list_never_starves_the_items(store):
+    """Items are fitted first; the unresolved list takes the room left and the count stays exact."""
+    evidence_local.put("present", url=URL)
+    manifest = [_entry(1000 + i, f"absent {i}") for i in range(300)] + [_entry(1, "present")]
+
+    pack = evidence_local.build_context_pack(1, manifest, char_budget=4_000)
+
+    assert [i["evidence_ref"] for i in pack["items"]] == ["E-1"]
+    assert pack["unresolved_count"] == 300
+    assert 0 < len(pack["unresolved"]) < 300
+    assert _size(pack) <= 4_000
+
+
+def test_the_mcp_pack_sees_clips_beyond_any_page(mcp_db, store, self_actor):
+    """Round-1 finding: the pack used to read only the newest 500 clips."""
+    task = models.Task(thread_id="t-many", title="T", status=models.TaskStatusEnum.DRAFT)
+    mcp_db.add(task)
+    mcp_db.commit()
+    oldest_digest = evidence_local.put("The oldest cited clip.", url=URL)
+    oldest, _ = evidence.create_clip(
+        mcp_db,
+        task_id=task.id,
+        captured_by_actor_id=None,
+        source_url=URL,
+        source_type="public",
+        content_sha256=oldest_digest,
+    )
+    for i in range(evidence.MAX_LIST + 5):
+        mcp_db.add(
+            models.EvidenceClip(
+                task_id=task.id,
+                source_url=f"https://example.com/{i}",
+                source_type=models.EvidenceSourceTypeEnum.PUBLIC,
+                content_sha256=ledger.compute_artifact_commitment(f"filler {i}"),
+                content_algorithm=ledger.COMMITMENT_ALGORITHM,
+            )
+        )
+    mcp_db.commit()
+
+    tool = server.mcp._tool_manager.get_tool("get_context_pack")
+    pack = asyncio.run(tool.run({"task_id": task.id, "query": "oldest cited clip"}, context=None))
+
+    assert [i["evidence_ref"] for i in pack["items"]] == [oldest.evidence_ref]
+    assert pack["unresolved_count"] == evidence.MAX_LIST + 5
