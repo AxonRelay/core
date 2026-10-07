@@ -8,6 +8,11 @@
 // can resolve the excerpts against the ledger's digests.
 
 const MAX_CONTENT_CHARS = 8000;
+// Kept in step with backend/app/evidence_local.py, whose import refuses the
+// whole export if one record breaks these.
+const MAX_TITLE_CHARS = 500;
+const MAX_ANNOTATIONS_BYTES = 16000;
+const ANNOTATION_FIELDS = ["summary", "tags", "source_claims", "interpretations"];
 const PROMPT_VERSION = "evidence-v1";
 const $ = (id) => document.getElementById(id);
 let capture = null;
@@ -76,7 +81,7 @@ async function loadSelection() {
   if (content.length > MAX_CONTENT_CHARS) throw new Error(`Selection exceeds ${MAX_CONTENT_CHARS} characters.`);
   capture = {
     content,
-    title: tab.title || "",
+    title: (tab.title || "").slice(0, MAX_TITLE_CHARS),
     url: tab.url,
     source_url: ledgerUrl(tab.url),
     content_sha256: await sha256Hex(content),
@@ -147,6 +152,23 @@ async function enrich() {
   }
 }
 
+function checkAnnotations(value) {
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("Annotations must be a JSON object.");
+  const unknown = Object.keys(value).filter((key) => !ANNOTATION_FIELDS.includes(key));
+  if (unknown.length) throw new Error(`Annotations may only hold ${ANNOTATION_FIELDS.join(", ")}.`);
+  if ("summary" in value && typeof value.summary !== "string") throw new Error("annotations.summary must be a string.");
+  for (const field of ["tags", "source_claims", "interpretations"]) {
+    if (field in value && !(Array.isArray(value[field]) && value[field].every((item) => typeof item === "string"))) {
+      throw new Error(`annotations.${field} must be a list of strings.`);
+    }
+  }
+  if (new TextEncoder().encode(JSON.stringify(value)).length > MAX_ANNOTATIONS_BYTES) {
+    throw new Error(`Annotations must be at most ${MAX_ANNOTATIONS_BYTES} bytes.`);
+  }
+  return value;
+}
+
 async function localClips() {
   const { clips } = await chrome.storage.local.get(["clips"]);
   return Array.isArray(clips) ? clips : [];
@@ -162,7 +184,11 @@ async function saveClip() {
   if (!Number.isInteger(taskId) || taskId <= 0) throw new Error("Enter a valid Task ID.");
   if (!$("confirmPolicy").checked) throw new Error("Confirm that this is not workplace data before saving.");
   const parsedAnnotations = JSON.parse($("annotations").value || "{}");
-  const annotations = Object.keys(parsedAnnotations).length ? parsedAnnotations : null;
+  const annotations = checkAnnotations(
+    parsedAnnotations && typeof parsedAnnotations === "object" && !Array.isArray(parsedAnnotations) && !Object.keys(parsedAnnotations).length
+      ? null
+      : parsedAnnotations,
+  );
   const endpoint = $("endpoint").value.replace(/\/$/, "");
   const headers = { "Content-Type": "application/json" };
   if ($("token").value) headers.Authorization = `Bearer ${$("token").value}`;

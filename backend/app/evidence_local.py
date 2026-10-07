@@ -103,8 +103,8 @@ def _validate_record(content, title, url, annotations) -> None:
         raise LocalEvidenceError(f"content must be at most {MAX_CONTENT_CHARS} characters")
     if title is not None and (not isinstance(title, str) or len(title) > MAX_TITLE_CHARS):
         raise LocalEvidenceError(f"title must be a string of at most {MAX_TITLE_CHARS} characters")
-    if url is not None and not isinstance(url, str):
-        raise LocalEvidenceError("url must be a string")
+    if url is not None and (not isinstance(url, str) or _ledger_form(url) is None):
+        raise LocalEvidenceError("url must be a parseable URL string")
     _validate_annotations(annotations)
 
 
@@ -255,11 +255,12 @@ def _ledger_form(url: str | None) -> str | None:
         return None
     try:
         parts = urlsplit(url.strip())
+        port = parts.port  # raises on a non-numeric or out-of-range port
     except ValueError:
         return None
     host = (parts.hostname or "").lower()
-    if parts.port:
-        host = f"{host}:{parts.port}"
+    if port:
+        host = f"{host}:{port}"
     return urlunsplit((parts.scheme.lower(), host, parts.path or "/", "", ""))
 
 

@@ -437,6 +437,7 @@ def test_concurrent_puts_of_the_same_words_keep_every_capture(store):
     [
         [{"title": 7, "url": URL, "annotations": None}],
         [{"title": "T", "url": URL, "annotations": "not an object"}],
+        [{"title": "T", "url": "https://example.com:bad/page", "annotations": None}],
         ["not a capture"],
         "not a list",
     ],
@@ -453,3 +454,9 @@ def test_malformed_capture_metadata_cannot_break_a_pack(store, captures):
 
     assert [i["evidence_ref"] for i in pack["items"]] == ["E-1"]
     assert pack["items"][0]["source_title"] == "" and pack["items"][0]["annotations"] is None
+
+
+def test_a_url_with_a_bad_port_is_refused_on_the_way_in(store):
+    """Round-4 finding: `urlsplit().port` raised later, inside a Context Pack."""
+    with pytest.raises(evidence_local.LocalEvidenceError):
+        evidence_local.put("text", url="https://example.com:bad/page")
