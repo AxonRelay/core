@@ -81,7 +81,7 @@ def test_the_clip_dict_is_exactly_the_shared_record(db, task, self_actor):
         source_type="public",
         content_sha256=DIGEST,
     )
-    assert set(evidence.clip_to_dict(clip)) == {
+    assert set(evidence.clips_to_dicts(db, [clip])[0]) == {
         "id",
         "evidence_ref",
         "task_id",
@@ -352,3 +352,35 @@ def test_an_enormous_citation_number_is_missing_not_an_error(db, task):
     result = evidence.validate_draft_references(db, task.id, draft)
     assert result["missing"] == ["E-123456789012345678"]
     assert result["valid"] == []
+
+
+def test_feedback_counts_come_from_one_aggregate_query(db, task):
+    """Round-6 finding: counting loaded every feedback row of every clip."""
+    from sqlalchemy import event
+
+    clips = [
+        evidence.create_clip(
+            db,
+            task_id=task.id,
+            captured_by_actor_id=None,
+            source_url=f"{URL}/{i}",
+            source_type="public",
+            content_sha256=DIGEST,
+        )[0]
+        for i in range(5)
+    ]
+    for clip in clips:
+        for verdict in ("relevant", "misleading", "relevant"):
+            evidence.record_feedback(db, clip.id, None, verdict)
+    db.expire_all()
+
+    statements = []
+    listener = lambda *args: statements.append(args[2])  # noqa: E731
+    event.listen(db.get_bind(), "before_cursor_execute", listener)
+    try:
+        rows = evidence.manifest(db, task.id)
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", listener)
+
+    assert all(r["feedback"] == {"relevant": 2, "irrelevant": 0, "misleading": 1} for r in rows)
+    assert len([s for s in statements if "evidence_feedback" in s]) == 1

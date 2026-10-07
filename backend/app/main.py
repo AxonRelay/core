@@ -697,7 +697,7 @@ async def create_evidence_clip_endpoint(
         )
     except ValueError as exc:
         raise _evidence_http_error(exc) from None
-    return JSONResponse(status_code=201 if created else 200, content=evidence.clip_to_dict(clip))
+    return JSONResponse(status_code=201 if created else 200, content=evidence.clips_to_dicts(db, [clip])[0])
 
 
 @app.get("/tasks/{task_id}/evidence-clips")
@@ -710,7 +710,7 @@ async def list_evidence_clips_endpoint(
         clips = evidence.list_clips(db, task_id, skip=skip, limit=limit)
     except ValueError as exc:
         raise _evidence_http_error(exc) from None
-    return [evidence.clip_to_dict(clip) for clip in clips]
+    return evidence.clips_to_dicts(db, clips)
 
 
 @app.post("/evidence-clips/{clip_id}/feedback", status_code=201)

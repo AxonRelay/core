@@ -138,7 +138,10 @@ def put(
             existing = get(digest, store=directory)
         except LocalEvidenceError:
             existing = None  # unreadable or tampered: the fresh text replaces it
-        captures = [c for c in (existing or {}).get("captures", []) if c.get("url") != url]
+        # One capture per *ledger* URL: two full URLs that differ only in
+        # query or fragment are the same ledger clip, so the newer replaces.
+        key = _ledger_form(url)
+        captures = [c for c in (existing or {}).get("captures", []) if _ledger_form(c.get("url")) != key]
         captures.append({"title": title, "url": url, "annotations": annotations})
         record = {
             "content_sha256": digest,

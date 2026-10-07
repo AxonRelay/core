@@ -14,10 +14,10 @@ Not a memory or RAG layer: clips are explicit, task-scoped, and immutable.
 from __future__ import annotations
 
 import re
-from collections import Counter
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session
 
 from app import ledger, models
 
@@ -80,6 +80,9 @@ def create_clip(
         content_sha256=content_sha256,
         content_algorithm=content_algorithm,
     )
+    # The task row lock serializes captures on one task, so the count below
+    # cannot be raced past the cap (a no-op on SQLite, which has one writer).
+    db.query(models.Task).filter(models.Task.id == task_id).with_for_update().first()
     existing = _find(db, task_id, clip.source_url, content_sha256)
     if existing is None:
         count = db.query(models.EvidenceClip).filter(models.EvidenceClip.task_id == task_id).count()
@@ -125,7 +128,6 @@ def list_clips(db: Session, task_id: int, *, skip: int = 0, limit: int = 100) ->
     return (
         db.query(models.EvidenceClip)
         .filter(models.EvidenceClip.task_id == task_id)
-        .options(selectinload(models.EvidenceClip.feedback_events))
         .order_by(models.EvidenceClip.captured_at.desc(), models.EvidenceClip.id.desc())
         .offset(max(0, skip))
         .limit(max(1, min(limit, MAX_LIST)))
@@ -143,13 +145,11 @@ def manifest(db: Session, task_id: int) -> list[dict]:
         raise EvidenceNotFound(f"Task {task_id} not found")
     clips = (
         db.query(models.EvidenceClip)
-        .options(selectinload(models.EvidenceClip.feedback_events))
         .filter(models.EvidenceClip.task_id == task_id)
         .order_by(models.EvidenceClip.captured_at.desc(), models.EvidenceClip.id.desc())
-        .limit(MAX_CLIPS_PER_TASK)
         .all()
     )
-    return [clip_to_dict(clip) for clip in clips]
+    return clips_to_dicts(db, clips)
 
 
 def record_feedback(db: Session, clip_id: int, actor_id: int | None, verdict: str) -> models.EvidenceFeedback:
@@ -168,9 +168,28 @@ def record_feedback(db: Session, clip_id: int, actor_id: int | None, verdict: st
     return event
 
 
-def clip_to_dict(clip: models.EvidenceClip) -> dict:
+def _feedback_counts(db: Session, clip_ids: list[int]) -> dict[int, dict[str, int]]:
+    """Verdict counts per clip in one aggregate query - feedback rows are never loaded."""
+    counts = {clip_id: {verdict.value: 0 for verdict in models.EvidenceFeedbackVerdictEnum} for clip_id in clip_ids}
+    if clip_ids:
+        rows = (
+            db.query(models.EvidenceFeedback.evidence_clip_id, models.EvidenceFeedback.verdict, func.count())
+            .filter(models.EvidenceFeedback.evidence_clip_id.in_(clip_ids))
+            .group_by(models.EvidenceFeedback.evidence_clip_id, models.EvidenceFeedback.verdict)
+            .all()
+        )
+        for clip_id, verdict, count in rows:
+            counts[clip_id][models.EvidenceFeedbackVerdictEnum(verdict).value] = count
+    return counts
+
+
+def clips_to_dicts(db: Session, clips: list[models.EvidenceClip]) -> list[dict]:
+    counts = _feedback_counts(db, [clip.id for clip in clips])
+    return [clip_to_dict(clip, counts[clip.id]) for clip in clips]
+
+
+def clip_to_dict(clip: models.EvidenceClip, feedback: dict[str, int]) -> dict:
     """The whole shared record of a clip. There is nothing else to disclose."""
-    counts = Counter(str(event.verdict) for event in clip.feedback_events)
     return {
         "id": clip.id,
         "evidence_ref": clip.evidence_ref,
@@ -181,7 +200,7 @@ def clip_to_dict(clip: models.EvidenceClip) -> dict:
         "content_sha256": clip.content_sha256,
         "content_algorithm": clip.content_algorithm,
         "captured_at": clip.captured_at.isoformat(),
-        "feedback": {verdict.value: counts.get(verdict.value, 0) for verdict in models.EvidenceFeedbackVerdictEnum},
+        "feedback": feedback,
     }
 
 

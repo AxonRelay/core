@@ -460,3 +460,13 @@ def test_a_url_with_a_bad_port_is_refused_on_the_way_in(store):
     """Round-4 finding: `urlsplit().port` raised later, inside a Context Pack."""
     with pytest.raises(evidence_local.LocalEvidenceError):
         evidence_local.put("text", url="https://example.com:bad/page")
+
+
+def test_full_urls_that_share_a_ledger_url_keep_one_capture(store):
+    """Round-6 finding: ?version=old and ?version=new are one ledger clip; the newer capture wins."""
+    digest = evidence_local.put("Versioned page text.", title="Old", url=URL + "?version=old")
+    evidence_local.put("Versioned page text.", title="New", url=URL + "?version=new#top")
+
+    assert [c["title"] for c in evidence_local.get(digest)["captures"]] == ["New"]
+    item = evidence_local.build_context_pack(1, [_entry(1, "Versioned page text.")])["items"][0]
+    assert item["source_title"] == "New"

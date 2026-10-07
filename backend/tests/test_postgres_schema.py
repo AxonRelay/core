@@ -395,6 +395,53 @@ class TestEvidenceClips:
         assert clip.source_type == models.EvidenceSourceTypeEnum.PERSONAL
         assert event.verdict == models.EvidenceFeedbackVerdictEnum.MISLEADING
 
+    def test_racing_captures_cannot_pass_the_per_task_cap(self, migrated_engine, monkeypatch):
+        """The count-then-insert runs under the task row lock, so concurrent captures stop at the cap."""
+        monkeypatch.setattr(evidence, "MAX_CLIPS_PER_TASK", 3)
+        factory = sessionmaker(bind=migrated_engine, autoflush=False)
+        setup = factory()
+        task = models.Task(thread_id="parity-evidence-cap", title="t")
+        setup.add(task)
+        setup.commit()
+        task_id = task.id
+        setup.close()
+
+        barrier = threading.Barrier(8)
+        outcomes = []
+
+        def _capture(i):
+            session = factory()
+            try:
+                barrier.wait()
+                evidence.create_clip(
+                    session,
+                    task_id=task_id,
+                    captured_by_actor_id=None,
+                    source_url=f"https://example.com/{i}",
+                    source_type="public",
+                    content_sha256=ledger.compute_artifact_commitment(str(i)),
+                )
+                outcomes.append("ok")
+            except evidence.EvidenceError:
+                outcomes.append("refused")
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=_capture, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        check = factory()
+        try:
+            stored = check.query(models.EvidenceClip).filter(models.EvidenceClip.task_id == task_id).count()
+            counts = evidence.manifest(check, task_id)
+        finally:
+            check.close()
+        assert sorted(outcomes) == ["ok"] * 3 + ["refused"] * 5
+        assert stored == 3 and len(counts) == 3
+
     def test_the_database_refuses_a_digest_the_model_would_have(self, migrated_engine):
         """The check constraint holds even for a writer that bypasses the ORM validator."""
         from sqlalchemy.exc import IntegrityError

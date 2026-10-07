@@ -1096,7 +1096,7 @@ def capture_evidence_clip(task_id: int, source_url: str, source_type: str, conte
             )
         except ValueError as e:
             raise ToolError(str(e)) from None
-        return {**evidence.clip_to_dict(clip), "created": created}
+        return {**evidence.clips_to_dicts(db, [clip])[0], "created": created}
 
 
 @mcp.tool()
@@ -1104,7 +1104,7 @@ def list_evidence_clips(task_id: int, skip: int = 0, limit: int = 100) -> list[d
     """A task's clip manifest, newest first: refs, digests, provenance and feedback counts. No text."""
     with _session() as db:
         try:
-            return [evidence.clip_to_dict(c) for c in evidence.list_clips(db, task_id, skip=skip, limit=limit)]
+            return evidence.clips_to_dicts(db, evidence.list_clips(db, task_id, skip=skip, limit=limit))
         except ValueError as e:
             raise ToolError(str(e)) from None
 
