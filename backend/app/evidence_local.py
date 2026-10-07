@@ -274,6 +274,10 @@ def _view(record: dict, source_url: str) -> dict:
     provenance; with no matching capture the clip shows its text alone.
     """
     wanted = _ledger_form(source_url)
+    if wanted is None:
+        # Never pair "no URL" with "no URL": a capture without a source is not
+        # this clip's.
+        return {"content": record["content"], "title": None, "annotations": None}
     capture = next(
         (c for c in record.get("captures", []) if isinstance(c, dict) and _ledger_form(c.get("url")) == wanted),
         {},

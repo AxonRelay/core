@@ -470,3 +470,12 @@ def test_full_urls_that_share_a_ledger_url_keep_one_capture(store):
     assert [c["title"] for c in evidence_local.get(digest)["captures"]] == ["New"]
     item = evidence_local.build_context_pack(1, [_entry(1, "Versioned page text.")])["items"][0]
     assert item["source_title"] == "New"
+
+
+def test_a_sourceless_capture_is_never_shown_under_an_unparseable_ledger_url(store):
+    """Round-7 finding: None == None paired a URL-less capture with any unparseable source."""
+    evidence_local.put("Orphan text.", title="No source", annotations={"summary": "x"})
+    item = evidence_local.build_context_pack(
+        1, [_entry(1, "Orphan text.") | {"source_url": "https://example.com:bad/page"}]
+    )["items"][0]
+    assert item["source_title"] == "" and item["annotations"] is None

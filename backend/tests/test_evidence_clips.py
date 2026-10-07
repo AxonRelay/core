@@ -154,6 +154,7 @@ def test_text_fields_are_refused_not_dropped(client, db, task, field, caplog):
         f"https://user:{CANARY}@example.com/page",
         f"ftp://example.com/{CANARY}",
         f"javascript:{CANARY}",
+        f"https://example.com:{CANARY}/page",
     ],
 )
 def test_an_unsafe_source_url_is_refused_without_echo(client, db, task, url):

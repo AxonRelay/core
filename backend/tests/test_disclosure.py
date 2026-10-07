@@ -395,6 +395,8 @@ def test_config_keys_handles_the_shapes_a_json_column_can_hold():
         "https://example.invalid/x?access_token=t0ken",
         "https://example.invalid/x#section",
         "https://",
+        "https://example.invalid:bad/x",
+        "https://example.invalid:99999/x",
     ],
 )
 def test_an_unsafe_url_is_refused_at_the_model_boundary(db, url):
