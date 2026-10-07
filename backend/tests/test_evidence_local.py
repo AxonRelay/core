@@ -409,3 +409,47 @@ def test_a_match_the_budget_cannot_hold_is_counted_not_lost(store):
 def test_nothing_is_omitted_when_everything_fits(store):
     evidence_local.put("fits", url=URL)
     assert evidence_local.build_context_pack(1, [_entry(1, "fits")])["omitted_count"] == 0
+
+
+def test_concurrent_puts_of_the_same_words_keep_every_capture(store):
+    """Round-3 finding: an unlocked read-modify-replace dropped a concurrent capture."""
+    import threading
+
+    pages = [f"https://example.com/page-{i}" for i in range(16)]
+    barrier = threading.Barrier(len(pages))
+
+    def _put(url):
+        barrier.wait()
+        evidence_local.put("Same words everywhere.", title=url, url=url)
+
+    threads = [threading.Thread(target=_put, args=(url,)) for url in pages]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    record = evidence_local.get(ledger.compute_artifact_commitment("Same words everywhere."))
+    assert sorted(c["url"] for c in record["captures"]) == sorted(pages)
+
+
+@pytest.mark.parametrize(
+    "captures",
+    [
+        [{"title": 7, "url": URL, "annotations": None}],
+        [{"title": "T", "url": URL, "annotations": "not an object"}],
+        ["not a capture"],
+        "not a list",
+    ],
+)
+def test_malformed_capture_metadata_cannot_break_a_pack(store, captures):
+    """Round-3 finding: a valid digest with corrupted metadata raised inside ranking."""
+    digest = evidence_local.put("Intact text.", url=URL)
+    path = store / f"{digest}.json"
+    record = json.loads(path.read_text())
+    record["captures"] = captures
+    path.write_text(json.dumps(record))
+
+    pack = evidence_local.build_context_pack(1, [_entry(1, "Intact text.")], query="intact text")
+
+    assert [i["evidence_ref"] for i in pack["items"]] == ["E-1"]
+    assert pack["items"][0]["source_title"] == "" and pack["items"][0]["annotations"] is None

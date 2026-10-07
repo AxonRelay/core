@@ -25,6 +25,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -129,29 +130,43 @@ def put(
     digest = ledger.compute_artifact_commitment(content)
     directory = store_dir(store)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        existing = get(digest, store=directory)
-    except LocalEvidenceError:
-        existing = None  # unreadable or tampered: the fresh text replaces it
-    captures = [c for c in (existing or {}).get("captures", []) if isinstance(c, dict) and c.get("url") != url]
-    captures.append({"title": title, "url": url, "annotations": annotations})
-    record = {
-        "content_sha256": digest,
-        "content_algorithm": ledger.COMMITMENT_ALGORITHM,
-        "content": content,
-        "captures": captures,
-    }
-    # Write-then-rename, so a reader never sees half a record.
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(record, handle, ensure_ascii=False)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, directory / f"{digest}.json")
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    # Read-modify-replace under an exclusive lock: two writers adding captures
+    # of the same words from different pages must not drop each other's.
+    with open(directory / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            existing = get(digest, store=directory)
+        except LocalEvidenceError:
+            existing = None  # unreadable or tampered: the fresh text replaces it
+        captures = [c for c in (existing or {}).get("captures", []) if c.get("url") != url]
+        captures.append({"title": title, "url": url, "annotations": annotations})
+        record = {
+            "content_sha256": digest,
+            "content_algorithm": ledger.COMMITMENT_ALGORITHM,
+            "content": content,
+            "captures": captures,
+        }
+        # Write-then-rename, so a reader never sees half a record.
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, directory / f"{digest}.json")
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
     return digest
+
+
+def _valid_capture(capture) -> bool:
+    if not isinstance(capture, dict):
+        return False
+    try:
+        _validate_record("x", capture.get("title"), capture.get("url"), capture.get("annotations"))
+    except LocalEvidenceError:
+        return False
+    return True
 
 
 def get(content_sha256: str, *, store: str | os.PathLike | None = None) -> dict | None:
@@ -174,6 +189,11 @@ def get(content_sha256: str, *, store: str | os.PathLike | None = None) -> dict 
     content = record.get("content") if isinstance(record, dict) else None
     if not isinstance(content, str) or ledger.compute_artifact_commitment(content) != content_sha256:
         raise LocalEvidenceError(f"local record {content_sha256} does not match its digest")
+    # The text is what the digest vouches for; capture metadata is not covered
+    # by it. A malformed capture (hand-edited, half-corrupted) is dropped rather
+    # than allowed to break the pack that reads it.
+    captures = record.get("captures")
+    record["captures"] = [c for c in captures if _valid_capture(c)] if isinstance(captures, list) else []
     return record
 
 
