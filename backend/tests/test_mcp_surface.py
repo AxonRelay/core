@@ -43,6 +43,14 @@ COORDINATION_TOOLS = {
     "ack_relay",
 }
 
+EVIDENCE_TOOLS = {
+    "capture_evidence_clip",
+    "list_evidence_clips",
+    "get_context_pack",
+    "evaluate_evidence_clip",
+    "validate_evidence_references",
+}
+
 
 @pytest.fixture(scope="module")
 def server():
@@ -66,6 +74,10 @@ def test_every_ledger_tool_is_registered(tools):
 
 def test_every_coordination_tool_is_registered(tools):
     assert set(tools) >= COORDINATION_TOOLS
+
+
+def test_every_evidence_tool_is_registered(tools):
+    assert set(tools) >= EVIDENCE_TOOLS
 
 
 def test_no_tool_was_registered_twice(server):

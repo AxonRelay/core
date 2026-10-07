@@ -36,7 +36,7 @@ from sqlalchemy import Enum, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
-from app import coordination, crud, ledger, models
+from app import coordination, crud, evidence, ledger, models
 
 TEST_URL = os.environ.get("AXONRELAY_TEST_POSTGRES_URL")
 if TEST_URL:
@@ -65,6 +65,8 @@ MODEL_ENUMS = [
     models.ClaimReasonCodeEnum,
     models.RelayCodeEnum,
     models.AckCodeEnum,
+    models.EvidenceSourceTypeEnum,
+    models.EvidenceFeedbackVerdictEnum,
 ]
 
 COORDINATION_TABLES = {"workspaces", "sessions", "claims", "relays", "relay_receipts", "safe_events", "credentials"}
@@ -346,6 +348,74 @@ class TestMigrationChain:
             ("relays", "code"),
             ("relay_receipts", "ack_code"),
         } <= columns
+
+
+class TestEvidenceClips:
+    """Migration 014: commitments and provenance, and no column for the text."""
+
+    def test_the_columns_match_the_model_exactly(self, migrated_engine):
+        with migrated_engine.connect() as conn:
+            for table, model in (
+                ("evidence_clips", models.EvidenceClip),
+                ("evidence_feedback", models.EvidenceFeedback),
+            ):
+                columns = {
+                    r[0]
+                    for r in conn.execute(
+                        text("SELECT column_name FROM information_schema.columns WHERE table_name = :t"), {"t": table}
+                    ).all()
+                }
+                assert columns == {c.name for c in model.__table__.columns}, table
+
+    def test_a_clip_round_trips_and_a_recapture_is_idempotent(self, pg_session):
+        task = models.Task(thread_id="parity-evidence", title="t")
+        pg_session.add(task)
+        pg_session.commit()
+        digest = ledger.compute_artifact_commitment("excerpt")
+
+        clip, created = evidence.create_clip(
+            pg_session,
+            task_id=task.id,
+            captured_by_actor_id=None,
+            source_url="https://example.com/a",
+            source_type="personal",
+            content_sha256=digest,
+        )
+        again, created_again = evidence.create_clip(
+            pg_session,
+            task_id=task.id,
+            captured_by_actor_id=None,
+            source_url="https://example.com/a",
+            source_type="personal",
+            content_sha256=digest,
+        )
+        event = evidence.record_feedback(pg_session, clip.id, None, "misleading")
+
+        assert (created, created_again, again.id) == (True, False, clip.id)
+        assert clip.source_type == models.EvidenceSourceTypeEnum.PERSONAL
+        assert event.verdict == models.EvidenceFeedbackVerdictEnum.MISLEADING
+
+    def test_the_database_refuses_a_digest_the_model_would_have(self, migrated_engine):
+        """The check constraint holds even for a writer that bypasses the ORM validator."""
+        from sqlalchemy.exc import IntegrityError
+
+        with migrated_engine.connect() as conn:
+            task_id = conn.execute(
+                text(
+                    "INSERT INTO tasks (thread_id, title, status, created_at, updated_at, state_version) "
+                    "VALUES ('parity-evidence-raw', 't', 'DRAFT', now(), now(), 0) RETURNING id"
+                )
+            ).scalar()
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        "INSERT INTO evidence_clips (task_id, source_url, source_type, content_sha256, "
+                        "content_algorithm, captured_at) VALUES (:t, 'https://example.com/', 'PUBLIC', :d, "
+                        "'sha256-utf8-v1', now())"
+                    ),
+                    {"t": task_id, "d": "A" * 64},
+                )
+            conn.rollback()
 
 
 class TestEnumParity:
@@ -815,7 +885,8 @@ def test_downgrading_013_refuses_once_a_v3_entry_exists():
         output = _run_alembic_expecting(url, ["downgrade", "012"], succeed=False)
         assert "v3" in output and "decision_key" in output
         with engine.connect() as conn:
-            assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "013"
+            # Nothing moved: the refusal rolls back the whole downgrade, from head.
+            assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == _expected_head()
     finally:
         engine.dispose()
 

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app import ledger
 
@@ -202,3 +202,27 @@ class ApprovalResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ========== Evidence Clip Schemas ==========
+
+
+class EvidenceClipCreateRequest(BaseModel):
+    """A clip commitment (ADR-014). The excerpt itself is not a field, and unknown fields are refused.
+
+    A client that still sends ``quote`` or ``title`` gets a 422 naming the
+    location, not a silent drop: it should learn that the text stays local.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_url: str = Field(..., min_length=1, max_length=2000)
+    source_type: str = Field(..., pattern="^(public|personal)$")
+    content_sha256: str = Field(..., pattern=ledger.SHA256_HEX_PATTERN)
+    content_algorithm: str = Field(ledger.COMMITMENT_ALGORITHM, max_length=32)
+
+
+class EvidenceFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: str = Field(..., pattern="^(relevant|irrelevant|misleading)$")

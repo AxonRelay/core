@@ -18,7 +18,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from app import authz, coordination, crud, disclosure, langgraph_client, models, safe_envelope, service
+from app import authz, coordination, crud, disclosure, evidence, langgraph_client, models, safe_envelope, service
 from app.database import get_db
 from app.mcp.serializers import claim_to_dict, session_to_dict
 from app.ratelimit import client_key
@@ -30,6 +30,8 @@ from app.schema import (
     ApprovalResponse,
     ApproveRequest,
     DraftResponse,
+    EvidenceClipCreateRequest,
+    EvidenceFeedbackRequest,
     RejectRequest,
     TaskAssignmentCreateRequest,
     TaskAssignmentResponse,
@@ -659,6 +661,69 @@ async def get_approvals_endpoint(request: Request, task_id: int, db: Session = D
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return crud.get_approvals(db, task_id)
+
+
+# ========== Evidence Clips (commitments only; ADR-014) ==========
+
+
+def _evidence_http_error(exc: ValueError) -> HTTPException:
+    """Map an evidence refusal to HTTP. Every message names fields, never submitted values."""
+    if isinstance(exc, evidence.EvidenceNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, evidence.EvidenceConflict):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/tasks/{task_id}/evidence-clips")
+@limiter.limit("30/minute")
+async def create_evidence_clip_endpoint(
+    request: Request,
+    task_id: int,
+    clip_data: EvidenceClipCreateRequest,
+    db: Session = Depends(get_db),
+    _guard: None = Depends(_free_text_surface),
+):
+    """Record that an excerpt was captured: its SHA-256 and where it came from.
+
+    The excerpt stays with the client (app/evidence_local.py). The server
+    never fetches the URL, and refuses one carrying a query, fragment or
+    credential: strip them on the client, where the full URL is kept.
+    201 for a new clip, 200 when the same capture was already recorded.
+    """
+    try:
+        clip, created = evidence.create_clip(
+            db, task_id=task_id, captured_by_actor_id=authz.acting_actor_id(db), **clip_data.model_dump()
+        )
+    except ValueError as exc:
+        raise _evidence_http_error(exc) from None
+    return JSONResponse(status_code=201 if created else 200, content=evidence.clip_to_dict(clip))
+
+
+@app.get("/tasks/{task_id}/evidence-clips")
+@limiter.limit("60/minute")
+async def list_evidence_clips_endpoint(
+    request: Request, task_id: int, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)
+):
+    """A task's clip manifest, newest first: refs, digests and provenance."""
+    try:
+        clips = evidence.list_clips(db, task_id, skip=skip, limit=limit)
+    except ValueError as exc:
+        raise _evidence_http_error(exc) from None
+    return [evidence.clip_to_dict(clip) for clip in clips]
+
+
+@app.post("/evidence-clips/{clip_id}/feedback", status_code=201)
+@limiter.limit("30/minute")
+async def evidence_feedback_endpoint(
+    request: Request, clip_id: int, feedback_data: EvidenceFeedbackRequest, db: Session = Depends(get_db)
+):
+    """Append a relevant / irrelevant / misleading verdict to a clip."""
+    try:
+        event = evidence.record_feedback(db, clip_id, authz.acting_actor_id(db), feedback_data.verdict)
+    except ValueError as exc:
+        raise _evidence_http_error(exc) from None
+    return evidence.feedback_to_dict(event)
 
 
 # ========== Ledger Integrity ==========

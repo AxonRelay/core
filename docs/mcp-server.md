@@ -158,6 +158,19 @@ Actor 名も `actor_ref` に置き換わり、これは MCP と REST の両方�
 
 モードによらず、agent の `config` は**キー名のみ**（`config_keys`）が返る。
 
+### Evidence Clip（[ADR-014](./adr-014-evidence-clips.md)）
+
+共有台帳は抜粋の SHA-256 と出所だけを持つ。本文はローカルに置き
+（`python -m app.evidence_local put` が digest を出す）、Context Pack はローカルで解決する。
+
+| Tool | 用途 |
+|---|---|
+| `capture_evidence_clip(task_id, source_url, source_type, content_sha256)` | 抜粋の commitment を記録する。`source_url` は http(s) で query・fragment・資格情報なし。同じ capture の再送は `created: false` で既存行を返す。draft では `[E-<id>]` で引用する |
+| `list_evidence_clips(task_id, skip?, limit?)` | task の clip manifest（新しい順、feedback 件数つき）。本文は含まない |
+| `get_context_pack(task_id, query?, limit?, char_budget?)` | ローカル store から本文を解決し、決定的な trigram ランキングで返す。**stdio のときだけ**本文を読む。HTTP では全 clip を `unresolved` として digest と出所だけ返す |
+| `evaluate_evidence_clip(clip_id, verdict)` | `relevant` / `irrelevant` / `misleading` を追記する |
+| `validate_evidence_references(task_id, draft)` | draft の `[E-n]` がこの task の clip を指すかを確かめる（読み取りのみ） |
+
 ### Safe Envelope（content-blind 取り込み）
 
 `AXONRELAY_SAFE_MODE=1` のインスタンスでは上の書き込み系 tool と調整レイヤーの書き込み系 tool は固定文言で拒否され、以下だけが書き込み経路になる（[ADR-010](./adr-010-safe-envelope.md)、[schema](./schemas/safe-envelope-v1.json)）。

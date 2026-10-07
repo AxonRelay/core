@@ -371,6 +371,11 @@ REST_FREE_TEXT = [
     ("post", "/tasks/1/reject", {"comment": CANARY, "reason": CANARY}),
     ("post", "/agents", {"name": "n", "agent_type": "writer", "description": CANARY}),
     ("put", "/agents/1", {"description": CANARY}),
+    (
+        "post",
+        "/tasks/1/evidence-clips",
+        {"source_url": "https://example.com/" + CANARY, "source_type": "public", "content_sha256": "0" * 64},
+    ),
 ]
 
 
@@ -403,6 +408,17 @@ MCP_FREE_TEXT = [
     ("claim_git_resource", {"session_id": 1, "resource": "stash", "reason": CANARY}),
     ("send_relay", {"from_session_id": 1, "subject": CANARY, "body": CANARY}),
     ("ack_relay", {"relay_id": 1, "session_id": 1, "note": CANARY}),
+    (
+        "capture_evidence_clip",
+        {
+            "task_id": 1,
+            "source_url": "https://example.com/" + CANARY,
+            "source_type": "public",
+            "content_sha256": "0" * 64,
+        },
+    ),
+    ("get_context_pack", {"task_id": 1, "query": CANARY}),
+    ("validate_evidence_references", {"task_id": 1, "draft": CANARY}),
 ]
 
 
@@ -531,6 +547,8 @@ MCP_READ_ONLY = {
     "release_territory",
     "read_inbox",
     "check_git_resource",
+    "list_evidence_clips",
+    "evaluate_evidence_clip",
 }
 MCP_ENVELOPE = {"ingest_safe_envelope", "list_safe_events"}
 MCP_REFUSED = {name for name, _ in MCP_FREE_TEXT} | {"review_pending_task", "check_conflicts"}
@@ -559,6 +577,7 @@ REST_REFUSED = {
     ("POST", "/tasks/{task_id}/reject"),
     ("POST", "/agents"),
     ("PUT", "/agents/{agent_id}"),
+    ("POST", "/tasks/{task_id}/evidence-clips"),
 }
 REST_ENVELOPE = {("POST", "/envelopes"), ("GET", "/envelopes")}
 
@@ -580,6 +599,8 @@ def test_every_rest_write_route_is_classified_for_safe_mode():
             ("DELETE", "/agents/{agent_id}"),
             ("DELETE", "/tasks/{task_id}/assignments/{actor_id}"),
             ("POST", "/tasks/{task_id}/assignments"),
+            # A clip id and a closed verdict: nothing free-form to receive.
+            ("POST", "/evidence-clips/{clip_id}/feedback"),
         }
     )
     assert unclassified == set(), f"classify these write routes for safe mode: {sorted(unclassified)}"

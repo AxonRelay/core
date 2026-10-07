@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AxonRelay Evidence Clip</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Evidence Clip</h1>
+      <p id="status" class="status">Select text in the active tab, then load it.</p>
+
+      <label>Task ID <input id="taskId" type="number" min="1" required /></label>
+      <label>Source type
+        <select id="sourceType">
+          <option value="public">Public</option>
+          <option value="personal">Personal</option>
+        </select>
+      </label>
+      <button id="load" type="button">Load selected text</button>
+
+      <section id="preview" hidden>
+        <h2>Source preview</h2>
+        <p id="source"></p>
+        <p id="sourceUrl"></p>
+        <p class="digest">SHA-256 <code id="digest"></code></p>
+        <blockquote id="quote"></blockquote>
+        <button id="enrich" type="button">Add local AI annotations</button>
+        <label>Annotations (kept in this profile; never sent)
+          <textarea id="annotations" rows="8">{}</textarea>
+        </label>
+        <label class="confirm"><input id="confirmPolicy" type="checkbox" /> This is public or personal data, not workplace data.</label>
+        <button id="save" type="button">Record digest in AxonRelay</button>
+      </section>
+
+      <p>Local clips: <span id="localCount">0</span></p>
+      <button id="export" type="button">Export local clips (JSONL)</button>
+
+      <details>
+        <summary>Local connection</summary>
+        <label>Endpoint <input id="endpoint" value="http://127.0.0.1:8000" /></label>
+        <label>Credential (only if the instance requires one) <input id="token" type="password" autocomplete="off" /></label>
+        <label>Blocked host suffixes
+          <input id="blockedHosts" placeholder="corp.example,internal.example" />
+        </label>
+        <button id="saveSettings" type="button">Save settings</button>
+      </details>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
