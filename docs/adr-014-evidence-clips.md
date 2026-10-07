@@ -89,6 +89,9 @@ pack は `char_budget`（2,000〜20,000 文字）を超えない。先頭の 1 �
 注釈・title を落とし、本文を接頭辞に切って `verbatim_complete: false` を付ける。
 ref・digest・URL は落とさない——それが無いと引用も照合もできない。
 
+pack は task の manifest を**全件**読む（古い引用が見えなくならないように）。そのため 1 task の
+clip は `MAX_CLIPS_PER_TASK`（1,000）までとし、上限は capture 時に拒否する。
+
 REST には Context Pack の endpoint を置かない。サーバ側では本文を解決できないので、
 置いても manifest と同じものしか返せない。manifest は `GET /tasks/{id}/evidence-clips`。
 

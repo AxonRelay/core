@@ -311,3 +311,44 @@ def test_mcp_validate_references(mcp_db, task):
     )
     result = _call_tool("validate_evidence_references", {"task_id": task.id, "draft": f"[{clip['evidence_ref']}]"})
     assert result["valid"] == [clip["evidence_ref"]]
+
+
+def test_a_task_holds_a_bounded_number_of_clips(db, task, monkeypatch):
+    """Round-5 finding: the Context Pack reads the whole manifest, so the manifest is bounded at capture."""
+    monkeypatch.setattr(evidence, "MAX_CLIPS_PER_TASK", 3)
+    for i in range(3):
+        evidence.create_clip(
+            db,
+            task_id=task.id,
+            captured_by_actor_id=None,
+            source_url=f"{URL}/{i}",
+            source_type="public",
+            content_sha256=DIGEST,
+        )
+    with pytest.raises(evidence.EvidenceError):
+        evidence.create_clip(
+            db,
+            task_id=task.id,
+            captured_by_actor_id=None,
+            source_url=f"{URL}/9",
+            source_type="public",
+            content_sha256=DIGEST,
+        )
+    # Re-sending an existing capture is still idempotent at the cap.
+    _, created = evidence.create_clip(
+        db,
+        task_id=task.id,
+        captured_by_actor_id=None,
+        source_url=f"{URL}/0",
+        source_type="public",
+        content_sha256=DIGEST,
+    )
+    assert created is False
+
+
+def test_an_enormous_citation_number_is_missing_not_an_error(db, task):
+    """Round-5 finding: int() on an unbounded digit run raised before any lookup."""
+    draft = "[E-" + "9" * 5000 + "] and [E-123456789012345678]"
+    result = evidence.validate_draft_references(db, task.id, draft)
+    assert result["missing"] == ["E-123456789012345678"]
+    assert result["valid"] == []

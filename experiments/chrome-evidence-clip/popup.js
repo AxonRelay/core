@@ -44,7 +44,8 @@ async function saveSettings() {
 function isBlocked(url, blockedHosts) {
   const parsed = new URL(url);
   if (!["http:", "https:"].includes(parsed.protocol)) return true;
-  const suffixes = blockedHosts.split(",").map((value) => value.trim()).filter(Boolean);
+  // URL.hostname is lowercase already; DNS names are case-insensitive.
+  const suffixes = blockedHosts.split(",").map((value) => value.trim().toLowerCase().replace(/^\.+/, "")).filter(Boolean);
   return suffixes.some((suffix) => parsed.hostname === suffix || parsed.hostname.endsWith(`.${suffix}`));
 }
 

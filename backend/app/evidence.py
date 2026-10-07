@@ -17,14 +17,18 @@ import re
 from collections import Counter
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app import ledger, models
 
-#: Citation form a draft uses for a clip, e.g. ``[E-12]``.
-EVIDENCE_REF = re.compile(r"\[E-(\d+)\]")
+#: Citation form a draft uses for a clip, e.g. ``[E-12]``. Bounded digits:
+#: a longer run is not an id this ledger could have issued.
+EVIDENCE_REF = re.compile(r"\[E-(\d{1,18})\]")
 
 MAX_LIST = 500
+#: Clips one task may hold. A Context Pack reads a task's whole manifest (so an
+#: old citation is never invisible), which needs the manifest to be bounded.
+MAX_CLIPS_PER_TASK = 1_000
 
 
 class EvidenceError(ValueError):
@@ -78,6 +82,9 @@ def create_clip(
     )
     existing = _find(db, task_id, clip.source_url, content_sha256)
     if existing is None:
+        count = db.query(models.EvidenceClip).filter(models.EvidenceClip.task_id == task_id).count()
+        if count >= MAX_CLIPS_PER_TASK:
+            raise EvidenceError(f"a task holds at most {MAX_CLIPS_PER_TASK} evidence clips")
         db.add(clip)
         try:
             db.commit()
@@ -118,6 +125,7 @@ def list_clips(db: Session, task_id: int, *, skip: int = 0, limit: int = 100) ->
     return (
         db.query(models.EvidenceClip)
         .filter(models.EvidenceClip.task_id == task_id)
+        .options(selectinload(models.EvidenceClip.feedback_events))
         .order_by(models.EvidenceClip.captured_at.desc(), models.EvidenceClip.id.desc())
         .offset(max(0, skip))
         .limit(max(1, min(limit, MAX_LIST)))
@@ -135,8 +143,10 @@ def manifest(db: Session, task_id: int) -> list[dict]:
         raise EvidenceNotFound(f"Task {task_id} not found")
     clips = (
         db.query(models.EvidenceClip)
+        .options(selectinload(models.EvidenceClip.feedback_events))
         .filter(models.EvidenceClip.task_id == task_id)
         .order_by(models.EvidenceClip.captured_at.desc(), models.EvidenceClip.id.desc())
+        .limit(MAX_CLIPS_PER_TASK)
         .all()
     )
     return [clip_to_dict(clip) for clip in clips]
@@ -196,7 +206,9 @@ def validate_draft_references(db: Session, task_id: int, content: str) -> dict:
     if not db.get(models.Task, task_id):
         raise EvidenceNotFound(f"Task {task_id} not found")
     referenced = [f"E-{value}" for value in EVIDENCE_REF.findall(content)]
-    ids = {int(ref[2:]) for ref in referenced}
+    # Only ids an INTEGER column can hold reach the query; anything larger
+    # cannot be a clip and would fail in the Postgres driver's binder.
+    ids = {n for n in (int(ref[2:]) for ref in referenced) if 0 < n <= 2**31 - 1}
     clips = (
         db.query(models.EvidenceClip)
         .filter(models.EvidenceClip.task_id == task_id, models.EvidenceClip.id.in_(ids))
