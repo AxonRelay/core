@@ -56,7 +56,8 @@ jobs:
         run: pytest -q
 
       - name: Test Evidence Clip pilot evaluator
-        run: python -m unittest discover -s ../experiments/chrome-evidence-clip -q
+        working-directory: experiments/chrome-evidence-clip
+        run: python -m unittest discover -q
 
   test-migrations:
     name: Test Migrations (Postgres)

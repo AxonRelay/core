@@ -47,7 +47,7 @@ class EvaluationTests(unittest.TestCase):
 
     def test_retrieval_and_citations_are_measured_per_arm(self):
         report = score_evidence(
-            '1,b,B,design,80,4,a,"E-1,E-2",[E-1] E-3,E-1 E-99,E-99',
+            '1,b,B,design,80,4,a,"E-1,E-2,",[E-1] E-3,E-1 E-99,E-99',
             "1,c,C,design,85,4,a,E-1,-,-,-",
         )
         self.assertEqual(report["B"]["retrieval"]["recall_at_5_pct"], 50)

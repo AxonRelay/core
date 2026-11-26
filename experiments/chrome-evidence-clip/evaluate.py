@@ -41,7 +41,7 @@ def read_ids(value, field, line):
     if value == "-":
         return set()
     ids = set()
-    for token in re.split(r"[\s,]+", value):
+    for token in re.split(r"[\s,]+", value.rstrip(",").rstrip()):
         if not EVIDENCE_ID.fullmatch(token):
             raise ValueError(f"row {line}: invalid Evidence ID in {field}")
         ref = token.strip("[]")
@@ -94,7 +94,8 @@ def evaluate(stream):
         raise ValueError("expected unique columns from evaluation-template.csv")
 
     trials = {}
-    for line, row in enumerate(reader, start=2):
+    for row in reader:
+        line = reader.line_num
         if None in row or None in row.values():
             raise ValueError(f"row {line}: column count differs from header")
         batch, task, condition, kind, baseline = (

@@ -57,7 +57,7 @@ unique task ID. For each B or C trial, enter the comparable A task ID from
 the same batch and task type in `baseline_pair_task_id`. Choose pairs before
 scoring. Each A trial can serve once per comparison arm.
 
-From this directory run `python3 evaluate.py /path/to/trials.csv`.
+From this directory run `python3 evaluate.py /path/to/trials.csv` with Python 3.12.
 For B and C separately, the report shows the number of matched pairs, the
 median of their time reductions (100 × (1 − trial time / baseline time)),
 the mean trial-minus-baseline quality score, and how many A trials were left
