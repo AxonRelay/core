@@ -5,6 +5,7 @@ import json
 import stat
 
 import pytest
+from sqlalchemy import event
 
 from app import evidence, evidence_local, ledger, models
 from app.mcp import server
@@ -201,6 +202,16 @@ def test_annotations_are_searched_on_their_own_plane(store):
     assert pack["items"][0]["matched_plane"] == "source_claim"
 
 
+def test_short_normalized_query_preserves_whole_plane_overlap(store):
+    evidence_local.put("AB")
+    evidence_local.put("ABC")
+    pack = evidence_local.build_context_pack(1, [_entry(2, "ABC"), _entry(1, "AB")], query="Ａ Ｂ")
+
+    # The short query is a substring of both, but only the entire short
+    # plane contributes overlap. Its higher score wins over recency.
+    assert [(item["evidence_ref"], item["score"]) for item in pack["items"]] == [("E-1", 3.0), ("E-2", 2.0)]
+
+
 def test_text_not_on_this_machine_is_reported_unresolved(store):
     evidence_local.put("here")
     pack = evidence_local.build_context_pack(1, [_entry(2, "elsewhere"), _entry(1, "here")])
@@ -275,8 +286,19 @@ def test_the_mcp_pack_resolves_from_the_local_store_on_stdio(mcp_db, store, self
     )
 
     tool = server.mcp._tool_manager.get_tool("get_context_pack")
-    pack = asyncio.run(tool.run({"task_id": task.id, "query": "brown fox"}, context=None))
+    statements = []
 
+    def record_statement(_conn, _cursor, statement, *_args):
+        statements.append(statement)
+
+    engine = mcp_db.get_bind()
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        pack = asyncio.run(tool.run({"task_id": task.id, "query": "brown fox"}, context=None))
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert not any("evidence_feedback" in statement for statement in statements)
     assert [item["evidence_ref"] for item in pack["items"]] == [clip.evidence_ref]
     assert pack["items"][0]["content"] == "The quick brown fox."
     # The ledger never saw the text.

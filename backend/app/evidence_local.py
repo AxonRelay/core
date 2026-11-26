@@ -28,6 +28,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -178,13 +179,18 @@ def get(content_sha256: str, *, store: str | os.PathLike | None = None) -> dict 
     A record whose text no longer hashes to its name is refused, not returned:
     showing it would present different words under the ledger's commitment.
     """
-    if not isinstance(content_sha256, str) or len(content_sha256) != 64:
+    return _read_record(content_sha256, str(store_dir(store)))
+
+
+_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _read_record(content_sha256: str, directory: str) -> dict | None:
+    if not isinstance(content_sha256, str) or not _DIGEST_PATTERN.fullmatch(content_sha256):
         return None
-    if any(ch not in "0123456789abcdef" for ch in content_sha256):
-        return None
-    path = store_dir(store) / f"{content_sha256}.json"
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        with open(os.path.join(directory, f"{content_sha256}.json"), encoding="utf-8") as stream:
+            record = json.load(stream)
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
@@ -246,10 +252,9 @@ def _normalized(value: str) -> str:
 
 
 def _trigrams(value: str) -> set[str]:
-    normalized = _normalized(value)
-    if len(normalized) < 3:
-        return {normalized} if normalized else set()
-    return {normalized[index : index + 3] for index in range(len(normalized) - 2)}
+    if len(value) < 3:
+        return {value} if value else set()
+    return {value[index : index + 3] for index in range(len(value) - 2)}
 
 
 def _ledger_form(url: str | None) -> str | None:
@@ -273,16 +278,22 @@ def _view(record: dict, source_url: str) -> dict:
     Another page's title and annotations are not shown under this clip's
     provenance; with no matching capture the clip shows its text alone.
     """
-    wanted = _ledger_form(source_url)
-    if wanted is None:
-        # Never pair "no URL" with "no URL": a capture without a source is not
-        # this clip's.
-        return {"content": record["content"], "title": None, "annotations": None}
-    capture = next(
-        (c for c in record.get("captures", []) if isinstance(c, dict) and _ledger_form(c.get("url")) == wanted),
-        {},
-    )
-    return {"content": record["content"], "title": capture.get("title"), "annotations": capture.get("annotations")}
+    # _read_record has already validated each capture URL. Exact matches
+    # need no further parsing, but earlier canonical matches still take precedence.
+    wanted = None
+    for capture in record["captures"]:
+        url = capture.get("url")
+        if not source_url or not url:
+            continue
+        if url != source_url:
+            if wanted is None:
+                wanted = _ledger_form(source_url)
+                if wanted is None:
+                    break
+            if _ledger_form(url) != wanted:
+                continue
+        return {"content": record["content"], "title": capture.get("title"), "annotations": capture.get("annotations")}
+    return {"content": record["content"], "title": None, "annotations": None}
 
 
 def _search_planes(record: dict) -> dict[str, str]:
@@ -302,10 +313,23 @@ def _search_planes(record: dict) -> dict[str, str]:
 
 def _score(record: dict, query_normalized: str, query_grams: set[str]) -> tuple[float, str]:
     weights = {"original": 1.0, "source_claim": 0.9, "interpretation": 0.7}
+    # A nonempty set from _trigrams contains either only full trigrams or
+    # a single short gram. Short grams match only an entire short plane.
+    check_substrings = 0 < len(query_grams) <= 24 and len(next(iter(query_grams))) == 3
     candidates = []
     for plane, text in _search_planes(record).items():
-        exact_bonus = 2.0 if query_normalized in _normalized(text) else 0.0
-        overlap = len(query_grams & _trigrams(text)) / len(query_grams) if query_grams else 0.0
+        if not text:
+            candidates.append((0.0, plane))
+            continue
+        normalized = _normalized(text)
+        exact_bonus = 2.0 if query_normalized in normalized else 0.0
+        if check_substrings:
+            # Short queries can check their own grams without allocating
+            # every trigram of the excerpt.
+            shared = sum(gram in normalized for gram in query_grams)
+        else:
+            shared = len(query_grams & _trigrams(normalized))
+        overlap = shared / len(query_grams) if query_grams else 0.0
         candidates.append(((exact_bonus + overlap) * weights[plane], plane))
     return max(candidates)
 
@@ -368,7 +392,7 @@ def build_context_pack(
     store: str | os.PathLike | None = None,
     local: bool = True,
 ) -> dict:
-    """Assemble a Context Pack from the ledger's manifest (``evidence.clip_to_dict`` rows).
+    """Assemble a Context Pack from the ledger's ``evidence.manifest`` rows.
 
     ``local=False`` is the remote-transport case: nothing is read from disk,
     every clip is listed as unresolved, and no query can be ranked.
@@ -385,11 +409,12 @@ def build_context_pack(
 
     resolved: list[tuple[dict, dict]] = []
     unresolved: list[dict] = []
+    directory = str(store_dir(store)) if local else None
     for entry in manifest:
         record = None
-        if local:
+        if directory is not None:
             try:
-                record = get(entry["content_sha256"], store=store)
+                record = _read_record(entry["content_sha256"], directory)
             except LocalEvidenceError:
                 record = None
         if record is None:
@@ -405,7 +430,7 @@ def build_context_pack(
 
     query_normalized = _normalized(query)
     if query_normalized:
-        query_grams = _trigrams(query_normalized)
+        query_grams = _trigrams(_normalized(query_normalized))
         scored = [(entry, record, *_score(record, query_normalized, query_grams)) for entry, record in resolved]
         scored = [result for result in scored if result[2] >= MIN_SCORE]
         scored.sort(key=lambda r: (r[2], r[0]["captured_at"], r[0]["id"]), reverse=True)
