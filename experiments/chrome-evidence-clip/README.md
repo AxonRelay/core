@@ -46,3 +46,44 @@ for the personal PoC. A production extension needs OS-backed secret handling or
 a short-lived pairing flow.
 
 `evaluation-template.csv` is the scoring sheet for the PoC in issue #52.
+
+### Compare decision time and quality
+
+Copy the template locally and replace its example row with observations. Use
+A for your usual workflow, B for raw clips and C for annotated clips. Record
+a positive decision time in seconds and have a reviewer score the decision
+from 1 to 5 without knowing the condition. Give every trial in a batch a
+unique task ID. For each B or C trial, enter the comparable A task ID from
+the same batch and task type in `baseline_pair_task_id`. Choose pairs before
+scoring. Each A trial can serve once per comparison arm.
+
+From this directory run `python3 evaluate.py /path/to/trials.csv` with Python 3.12.
+For B and C separately, the report shows the number of matched pairs, the
+median of their time reductions (100 × (1 − trial time / baseline time)),
+the mean trial-minus-baseline quality score, and how many A trials were left
+unpaired for each comparison. Positive values indicate
+faster decisions or higher quality. A missing arm produces zero pairs and
+null estimates. The output contains no task IDs, excerpts, or notes.
+
+### Measure retrieval and citations
+
+For B and C, choose the relevant IDs before running the query and record them
+in `expected_relevant_ids`. Copy up to five IDs from the result into
+`returned_top5_ids`. Record the distinct IDs cited in the draft in `cited_ids`
+and copy the distinct missing IDs from `validate_evidence_references` into
+`missing_or_invalid_ids`. Enter IDs as `E-1 E-2` or `[E-1], [E-2]`. Copy each
+ID as written, including leading zeros on invalid citations. Use `-` for an
+observed empty list and leave both cells blank
+when a measurement was skipped.
+
+The same command reports Recall@5 as retrieved relevant IDs divided by expected
+IDs, Relevant@5 as retrieved relevant IDs divided by returned IDs, and citation
+integrity as valid cited IDs divided by all cited IDs. Each ratio pools counts
+across measured trials within its condition. A zero denominator produces
+`null`. Drafts with no citations are counted separately. The report includes
+aggregate counts only.
+
+Small samples and arms paired to different baselines limit comparisons between
+B and C. Record reuse and privacy observations separately as described in
+[issue #52](https://github.com/AxonRelay/core/issues/52). Keep the completed
+worksheets local.

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -136,20 +136,29 @@ def list_clips(db: Session, task_id: int, *, skip: int = 0, limit: int = 100) ->
 
 
 def manifest(db: Session, task_id: int) -> list[dict]:
-    """Every clip of a task, newest first, as `clip_to_dict` rows - what a Context Pack resolves.
+    """The fields Context Pack needs from every clip of a task, newest first.
 
     Unpaged on purpose: a pack that saw only the newest page could neither
     return an older cited clip nor report it as unresolved.
     """
     if not db.get(models.Task, task_id):
         raise EvidenceNotFound(f"Task {task_id} not found")
-    clips = (
-        db.query(models.EvidenceClip)
-        .filter(models.EvidenceClip.task_id == task_id)
-        .order_by(models.EvidenceClip.captured_at.desc(), models.EvidenceClip.id.desc())
-        .all()
+    clip = models.EvidenceClip
+    rows = db.execute(
+        select(clip.id, clip.content_sha256, clip.source_url, clip.captured_at)
+        .where(clip.task_id == task_id)
+        .order_by(clip.captured_at.desc(), clip.id.desc())
     )
-    return clips_to_dicts(db, clips)
+    return [
+        {
+            "id": row.id,
+            "evidence_ref": f"E-{row.id}",
+            "content_sha256": row.content_sha256,
+            "source_url": row.source_url,
+            "captured_at": row.captured_at.isoformat(),
+        }
+        for row in rows
+    ]
 
 
 def record_feedback(db: Session, clip_id: int, actor_id: int | None, verdict: str) -> models.EvidenceFeedback:

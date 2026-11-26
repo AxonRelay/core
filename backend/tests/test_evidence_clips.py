@@ -379,7 +379,7 @@ def test_feedback_counts_come_from_one_aggregate_query(db, task):
     listener = lambda *args: statements.append(args[2])  # noqa: E731
     event.listen(db.get_bind(), "before_cursor_execute", listener)
     try:
-        rows = evidence.manifest(db, task.id)
+        rows = evidence.clips_to_dicts(db, evidence.list_clips(db, task.id))
     finally:
         event.remove(db.get_bind(), "before_cursor_execute", listener)
 
