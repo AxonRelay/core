@@ -298,8 +298,10 @@ def test_the_mcp_pack_resolves_from_the_local_store_on_stdio(mcp_db, store, self
     finally:
         event.remove(engine, "before_cursor_execute", record_statement)
 
+    assert any("evidence_clips" in statement for statement in statements)
     assert not any("evidence_feedback" in statement for statement in statements)
     assert [item["evidence_ref"] for item in pack["items"]] == [clip.evidence_ref]
+    assert pack["items"][0]["captured_at"] == evidence.clip_to_dict(clip, {})["captured_at"]
     assert pack["items"][0]["content"] == "The quick brown fox."
     # The ledger never saw the text.
     assert "brown fox" not in str([tuple(r) for r in mcp_db.execute(models.EvidenceClip.__table__.select())])

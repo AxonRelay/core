@@ -60,7 +60,8 @@ scoring. Each A trial can serve once per comparison arm.
 From this directory run `python3 evaluate.py /path/to/trials.csv`.
 For B and C separately, the report shows the number of matched pairs, the
 median of their time reductions (100 × (1 − trial time / baseline time)),
-and the mean trial-minus-baseline quality score. Positive values indicate
+the mean trial-minus-baseline quality score, and how many A trials were left
+unpaired for each comparison. Positive values indicate
 faster decisions or higher quality. A missing arm produces zero pairs and
 null estimates. The output contains no task IDs, excerpts, or notes.
 
@@ -70,8 +71,9 @@ For B and C, choose the relevant IDs before running the query and record them
 in `expected_relevant_ids`. Copy up to five IDs from the result into
 `returned_top5_ids`. Record the distinct IDs cited in the draft in `cited_ids`
 and copy the distinct missing IDs from `validate_evidence_references` into
-`missing_or_invalid_ids`. Use spaces or commas between IDs, with or without
-square brackets. Use `-` for an observed empty list and leave both cells blank
+`missing_or_invalid_ids`. Enter IDs as `E-1 E-2` or `[E-1], [E-2]`. Copy each
+ID as written, including leading zeros on invalid citations. Use `-` for an
+observed empty list and leave both cells blank
 when a measurement was skipped.
 
 The same command reports Recall@5 as retrieved relevant IDs divided by expected

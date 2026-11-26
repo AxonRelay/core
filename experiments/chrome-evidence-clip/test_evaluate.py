@@ -28,6 +28,7 @@ class EvaluationTests(unittest.TestCase):
     def test_absent_arm_has_no_estimate(self):
         arm = score("1,a,A,design,100,3,")["B"]
         self.assertEqual(arm["pairs"], 0)
+        self.assertEqual(arm["unpaired_baselines"], 1)
         self.assertIsNone(arm["median_decision_time_reduction_pct"])
 
     def test_invalid_pairs_and_measurements(self):
@@ -70,3 +71,7 @@ class EvaluationTests(unittest.TestCase):
         ):
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 score_evidence(f"1,b,B,design,80,4,a,{fields}")
+
+    def test_baseline_rows_reject_evidence_measurements(self):
+        with self.assertRaisesRegex(ValueError, "apply only to B and C"):
+            score_evidence("1,other,A,design,100,3,,E-1,E-1,,")

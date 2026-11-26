@@ -55,6 +55,9 @@ jobs:
       - name: Run pytest
         run: pytest -q
 
+      - name: Test Evidence Clip pilot evaluator
+        run: python -m unittest discover -s ../experiments/chrome-evidence-clip -q
+
   test-migrations:
     name: Test Migrations (Postgres)
     runs-on: ubuntu-latest

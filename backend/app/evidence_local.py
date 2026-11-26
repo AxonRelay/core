@@ -252,6 +252,7 @@ def _normalized(value: str) -> str:
 
 
 def _trigrams(value: str) -> set[str]:
+    """Return grams of an already normalized string."""
     if len(value) < 3:
         return {value} if value else set()
     return {value[index : index + 3] for index in range(len(value) - 2)}
@@ -430,6 +431,7 @@ def build_context_pack(
 
     query_normalized = _normalized(query)
     if query_normalized:
+        # Preserve the query's historical second normalization for gram matching.
         query_grams = _trigrams(_normalized(query_normalized))
         scored = [(entry, record, *_score(record, query_normalized, query_grams)) for entry, record in resolved]
         scored = [result for result in scored if result[2] >= MIN_SCORE]

@@ -119,9 +119,12 @@ def evaluate(stream):
         citations = read_measurement(row, ("cited_ids", "missing_or_invalid_ids"), line)
         if citations is not None and not citations[1].issubset(citations[0]):
             raise ValueError(f"row {line}: missing or invalid IDs must be a subset of cited IDs")
+        if condition == "A" and (retrieval is not None or citations is not None):
+            raise ValueError(f"row {line}: evidence measurements apply only to B and C")
         trials[batch, task] = Trial(condition, kind, baseline, seconds, quality, line, retrieval, citations)
 
     comparisons = {}
+    baseline_count = sum(trial.condition == "A" for trial in trials.values())
     for arm in ("B", "C"):
         reductions, deltas = [], []
         used = set()
@@ -139,6 +142,7 @@ def evaluate(stream):
             deltas.append(trial.quality - reference.quality)
         comparisons[arm] = {
             "pairs": len(used),
+            "unpaired_baselines": baseline_count - len(used),
             "median_decision_time_reduction_pct": statistics.median(reductions) if used else None,
             "mean_blind_quality_delta": statistics.mean(deltas) if used else None,
             **summarize_evidence([trial for trial in trials.values() if trial.condition == arm]),
